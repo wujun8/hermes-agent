@@ -35,7 +35,8 @@ Usage:
     hermes honcho identity <file>          # Seed AI peer identity from a file (SOUL.md etc.)
     hermes honcho migrate                  # Step-by-step migration guide: OpenClaw native → Hermes + Honcho
     hermes version             Show version
-    hermes update              Update to latest version
+    hermes update              Update to latest main-branch code
+    hermes upgrade             Upgrade to latest Release version
     hermes uninstall           Uninstall Hermes Agent
     hermes acp                 Run as an ACP server for editor integration
     hermes sessions browse     Interactive session picker with search
@@ -164,6 +165,8 @@ import argparse
 import json
 import shutil
 import subprocess
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Optional
 
@@ -7104,8 +7107,9 @@ def _update_via_zip(args):
     # if the user asked for something else — exactly the silent-divergence
     # bug --branch was added to prevent. Refuse to proceed in that case
     # rather than lie.
+    release_tag = getattr(args, "release_tag", None)
     branch = _resolve_update_branch(args)
-    if branch != "main":
+    if branch != "main" and not release_tag:
         print(
             f"✗ --branch={branch} is not supported on the Windows ZIP-fallback "
             "update path."
@@ -7117,14 +7121,18 @@ def _update_via_zip(args):
             f"--branch {branch}`, or update against main with `hermes update`."
         )
         sys.exit(1)
-    zip_url = (
-        f"https://github.com/NousResearch/hermes-agent/archive/refs/heads/{branch}.zip"
-    )
+    if release_tag:
+        zip_ref = f"refs/tags/{release_tag}"
+        zip_label = release_tag
+    else:
+        zip_ref = f"refs/heads/{branch}"
+        zip_label = branch
+    zip_url = f"https://github.com/NousResearch/hermes-agent/archive/{zip_ref}.zip"
 
     print("→ Downloading latest version...")
     tmp_dir = tempfile.mkdtemp(prefix="hermes-update-")
     try:
-        zip_path = os.path.join(tmp_dir, f"hermes-agent-{branch}.zip")
+        zip_path = os.path.join(tmp_dir, f"hermes-agent-{zip_label}.zip")
         urlretrieve(zip_url, zip_path)
 
         print("→ Extracting...")
@@ -8650,6 +8658,148 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
         print(f"  Run '{recommended_update_command()}' to install.")
 
 
+def _fetch_latest_release_tag() -> str:
+    """Return the tag name for the latest published GitHub Release."""
+    req = urllib.request.Request(
+        "https://api.github.com/repos/NousResearch/hermes-agent/releases/latest",
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "hermes-agent-upgrade",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Could not check GitHub Releases: {exc}") from exc
+
+    tag = str(payload.get("tag_name") or "").strip()
+    if not tag:
+        raise RuntimeError("GitHub latest-release response did not include tag_name")
+    return tag
+
+
+def _cmd_upgrade_check() -> None:
+    """Implement ``hermes upgrade --check`` against the latest Release tag."""
+    from hermes_cli.config import detect_install_method
+
+    method = detect_install_method(PROJECT_ROOT)
+    if method == "docker":
+        from hermes_cli.config import format_docker_update_message
+
+        print(format_docker_update_message())
+        sys.exit(1)
+    if method == "pip":
+        from hermes_cli.banner import check_via_pypi
+
+        result = check_via_pypi()
+        if result is None:
+            print("✗ Could not reach PyPI to check for release upgrades.")
+            sys.exit(1)
+        if result == 0:
+            print("✓ Already on the latest packaged release.")
+        else:
+            print("⚕ Release upgrade available on PyPI.")
+            print("  Run 'hermes upgrade' to install.")
+        return
+
+    git_dir = PROJECT_ROOT / ".git"
+    if not git_dir.exists():
+        print("✗ Not a git repository — cannot check Release upgrades.")
+        sys.exit(1)
+
+    try:
+        latest_tag = _fetch_latest_release_tag()
+    except RuntimeError as exc:
+        print(f"✗ {exc}")
+        sys.exit(1)
+
+    git_cmd = ["git"]
+    if sys.platform == "win32":
+        git_cmd = ["git", "-c", "windows.appendAtomically=false"]
+
+    print(f"→ Latest Release: {latest_tag}")
+    print("→ Fetching release tags...")
+    fetch_result = subprocess.run(
+        git_cmd + ["fetch", "origin", "--tags"],
+        cwd=PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+    )
+    if fetch_result.returncode != 0:
+        stderr = fetch_result.stderr.strip()
+        print("✗ Failed to fetch release tags.")
+        if stderr:
+            print(f"  {stderr.splitlines()[0]}")
+        sys.exit(1)
+
+    tag_result = subprocess.run(
+        git_cmd + ["rev-parse", "--verify", f"{latest_tag}^{{commit}}"],
+        cwd=PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+    )
+    if tag_result.returncode != 0:
+        print(f"✗ Release tag '{latest_tag}' was not found after fetching tags.")
+        sys.exit(1)
+
+    release_merged = subprocess.run(
+        git_cmd + ["merge-base", "--is-ancestor", latest_tag, "HEAD"],
+        cwd=PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+    )
+    if release_merged.returncode == 0:
+        print(f"✓ Already includes the latest Release ({latest_tag}).")
+    elif release_merged.returncode == 1:
+        print(f"⚕ Release upgrade available: {latest_tag}.")
+        print("  Run 'hermes upgrade' to install.")
+    else:
+        print(f"✗ Failed to compare local branch with Release {latest_tag}.")
+        if release_merged.stderr.strip():
+            print(f"  {release_merged.stderr.strip().splitlines()[0]}")
+        sys.exit(1)
+
+
+def cmd_upgrade(args):
+    """Upgrade Hermes Agent to the latest published GitHub Release."""
+    from hermes_cli.config import (
+        detect_install_method,
+        format_docker_update_message,
+        is_managed,
+        managed_error,
+    )
+
+    if is_managed():
+        managed_error("upgrade Hermes Agent")
+        return
+    if detect_install_method(PROJECT_ROOT) == "docker":
+        print(format_docker_update_message())
+        sys.exit(1)
+    if getattr(args, "check", False):
+        _cmd_upgrade_check()
+        return
+    if detect_install_method(PROJECT_ROOT) == "pip" and not (PROJECT_ROOT / ".git").exists():
+        _cmd_update_pip(args)
+        return
+
+    try:
+        release_tag = _fetch_latest_release_tag()
+    except RuntimeError as exc:
+        print(f"✗ {exc}")
+        sys.exit(1)
+
+    setattr(args, "release_tag", release_tag)
+    setattr(args, "branch", None)
+
+    gateway_mode = getattr(args, "gateway", False)
+    _update_io_state = _install_hangup_protection(gateway_mode=gateway_mode)
+    try:
+        _cmd_update_impl(args, gateway_mode=gateway_mode)
+    finally:
+        _finalize_update_output(_update_io_state)
+
+
 def _ensure_fhs_path_guard() -> None:
     """Ensure /usr/local/bin is on PATH for RHEL-family root non-login shells.
 
@@ -8996,9 +9146,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
     # Fetch and pull
     try:
 
+        release_tag = getattr(args, "release_tag", None)
         print("→ Fetching updates...")
+        fetch_args = ["fetch", "origin", "--tags"] if release_tag else ["fetch", "origin"]
         fetch_result = subprocess.run(
-            git_cmd + ["fetch", "origin"],
+            git_cmd + fetch_args,
             cwd=PROJECT_ROOT,
             capture_output=True,
             text=True,
@@ -9030,45 +9182,48 @@ def _cmd_update_impl(args, gateway_mode: bool):
         )
         current_branch = result.stdout.strip()
 
-        # Determine the target branch. Default is "main" (the long-standing
-        # CLI behavior); --branch overrides for callers that want to update
-        # against a non-default channel.
-        branch = _resolve_update_branch(args)
-
-        # If user is on a different branch than the update target, switch
-        # to the target. When the target is "main" this is the historical
-        # "always update against main" behavior; for any other target it's
-        # the same thing — get HEAD onto the requested branch first, then
-        # fast-forward.
-        if current_branch != branch:
-            label = (
-                "detached HEAD"
-                if current_branch == "HEAD"
-                else f"branch '{current_branch}'"
-            )
-            print(f"  ⚠ Currently on {label} — switching to {branch} for update...")
-            # Stash before checkout so uncommitted work isn't lost
-            auto_stash_ref = _stash_local_changes_if_needed(git_cmd, PROJECT_ROOT)
-            checkout_result = subprocess.run(
-                git_cmd + ["checkout", branch],
+        release_tag = getattr(args, "release_tag", None)
+        if release_tag:
+            print(f"→ Target Release: {release_tag}")
+            tag_result = subprocess.run(
+                git_cmd + ["rev-parse", "--verify", f"{release_tag}^{{commit}}"],
                 cwd=PROJECT_ROOT,
                 capture_output=True,
                 text=True,
             )
-            if checkout_result.returncode != 0:
-                # Local checkout doesn't have this branch yet. Try to set
-                # it up as a tracking branch of origin/<branch>. This is
-                # the common case when the requested branch exists upstream
-                # but was never checked out locally.
-                track_result = subprocess.run(
-                    git_cmd + ["checkout", "-B", branch, f"origin/{branch}"],
+            if tag_result.returncode != 0:
+                print(f"✗ Release tag '{release_tag}' was not found after fetching tags.")
+                sys.exit(1)
+
+            branch = getattr(args, "upgrade_branch", None) or "hermes-release"
+            auto_stash_ref = _stash_local_changes_if_needed(git_cmd, PROJECT_ROOT)
+            prompt_for_restore = (
+                auto_stash_ref is not None
+                and not assume_yes
+                and (gateway_mode or (sys.stdin.isatty() and sys.stdout.isatty()))
+            )
+
+            if current_branch != branch:
+                print(f"→ Using local maintenance branch: {branch}")
+                branch_exists = subprocess.run(
+                    git_cmd + ["rev-parse", "--verify", branch],
                     cwd=PROJECT_ROOT,
                     capture_output=True,
                     text=True,
                 )
-                if track_result.returncode != 0:
-                    # Restore the user's prior branch + stash before bailing
-                    # so we don't leave them stranded in a weird state.
+                checkout_args = ["checkout", branch]
+                if branch_exists.returncode != 0:
+                    # First upgrade on this install: create the maintenance
+                    # branch from the user's current HEAD so existing local
+                    # commits become the preserved patch stack.
+                    checkout_args = ["checkout", "-B", branch]
+                checkout_result = subprocess.run(
+                    git_cmd + checkout_args,
+                    cwd=PROJECT_ROOT,
+                    capture_output=True,
+                    text=True,
+                )
+                if checkout_result.returncode != 0:
                     if auto_stash_ref is not None:
                         _restore_stashed_changes(
                             git_cmd,
@@ -9077,57 +9232,134 @@ def _cmd_update_impl(args, gateway_mode: bool):
                             prompt_user=False,
                             input_fn=gw_input_fn,
                         )
-                    print(f"✗ Branch '{branch}' does not exist locally or on origin.")
-                    if track_result.stderr.strip():
-                        print(f"  {track_result.stderr.strip().splitlines()[0]}")
+                    print(f"✗ Failed to switch to local maintenance branch '{branch}'.")
+                    if checkout_result.stderr.strip():
+                        print(f"  {checkout_result.stderr.strip().splitlines()[0]}")
                     sys.exit(1)
+
+            release_merged = subprocess.run(
+                git_cmd + ["merge-base", "--is-ancestor", release_tag, "HEAD"],
+                cwd=PROJECT_ROOT,
+                capture_output=True,
+                text=True,
+            )
+            if release_merged.returncode == 0:
+                _invalidate_update_cache()
+                if auto_stash_ref is not None:
+                    _restore_stashed_changes(
+                        git_cmd,
+                        PROJECT_ROOT,
+                        auto_stash_ref,
+                        prompt_user=prompt_for_restore,
+                        input_fn=gw_input_fn,
+                    )
+                print(f"✓ Already includes the latest Release ({release_tag}).")
+                return
+            if release_merged.returncode != 1:
+                print(f"✗ Failed to compare local branch with Release {release_tag}.")
+                if release_merged.stderr.strip():
+                    print(f"  {release_merged.stderr.strip().splitlines()[0]}")
+                sys.exit(1)
+            print(f"→ Found newer Release: {release_tag}")
         else:
-            auto_stash_ref = _stash_local_changes_if_needed(git_cmd, PROJECT_ROOT)
+            # Determine the target branch. Default is "main" (the long-standing
+            # CLI behavior); --branch overrides for callers that want to update
+            # against a non-default channel.
+            branch = _resolve_update_branch(args)
 
-        prompt_for_restore = (
-            auto_stash_ref is not None
-            and not assume_yes
-            and (gateway_mode or (sys.stdin.isatty() and sys.stdout.isatty()))
-        )
-
-        # Check if there are updates
-        result = subprocess.run(
-            git_cmd + ["rev-list", f"HEAD..origin/{branch}", "--count"],
-            cwd=PROJECT_ROOT,
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        commit_count = int(result.stdout.strip())
-
-        if commit_count == 0:
-            _invalidate_update_cache()
-
-            # Even if origin is up to date, the fork may be behind upstream
-            if is_fork and branch == "main":
-                _sync_with_upstream_if_needed(git_cmd, PROJECT_ROOT)
-
-            # Restore stash and switch back to original branch if we moved
-            if auto_stash_ref is not None:
-                _restore_stashed_changes(
-                    git_cmd,
-                    PROJECT_ROOT,
-                    auto_stash_ref,
-                    prompt_user=prompt_for_restore,
-                    input_fn=gw_input_fn,
+            # If user is on a different branch than the update target, switch
+            # to the target. When the target is "main" this is the historical
+            # "always update against main" behavior; for any other target it's
+            # the same thing — get HEAD onto the requested branch first, then
+            # fast-forward.
+            if current_branch != branch:
+                label = (
+                    "detached HEAD"
+                    if current_branch == "HEAD"
+                    else f"branch '{current_branch}'"
                 )
-            if current_branch not in {branch, "HEAD"}:
-                subprocess.run(
-                    git_cmd + ["checkout", current_branch],
+                print(f"  ⚠ Currently on {label} — switching to {branch} for update...")
+                # Stash before checkout so uncommitted work isn't lost
+                auto_stash_ref = _stash_local_changes_if_needed(git_cmd, PROJECT_ROOT)
+                checkout_result = subprocess.run(
+                    git_cmd + ["checkout", branch],
                     cwd=PROJECT_ROOT,
                     capture_output=True,
                     text=True,
-                    check=False,
                 )
-            print("✓ Already up to date!")
-            return
+                if checkout_result.returncode != 0:
+                    # Local checkout doesn't have this branch yet. Try to set
+                    # it up as a tracking branch of origin/<branch>. This is
+                    # the common case when the requested branch exists upstream
+                    # but was never checked out locally.
+                    track_result = subprocess.run(
+                        git_cmd + ["checkout", "-B", branch, f"origin/{branch}"],
+                        cwd=PROJECT_ROOT,
+                        capture_output=True,
+                        text=True,
+                    )
+                    if track_result.returncode != 0:
+                        # Restore the user's prior branch + stash before bailing
+                        # so we don't leave them stranded in a weird state.
+                        if auto_stash_ref is not None:
+                            _restore_stashed_changes(
+                                git_cmd,
+                                PROJECT_ROOT,
+                                auto_stash_ref,
+                                prompt_user=False,
+                                input_fn=gw_input_fn,
+                            )
+                        print(f"✗ Branch '{branch}' does not exist locally or on origin.")
+                        if track_result.stderr.strip():
+                            print(f"  {track_result.stderr.strip().splitlines()[0]}")
+                        sys.exit(1)
+            else:
+                auto_stash_ref = _stash_local_changes_if_needed(git_cmd, PROJECT_ROOT)
 
-        print(f"→ Found {commit_count} new commit(s)")
+            prompt_for_restore = (
+                auto_stash_ref is not None
+                and not assume_yes
+                and (gateway_mode or (sys.stdin.isatty() and sys.stdout.isatty()))
+            )
+
+            # Check if there are updates
+            result = subprocess.run(
+                git_cmd + ["rev-list", f"HEAD..origin/{branch}", "--count"],
+                cwd=PROJECT_ROOT,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            commit_count = int(result.stdout.strip())
+
+            if commit_count == 0:
+                _invalidate_update_cache()
+
+                # Even if origin is up to date, the fork may be behind upstream
+                if is_fork and branch == "main":
+                    _sync_with_upstream_if_needed(git_cmd, PROJECT_ROOT)
+
+                # Restore stash and switch back to original branch if we moved
+                if auto_stash_ref is not None:
+                    _restore_stashed_changes(
+                        git_cmd,
+                        PROJECT_ROOT,
+                        auto_stash_ref,
+                        prompt_user=prompt_for_restore,
+                        input_fn=gw_input_fn,
+                    )
+                if current_branch not in {branch, "HEAD"}:
+                    subprocess.run(
+                        git_cmd + ["checkout", current_branch],
+                        cwd=PROJECT_ROOT,
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                print("✓ Already up to date!")
+                return
+
+            print(f"→ Found {commit_count} new commit(s)")
 
         # Snapshot critical state (state.db, config, pairing JSONs, etc.)
         # before pulling so a user can recover if something goes wrong.
@@ -9145,7 +9377,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             # Never let a snapshot failure block an update.
             logger.debug("Pre-update snapshot failed: %s", exc)
 
-        print("→ Pulling updates...")
+        print("→ Merging release into local maintenance branch..." if release_tag else "→ Pulling updates...")
         update_succeeded = False
         # Capture the pre-pull SHA so we can auto-roll-back if the new code
         # has a syntax error in a critical-path file (PR #28452 incident:
@@ -9154,33 +9386,55 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # the bad commit and the fix landing).
         pre_pull_sha = _capture_head_sha(git_cmd, PROJECT_ROOT)
         try:
-            pull_result = subprocess.run(
-                git_cmd + ["pull", "--ff-only", "origin", branch],
-                cwd=PROJECT_ROOT,
-                capture_output=True,
-                text=True,
-            )
-            if pull_result.returncode != 0:
-                # ff-only failed — local and remote have diverged (e.g. upstream
-                # force-pushed or rebase).  Since local changes are already
-                # stashed, reset to match the remote exactly.
-                print(
-                    "  ⚠ Fast-forward not possible (history diverged), resetting to match remote..."
-                )
-                reset_result = subprocess.run(
-                    git_cmd + ["reset", "--hard", f"origin/{branch}"],
+            if release_tag:
+                merge_release = subprocess.run(
+                    git_cmd + ["merge", "--no-edit", release_tag],
                     cwd=PROJECT_ROOT,
                     capture_output=True,
                     text=True,
                 )
-                if reset_result.returncode != 0:
-                    print(f"✗ Failed to reset to origin/{branch}.")
-                    if reset_result.stderr.strip():
-                        print(f"  {reset_result.stderr.strip()}")
-                    print(
-                        f"  Try manually: git fetch origin && git reset --hard origin/{branch}"
+                if merge_release.returncode != 0:
+                    subprocess.run(
+                        git_cmd + ["merge", "--abort"],
+                        cwd=PROJECT_ROOT,
+                        capture_output=True,
+                        text=True,
                     )
+                    print(f"✗ Failed to merge Release tag {release_tag} into {branch}.")
+                    if merge_release.stderr.strip():
+                        print(f"  {merge_release.stderr.strip().splitlines()[0]}")
+                    print("  Resolve manually with:")
+                    print(f"    cd {PROJECT_ROOT} && git checkout {branch} && git merge {release_tag}")
                     sys.exit(1)
+            else:
+                assert branch is not None
+                pull_result = subprocess.run(
+                    git_cmd + ["pull", "--ff-only", "origin", branch],
+                    cwd=PROJECT_ROOT,
+                    capture_output=True,
+                    text=True,
+                )
+                if pull_result.returncode != 0:
+                    # ff-only failed — local and remote have diverged (e.g. upstream
+                    # force-pushed or rebase).  Since local changes are already
+                    # stashed, reset to match the remote exactly.
+                    print(
+                        "  ⚠ Fast-forward not possible (history diverged), resetting to match remote..."
+                    )
+                    reset_result = subprocess.run(
+                        git_cmd + ["reset", "--hard", f"origin/{branch}"],
+                        cwd=PROJECT_ROOT,
+                        capture_output=True,
+                        text=True,
+                    )
+                    if reset_result.returncode != 0:
+                        print(f"✗ Failed to reset to origin/{branch}.")
+                        if reset_result.stderr.strip():
+                            print(f"  {reset_result.stderr.strip()}")
+                        print(
+                            f"  Try manually: git fetch origin && git reset --hard origin/{branch}"
+                        )
+                        sys.exit(1)
 
             # Post-pull syntax guard: validate critical-path files actually
             # parse before declaring the update successful. If a bad commit
@@ -13766,6 +14020,53 @@ Examples:
         help="Windows: proceed with the update even when another hermes.exe is detected. The concurrent process will likely cause WinError 32 warnings and may leave a reboot-deferred .exe replacement.",
     )
     update_parser.set_defaults(func=cmd_update)
+
+    # =========================================================================
+    # upgrade command
+    # =========================================================================
+    upgrade_parser = subparsers.add_parser(
+        "upgrade",
+        help="Upgrade Hermes Agent to the latest Release version",
+        description="Check GitHub Releases and merge the latest release tag into the local hermes-release maintenance branch",
+    )
+    upgrade_parser.add_argument(
+        "--gateway",
+        action="store_true",
+        default=False,
+        help="Gateway mode: use file-based IPC for prompts instead of stdin (reserved for gateway-driven upgrades)",
+    )
+    upgrade_parser.add_argument(
+        "--check",
+        action="store_true",
+        default=False,
+        help="Check whether a Release upgrade is available without installing anything",
+    )
+    upgrade_parser.add_argument(
+        "--no-backup",
+        action="store_true",
+        default=False,
+        help="Skip the pre-update backup for this run (overrides updates.pre_update_backup)",
+    )
+    upgrade_parser.add_argument(
+        "--backup",
+        action="store_true",
+        default=False,
+        help="Force a pre-update backup for this run (off by default; overrides updates.pre_update_backup)",
+    )
+    upgrade_parser.add_argument(
+        "--yes",
+        "-y",
+        action="store_true",
+        default=False,
+        help="Assume yes for interactive prompts (config migration, stash restore). API-key entry is skipped; run 'hermes config migrate' separately for those.",
+    )
+    upgrade_parser.add_argument(
+        "--force",
+        action="store_true",
+        default=False,
+        help="Windows: proceed with the upgrade even when another hermes.exe is detected. The concurrent process will likely cause WinError 32 warnings and may leave a reboot-deferred .exe replacement.",
+    )
+    upgrade_parser.set_defaults(func=cmd_upgrade)
 
     # =========================================================================
     # uninstall command
