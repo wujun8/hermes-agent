@@ -112,6 +112,43 @@ def test_tui_verbose_tool_events_omit_details_when_redaction_fails(monkeypatch):
     assert "result_text" not in events[1][2]
 
 
+def test_tui_session_usage_includes_account_limit_lines(monkeypatch):
+    class Agent:
+        model = "gpt-5.5"
+        provider = "openai-codex"
+        base_url = "https://chatgpt.com/backend-api/codex"
+        api_key = "unused"
+        session_input_tokens = 100
+        session_output_tokens = 20
+        session_prompt_tokens = 100
+        session_completion_tokens = 20
+        session_cache_read_tokens = 0
+        session_cache_write_tokens = 0
+        session_total_tokens = 120
+        session_api_calls = 1
+
+    monkeypatch.setattr(
+        "agent.account_usage.fetch_account_usage",
+        lambda provider, base_url=None, api_key=None: object(),
+    )
+    monkeypatch.setattr(
+        "agent.account_usage.render_account_usage_lines",
+        lambda snapshot, markdown=False: [
+            "📈 Account limits",
+            "Provider: openai-codex (Pro)",
+            "Session: 79% remaining (21% used)",
+        ],
+    )
+
+    usage = server._get_usage(Agent(), include_account=True)
+
+    assert usage["account_lines"] == [
+        "📈 Account limits",
+        "Provider: openai-codex (Pro)",
+        "Session: 79% remaining (21% used)",
+    ]
+
+
 def test_dispatch_rejects_non_object_request():
     resp = server.dispatch([])
 

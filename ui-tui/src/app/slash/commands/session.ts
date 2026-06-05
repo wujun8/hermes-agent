@@ -547,6 +547,10 @@ export const sessionCommands: SlashCommand[] = [
           sections.push({ text: `Compressions: ${r.compressions}` })
         }
 
+        if (r.account_lines?.length) {
+          sections.push({ text: r.account_lines.join('\n') })
+        }
+
         ctx.transcript.panel('Usage', sections)
       })
     }

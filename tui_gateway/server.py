@@ -1325,7 +1325,7 @@ def _sync_session_key_after_compress(
             pass
 
 
-def _get_usage(agent) -> dict:
+def _get_usage(agent, *, include_account: bool = False) -> dict:
     g = lambda k, fb=None: getattr(agent, k, 0) or (getattr(agent, fb, 0) if fb else 0)
     usage = {
         "model": getattr(agent, "model", "") or "",
@@ -1367,6 +1367,22 @@ def _get_usage(agent) -> dict:
             usage["cost_usd"] = float(cost.amount_usd)
     except Exception:
         pass
+    if include_account:
+        try:
+            from agent.account_usage import fetch_account_usage, render_account_usage_lines
+
+            provider = getattr(agent, "provider", None)
+            if provider:
+                account_snapshot = fetch_account_usage(
+                    provider,
+                    base_url=getattr(agent, "base_url", None),
+                    api_key=getattr(agent, "api_key", None),
+                )
+                account_lines = render_account_usage_lines(account_snapshot)
+                if account_lines:
+                    usage["account_lines"] = account_lines
+        except Exception:
+            pass
     return usage
 
 
@@ -2735,7 +2751,7 @@ def _(rid, params: dict) -> dict:
     return _ok(
         rid,
         (
-            _get_usage(agent)
+            _get_usage(agent, include_account=True)
             if agent is not None
             else {"calls": 0, "input": 0, "output": 0, "total": 0}
         ),
