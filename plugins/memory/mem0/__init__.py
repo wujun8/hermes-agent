@@ -21,6 +21,9 @@ import os
 import threading
 import time
 from typing import Any, Dict, List
+from urllib import error as urllib_error
+from urllib import parse as urllib_parse
+from urllib import request as urllib_request
 
 from agent.memory_provider import MemoryProvider
 from tools.registry import tool_error
@@ -37,6 +40,14 @@ _BREAKER_COOLDOWN_SECS = 120
 # Config
 # ---------------------------------------------------------------------------
 
+def _as_bool(value: Any, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _load_config() -> dict:
     """Load config from env vars, with $HERMES_HOME/mem0.json overrides.
 
@@ -48,9 +59,12 @@ def _load_config() -> dict:
 
     config = {
         "api_key": os.environ.get("MEM0_API_KEY", ""),
+        "api_url": os.environ.get("MEM0_API_URL") or os.environ.get("MEM0_BASE_URL", ""),
         "user_id": os.environ.get("MEM0_USER_ID", "hermes-user"),
         "agent_id": os.environ.get("MEM0_AGENT_ID", "hermes"),
         "rerank": True,
+        "infer_turns": None,
+        "sync_turns": os.environ.get("MEM0_SYNC_TURNS", True),
         "keyword_search": False,
     }
 
@@ -63,7 +77,67 @@ def _load_config() -> dict:
         except Exception:
             pass
 
+    config["api_url"] = str(config.get("api_url") or "").rstrip("/")
+    config["rerank"] = _as_bool(config.get("rerank"), True)
+    config["sync_turns"] = _as_bool(config.get("sync_turns"), True)
+    if config.get("infer_turns") is None:
+        # Platform Mem0 has server-side extraction; OSS REST deployments often
+        # run with local/experimental LLM routing. Default local auto-sync to
+        # verbatim storage unless the user explicitly opts into inference.
+        config["infer_turns"] = False if config["api_url"] else True
+    else:
+        config["infer_turns"] = _as_bool(config.get("infer_turns"), True)
+
     return config
+
+
+class _LocalMem0Client:
+    """Tiny client for the self-hosted OSS REST API.
+
+    The official ``MemoryClient`` targets Mem0 Platform ``/v1``/``/v2`` routes;
+    the OSS server exposes bare ``/memories`` and ``/search`` endpoints instead.
+    Keep this client deliberately small and aligned with the methods Hermes uses.
+    """
+
+    def __init__(self, api_url: str, api_key: str, timeout: float = 30.0):
+        self.api_url = api_url.rstrip("/")
+        self.api_key = api_key
+        self.timeout = timeout
+
+    def _request(self, method: str, path: str, payload: dict | None = None, query: dict | None = None):
+        url = f"{self.api_url}{path}"
+        if query:
+            url = f"{url}?{urllib_parse.urlencode({k: v for k, v in query.items() if v is not None})}"
+        data = None if payload is None else json.dumps(payload).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["X-API-Key"] = self.api_key
+        req = urllib_request.Request(url, data=data, headers=headers, method=method)
+        try:
+            with urllib_request.urlopen(req, timeout=self.timeout) as resp:
+                raw = resp.read().decode("utf-8")
+        except urllib_error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"Mem0 OSS {method} {path} failed: HTTP {exc.code}: {detail}") from exc
+        return json.loads(raw) if raw else {}
+
+    def add(self, messages, **kwargs):
+        payload = {"messages": messages}
+        payload.update(kwargs)
+        return self._request("POST", "/memories", payload=payload)
+
+    def search(self, query: str, filters: dict | None = None, top_k: int | None = None, **_kwargs):
+        payload = {"query": query, "filters": filters or {}}
+        if top_k is not None:
+            payload["top_k"] = top_k
+        return self._request("POST", "/search", payload=payload)
+
+    def get_all(self, filters: dict | None = None, top_k: int | None = None, **_kwargs):
+        filters = filters or {}
+        query = {k: filters.get(k) for k in ("user_id", "agent_id", "run_id") if filters.get(k) is not None}
+        if top_k is not None:
+            query["top_k"] = top_k
+        return self._request("GET", "/memories", query=query)
 
 
 # ---------------------------------------------------------------------------
@@ -124,9 +198,12 @@ class Mem0MemoryProvider(MemoryProvider):
         self._client = None
         self._client_lock = threading.Lock()
         self._api_key = ""
+        self._api_url = ""
         self._user_id = "hermes-user"
         self._agent_id = "hermes"
         self._rerank = True
+        self._infer_turns = True
+        self._sync_turns = True
         self._prefetch_result = ""
         self._prefetch_lock = threading.Lock()
         self._prefetch_thread = None
@@ -160,16 +237,22 @@ class Mem0MemoryProvider(MemoryProvider):
 
     def get_config_schema(self):
         return [
-            {"key": "api_key", "description": "Mem0 Platform API key", "secret": True, "required": True, "env_var": "MEM0_API_KEY", "url": "https://app.mem0.ai"},
+            {"key": "api_key", "description": "Mem0 API key (Platform) or self-hosted OSS X-API-Key", "secret": True, "required": True, "env_var": "MEM0_API_KEY", "url": "https://app.mem0.ai"},
+            {"key": "api_url", "description": "Self-hosted OSS REST base URL (omit for Mem0 Platform)", "default": ""},
             {"key": "user_id", "description": "User identifier", "default": "hermes-user"},
             {"key": "agent_id", "description": "Agent identifier", "default": "hermes"},
             {"key": "rerank", "description": "Enable reranking for recall", "default": "true", "choices": ["true", "false"]},
+            {"key": "sync_turns", "description": "Automatically mirror completed conversation turns to Mem0", "default": "true", "choices": ["true", "false"]},
+            {"key": "infer_turns", "description": "Use Mem0 LLM extraction when auto-syncing turns", "default": "true", "choices": ["true", "false"]},
         ]
 
     def _get_client(self):
         """Thread-safe client accessor with lazy initialization."""
         with self._client_lock:
             if self._client is not None:
+                return self._client
+            if self._api_url:
+                self._client = _LocalMem0Client(self._api_url, self._api_key)
                 return self._client
             try:
                 from mem0 import MemoryClient
@@ -204,11 +287,14 @@ class Mem0MemoryProvider(MemoryProvider):
     def initialize(self, session_id: str, **kwargs) -> None:
         self._config = _load_config()
         self._api_key = self._config.get("api_key", "")
+        self._api_url = self._config.get("api_url", "")
         # Prefer gateway-provided user_id for per-user memory scoping;
         # fall back to config/env default for CLI (single-user) sessions.
         self._user_id = kwargs.get("user_id") or self._config.get("user_id", "hermes-user")
         self._agent_id = self._config.get("agent_id", "hermes")
         self._rerank = self._config.get("rerank", True)
+        self._infer_turns = self._config.get("infer_turns", True)
+        self._sync_turns = self._config.get("sync_turns", True)
 
     def _read_filters(self) -> Dict[str, Any]:
         """Filters for search/get_all — scoped to user only for cross-session recall."""
@@ -272,6 +358,8 @@ class Mem0MemoryProvider(MemoryProvider):
 
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
         """Send the turn to Mem0 for server-side fact extraction (non-blocking)."""
+        if not self._sync_turns:
+            return
         if self._is_breaker_open():
             return
 
@@ -282,7 +370,10 @@ class Mem0MemoryProvider(MemoryProvider):
                     {"role": "user", "content": user_content},
                     {"role": "assistant", "content": assistant_content},
                 ]
-                client.add(messages, **self._write_filters())
+                write_kwargs = self._write_filters()
+                if self._api_url and not self._infer_turns:
+                    write_kwargs["infer"] = False
+                client.add(messages, **write_kwargs)
                 self._record_success()
             except Exception as e:
                 self._record_failure()

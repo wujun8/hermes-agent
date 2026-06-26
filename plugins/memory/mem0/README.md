@@ -28,6 +28,8 @@ Config file: `$HERMES_HOME/mem0.json`
 | `user_id` | `hermes-user` | User identifier on Mem0 |
 | `agent_id` | `hermes` | Agent identifier |
 | `rerank` | `true` | Enable reranking for recall |
+| `sync_turns` | `true` | Automatically mirror completed conversation turns to Mem0 |
+| `infer_turns` | `true` | Use Mem0 LLM extraction when auto-syncing turns |
 
 ## Tools
 

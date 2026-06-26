@@ -88,12 +88,41 @@ class TestMem0FiltersV2:
         provider = self._make_provider(monkeypatch, client)
 
         provider.sync_turn("user said this", "assistant replied", session_id="s1")
+        assert provider._sync_thread is not None
         provider._sync_thread.join(timeout=2)
 
         assert len(client.captured_add) == 1
         call = client.captured_add[0]
         assert call["user_id"] == "u123"
         assert call["agent_id"] == "hermes"
+
+    def test_local_oss_sync_turn_can_disable_inference(self, monkeypatch):
+        """Self-hosted OSS REST mode can store auto-synced turns verbatim."""
+        client = FakeClientV2()
+        provider = self._make_provider(monkeypatch, client)
+        provider._api_url = "http://127.0.0.1:8888"
+        provider._infer_turns = False
+
+        provider.sync_turn("user said this", "assistant replied", session_id="s1")
+        assert provider._sync_thread is not None
+        provider._sync_thread.join(timeout=2)
+
+        assert len(client.captured_add) == 1
+        call = client.captured_add[0]
+        assert call["user_id"] == "u123"
+        assert call["agent_id"] == "hermes"
+        assert call["infer"] is False
+
+    def test_sync_turns_can_be_disabled_without_writing(self, monkeypatch):
+        """Users can disable automatic per-turn mem0 writes and keep explicit mem0_conclude available."""
+        client = FakeClientV2()
+        provider = self._make_provider(monkeypatch, client)
+        provider._sync_turns = False
+
+        provider.sync_turn("ephemeral task request", "ephemeral task result", session_id="s1")
+
+        assert provider._sync_thread is None
+        assert client.captured_add == []
 
     def test_conclude_uses_write_filters(self, monkeypatch):
         client = FakeClientV2()
@@ -239,3 +268,16 @@ class TestMem0Defaults:
         provider.initialize("test")
 
         assert provider._agent_id == "hermes"
+
+    def test_mem0_json_can_disable_auto_turn_sync(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.delenv("MEM0_SYNC_TURNS", raising=False)
+        (tmp_path / "mem0.json").write_text(
+            json.dumps({"api_key": "test-key", "sync_turns": False}),
+            encoding="utf-8",
+        )
+
+        provider = Mem0MemoryProvider()
+        provider.initialize("test")
+
+        assert provider._sync_turns is False
