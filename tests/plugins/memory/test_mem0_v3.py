@@ -619,3 +619,72 @@ class TestSelfHostedConfig:
         monkeypatch.delenv("MEM0_HOST", raising=False)
         monkeypatch.setenv("MEM0_MODE", "platform")
         assert Mem0MemoryProvider().is_available() is False
+
+
+class TestMem0TurnSyncSettings:
+    """Local patch: sync_turns / infer_turns controls and api_url alias."""
+
+    def _make_provider(self, monkeypatch, backend):
+        provider = Mem0MemoryProvider()
+        provider.initialize("test-session")
+        provider._user_id = "u123"
+        provider._agent_id = "hermes"
+        provider._backend = backend
+        return provider
+
+    def test_sync_turns_can_be_disabled_without_writing(self, monkeypatch):
+        backend = FakeBackend()
+        provider = self._make_provider(monkeypatch, backend)
+        provider._sync_turns = False
+
+        provider.sync_turn("ephemeral task request", "ephemeral task result", session_id="s1")
+
+        assert provider._sync_thread is None
+        assert backend.captured == []
+
+    def test_self_hosted_sync_turn_can_disable_inference(self, monkeypatch):
+        backend = FakeBackend()
+        provider = self._make_provider(monkeypatch, backend)
+        provider._host = "http://127.0.0.1:8888"
+        provider._infer_turns = False
+
+        provider.sync_turn("user said this", "assistant replied", session_id="s1")
+        provider._sync_thread.join(timeout=2)
+
+        assert len(backend.captured) == 1
+        assert backend.captured[0][2]["infer"] is False
+
+    def test_mem0_json_can_disable_auto_turn_sync(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.delenv("MEM0_SYNC_TURNS", raising=False)
+        (tmp_path / "mem0.json").write_text(
+            json.dumps({"api_key": "test-key", "sync_turns": False}),
+            encoding="utf-8",
+        )
+
+        provider = Mem0MemoryProvider()
+        provider.initialize("test")
+
+        assert provider._sync_turns is False
+
+    def test_api_url_alias_maps_to_host(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.delenv("MEM0_HOST", raising=False)
+        (tmp_path / "mem0.json").write_text(
+            json.dumps({"api_key": "test-key", "api_url": "http://127.0.0.1:8888/"}),
+            encoding="utf-8",
+        )
+
+        cfg = mem0_plugin._load_config()
+        assert cfg["host"] == "http://127.0.0.1:8888"
+        assert cfg["infer_turns"] is False
+
+    def test_infer_turns_defaults_true_for_platform(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / "mem0.json").write_text(
+            json.dumps({"api_key": "test-key"}),
+            encoding="utf-8",
+        )
+
+        cfg = mem0_plugin._load_config()
+        assert cfg["infer_turns"] is True

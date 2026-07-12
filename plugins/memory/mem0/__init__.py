@@ -24,6 +24,10 @@ setup`):
                        store. When unset, the gateway-native id (e.g. Telegram
                        numeric id, Discord snowflake) is used instead.
   agent_id           — Agent identifier (default: hermes)
+  sync_turns         — Automatically mirror completed conversation turns to Mem0
+                       (default: true). Set false to disable background turn sync.
+  infer_turns        — Use Mem0 LLM extraction when auto-syncing turns (default:
+                       true for platform, false for self-hosted host/api_url).
 
 The matching MEM0_MODE / MEM0_USER_ID / MEM0_AGENT_ID environment variables are
 still read as a backward-compatible fallback, but mem0.json is the canonical
@@ -70,6 +74,14 @@ def _is_client_error(exc: Exception) -> bool:
     return "404" in err_str or "not found" in err_str or "valid uuid" in err_str
 
 
+def _as_bool(value: Any, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -86,8 +98,14 @@ def _load_config() -> dict:
     config = {
         "mode": os.environ.get("MEM0_MODE", "platform"),
         "api_key": os.environ.get("MEM0_API_KEY", ""),
-        "host": os.environ.get("MEM0_HOST", ""),
+        "host": (
+            os.environ.get("MEM0_HOST", "")
+            or os.environ.get("MEM0_API_URL", "")
+            or os.environ.get("MEM0_BASE_URL", "")
+        ),
         "agent_id": os.environ.get("MEM0_AGENT_ID", "hermes"),
+        "sync_turns": os.environ.get("MEM0_SYNC_TURNS", True),
+        "infer_turns": None,
         "oss": {},
     }
     # Only carry user_id when the operator explicitly configured one (env or
@@ -105,6 +123,19 @@ def _load_config() -> dict:
                            if v is not None and v != ""})
         except Exception:
             pass
+
+    # ``api_url`` in mem0.json is a legacy alias for ``host``.
+    api_url = str(config.get("api_url") or "").strip().rstrip("/")
+    host = str(config.get("host") or "").strip().rstrip("/")
+    config["host"] = host or api_url
+    config["sync_turns"] = _as_bool(config.get("sync_turns"), True)
+    if config.get("infer_turns") is None:
+        # Platform Mem0 has server-side extraction; self-hosted REST deployments
+        # often run with local/experimental LLM routing. Default local auto-sync
+        # to verbatim storage unless the user explicitly opts into inference.
+        config["infer_turns"] = False if config["host"] else True
+    else:
+        config["infer_turns"] = _as_bool(config.get("infer_turns"), True)
 
     return config
 
@@ -205,6 +236,8 @@ class Mem0MemoryProvider(MemoryProvider):
         self._user_id = _DEFAULT_USER_ID
         self._agent_id = "hermes"
         self._rerank_default = False
+        self._sync_turns = True
+        self._infer_turns = True
         self._channel = "cli"  # gateway channel name (cli/telegram/discord/...)
         self._sync_thread = None
         self._prefetch_thread = None
@@ -257,6 +290,8 @@ class Mem0MemoryProvider(MemoryProvider):
             {"key": "user_id", "description": "User identifier", "default": "hermes-user"},
             {"key": "agent_id", "description": "Agent identifier", "default": "hermes"},
             {"key": "rerank", "description": "Enable reranking for recall", "default": "false", "choices": ["true", "false"]},
+            {"key": "sync_turns", "description": "Automatically mirror completed conversation turns to Mem0", "default": "true", "choices": ["true", "false"]},
+            {"key": "infer_turns", "description": "Use Mem0 LLM extraction when auto-syncing turns", "default": "true", "choices": ["true", "false"]},
         ]
 
     def post_setup(self, hermes_home: str, config: dict) -> None:
@@ -362,6 +397,8 @@ class Mem0MemoryProvider(MemoryProvider):
         self._rerank_default = (
             _rr.lower() in ("true", "1", "yes") if isinstance(_rr, str) else bool(_rr)
         )
+        self._sync_turns = self._config.get("sync_turns", True)
+        self._infer_turns = self._config.get("infer_turns", True)
         self._channel = kwargs.get("platform") or "cli"
         self._backend = self._create_backend()
         if self._backend and not self._atexit_registered:
@@ -477,6 +514,8 @@ class Mem0MemoryProvider(MemoryProvider):
 
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
         """Send the turn to Mem0 for server-side fact extraction (non-blocking)."""
+        if not self._sync_turns:
+            return
         if self._backend is None or self._is_breaker_open():
             return
 
@@ -493,7 +532,7 @@ class Mem0MemoryProvider(MemoryProvider):
                     messages,
                     user_id=self._user_id,
                     agent_id=self._agent_id,
-                    infer=True,
+                    infer=self._infer_turns,
                     metadata=self._write_metadata(),
                 )
                 self._record_success()

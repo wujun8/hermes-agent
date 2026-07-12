@@ -30,6 +30,10 @@ Behavioral settings live in `$HERMES_HOME/mem0.json` (set them via `hermes memor
 | `user_id` | `hermes-user` | User identifier on Mem0 |
 | `agent_id` | `hermes` | Agent identifier |
 | `rerank` | `false` | Rerank search results for relevance (platform mode only) |
+| `sync_turns` | `true` | Automatically mirror completed conversation turns to Mem0 |
+| `infer_turns` | `true` (platform) / `false` (self-hosted) | Use Mem0 LLM extraction when auto-syncing turns |
+
+`api_url` in `mem0.json` is accepted as a legacy alias for `host`.
 
 The plugin has three connection modes:
 
