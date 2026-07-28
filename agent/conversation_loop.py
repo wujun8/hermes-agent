@@ -220,6 +220,40 @@ def _is_nous_inference_route(provider: str, base_url: str) -> bool:
     )
 
 
+# Codex Responses ``response.failed`` codes that are transient capacity /
+# upstream hiccups. These should exhaust ``api_max_retries`` on the primary
+# before eager fallback — unlike rate-limit / quota / billing terminals.
+_CODEX_TRANSIENT_TERMINAL_ERROR_CODES = frozenset({
+    "upstream_error",
+    "overloaded",
+    "server_error",
+})
+
+
+def _codex_response_error_code(error_obj: Any) -> str:
+    """Extract a lowercase error code from a Responses ``response.error`` payload."""
+    code = None
+    if isinstance(error_obj, dict):
+        code = error_obj.get("code")
+    elif error_obj is not None:
+        code = getattr(error_obj, "code", None)
+    if code is None:
+        return ""
+    return str(code).strip().lower()
+
+
+def _is_codex_transient_terminal_failure(status: str, error_obj: Any) -> bool:
+    """True when a Codex terminal failure should exhaust primary retries first.
+
+    Only ``status=failed`` with known-transient codes defers eager fallback.
+    ``cancelled``, unknown codes, and rate-limit/quota/billing codes keep
+    the prior immediate-fallback behaviour.
+    """
+    if status != "failed":
+        return False
+    return _codex_response_error_code(error_obj) in _CODEX_TRANSIENT_TERMINAL_ERROR_CODES
+
+
 def _billing_or_entitlement_message(
     *,
     capability: str,
@@ -1491,6 +1525,7 @@ def run_conversation(
                 
                 # Validate response shape before proceeding
                 response_invalid = False
+                _codex_transient_terminal_failure = False
                 error_details = []
                 if agent.api_mode == "codex_responses":
                     _ct_v = agent._get_transport()
@@ -1505,14 +1540,25 @@ def run_conversation(
                             _codex_resp_status = str(getattr(response, "status", "") or "").strip().lower()
                             if _codex_resp_status in {"failed", "cancelled"}:
                                 _codex_error_obj = getattr(response, "error", None)
+                                _codex_transient_terminal_failure = (
+                                    _is_codex_transient_terminal_failure(
+                                        _codex_resp_status, _codex_error_obj
+                                    )
+                                )
                                 _codex_error_msg = (
                                     _codex_error_obj.get("message") if isinstance(_codex_error_obj, dict)
                                     else str(_codex_error_obj) if _codex_error_obj
                                     else f"Responses API returned status '{_codex_resp_status}'"
                                 )
                                 logger.warning(
-                                    "Codex response status='%s' (error=%s). Routing to fallback. %s",
-                                    _codex_resp_status, _codex_error_msg,
+                                    "Codex response status='%s' (error=%s). %s %s",
+                                    _codex_resp_status,
+                                    _codex_error_msg,
+                                    (
+                                        "Retrying primary before fallback."
+                                        if _codex_transient_terminal_failure
+                                        else "Routing to fallback."
+                                    ),
                                     agent._client_log_context(),
                                 )
                                 response_invalid = True
@@ -1598,17 +1644,18 @@ def run_conversation(
                     retry_count += 1
                     
                     # Eager fallback: empty/malformed responses are a common
-                    # rate-limit symptom.  Switch to fallback immediately
-                    # rather than retrying with extended backoff.
-                    if agent._fallback_index < len(agent._fallback_chain):
-                        agent._buffer_status("⚠️ Empty/malformed response — switching to fallback...")
-                    if agent._try_activate_fallback():
-                        active_system_prompt = _sync_failover_system_message(
-                            agent, api_messages, active_system_prompt)
-                        retry_count = 0
-                        compression_attempts = 0
-                        _retry.primary_recovery_attempted = False
-                        continue
+                    # rate-limit symptom. Known transient Codex terminal errors
+                    # instead exhaust api_max_retries on the primary first.
+                    if not _codex_transient_terminal_failure:
+                        if agent._fallback_index < len(agent._fallback_chain):
+                            agent._buffer_status("⚠️ Empty/malformed response — switching to fallback...")
+                        if agent._try_activate_fallback():
+                            active_system_prompt = _sync_failover_system_message(
+                                agent, api_messages, active_system_prompt)
+                            retry_count = 0
+                            compression_attempts = 0
+                            _retry.primary_recovery_attempted = False
+                            continue
 
                     # Check for error field in response (some providers include this)
                     error_msg = "Unknown"
@@ -3326,8 +3373,8 @@ def run_conversation(
                 # and transport errors (connection failure / timeout / provider
                 # overloaded).  Rate limits and billing: switch immediately —
                 # the primary provider won't recover within the retry window.
-                # Transport errors: allow 1 retry first (transient hiccups
-                # recover), then fall back if the provider is truly unreachable.
+                # Transport errors: wait until api_max_retries is exhausted
+                # before falling back (transient hiccups may recover).
                 is_rate_limited = classified.reason in {
                     FailoverReason.rate_limit,
                     FailoverReason.billing,
@@ -3351,7 +3398,7 @@ def run_conversation(
                     max_retries = max(max_retries, zai_coding_overload_retry_ceiling())
                 _should_fallback = (
                     is_rate_limited
-                    or (_is_transport_failure and retry_count >= 2)
+                    or (_is_transport_failure and retry_count >= max_retries)
                 )
                 if _should_fallback and agent._fallback_index < len(agent._fallback_chain):
                     # Don't eagerly fallback if credential pool rotation may
