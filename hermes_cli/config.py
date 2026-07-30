@@ -1040,6 +1040,9 @@ DEFAULT_CONFIG = {
         # on flaky primaries; raise it if you prefer to tolerate longer
         # provider hiccups on a single provider.
         "api_max_retries": 3,
+        # Emit each retry/fallback status immediately instead of buffering the
+        # trace until terminal failure. False preserves the quieter default.
+        "show_retry_status": False,
         "service_tier": "",
         # Tool-use enforcement: injects system prompt guidance that tells the
         # model to actually call tools instead of describing intended actions.

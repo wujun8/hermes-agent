@@ -996,6 +996,9 @@ class AIAgent:
         turn ultimately recovered or failed.
         """
         try:
+            if getattr(self, "_show_retry_status", False):
+                self._emit_status(message)
+                return
             buf = getattr(self, "_retry_status_buffer", None)
             if buf is None:
                 buf = []
@@ -1008,6 +1011,9 @@ class AIAgent:
     def _buffer_vprint(self, message: str) -> None:
         """Buffer a vprint(force=True) retry/fallback line."""
         try:
+            if getattr(self, "_show_retry_status", False):
+                self._vprint(f"{self.log_prefix}{message}", force=True)
+                return
             buf = getattr(self, "_retry_status_buffer", None)
             if buf is None:
                 buf = []

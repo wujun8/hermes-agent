@@ -8,6 +8,9 @@ silently dropped.
 
 from __future__ import annotations
 
+from unittest.mock import patch
+
+import pytest
 
 from run_agent import AIAgent
 
@@ -51,6 +54,22 @@ def test_buffer_status_accumulates_then_flushes(capsys):
     assert agent._retry_status_buffer == []
 
 
+def test_show_retry_status_emits_status_immediately_without_buffering():
+    agent = _make_bare_agent()
+    agent._show_retry_status = True
+    emitted = []
+    agent._emit_status = lambda msg: emitted.append(msg)
+
+    agent._buffer_status("⏳ Retrying...")
+
+    assert emitted == ["⏳ Retrying..."]
+    assert getattr(agent, "_retry_status_buffer", []) == []
+
+    # A terminal-failure flush must not replay a status already shown live.
+    agent._flush_status_buffer()
+    assert emitted == ["⏳ Retrying..."]
+
+
 def test_clear_drops_buffered_messages_silently():
     agent = _make_bare_agent()
     emitted = []
@@ -81,6 +100,60 @@ def test_buffer_vprint_replays_via_vprint_with_log_prefix():
     # Replays through _vprint with force=True and the agent's log_prefix
     # prepended (matching the original direct-emit format).
     assert seen == [("[abc] ⚠️  API call failed", True)]
+
+
+def test_show_retry_status_vprints_immediately_without_buffering():
+    agent = _make_bare_agent()
+    agent._show_retry_status = True
+    agent.log_prefix = "[abc] "
+    seen = []
+    agent._vprint = lambda msg, force=False, **kw: seen.append((msg, force))
+
+    agent._buffer_vprint("⚠️  API call failed")
+
+    assert seen == [("[abc] ⚠️  API call failed", True)]
+    assert getattr(agent, "_retry_status_buffer", []) == []
+
+    agent._flush_status_buffer()
+    assert seen == [("[abc] ⚠️  API call failed", True)]
+
+
+@pytest.mark.parametrize(
+    ("configured", "expected"),
+    [
+        (True, True),
+        (False, False),
+        ("YES", True),
+        ("false", False),
+        ("unexpected", False),
+    ],
+)
+def test_agent_reads_show_retry_status_as_boolean(configured, expected):
+    with (
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+        patch(
+            "hermes_cli.config.load_config",
+            return_value={"agent": {"show_retry_status": configured}},
+        ),
+    ):
+        agent = AIAgent(
+            api_key="test-key-1234567890",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+
+    assert agent._show_retry_status is expected
+
+
+def test_show_retry_status_is_a_known_config_key():
+    from hermes_cli.config import DEFAULT_CONFIG, _validate_config_key
+
+    assert DEFAULT_CONFIG["agent"]["show_retry_status"] is False
+    assert _validate_config_key("agent.show_retry_status") == (True, None)
 
 
 def test_flush_empty_buffer_is_noop():

@@ -95,6 +95,17 @@ You can also set `providers.<id>.stale_timeout_seconds` for the non-streaming st
 
 Leaving these unset keeps the legacy defaults (`HERMES_API_TIMEOUT=1800`s, `HERMES_API_CALL_STALE_TIMEOUT=90`s, native Anthropic 900s). The non-streaming stale detector is auto-disabled for local endpoints when left implicit and can scale upward for very large contexts. Not currently wired for AWS Bedrock (both `bedrock_converse` and AnthropicBedrock SDK paths use boto3 with its own timeout configuration). See the commented example in [`cli-config.yaml.example`](https://github.com/NousResearch/hermes-agent/blob/main/cli-config.yaml.example).
 
+### API Retry Status
+
+Hermes retries transient API failures according to `agent.api_max_retries` and normally buffers retry/fallback status messages unless all recovery attempts fail. To display every retry status immediately while the request is still running, enable:
+
+```yaml
+agent:
+  show_retry_status: true   # default: false
+```
+
+You can also run `hermes config set agent.show_retry_status true`. Live messages are not buffered, so a final failure does not display the same retry status twice.
+
 ## Update Behavior
 
 `hermes update` settings live under `updates` in `config.yaml`:
