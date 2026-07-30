@@ -242,6 +242,7 @@ export interface SessionUsageResponse {
   cache_read?: number
   cache_write?: number
   calls?: number
+  account_lines?: string[]
   compressions?: number
   context_max?: number
   context_percent?: number

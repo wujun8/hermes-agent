@@ -9,8 +9,13 @@ from __future__ import annotations
 from typing import Callable
 
 
-def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
-    """Attach the ``update`` subcommand to ``subparsers``."""
+def build_update_parser(
+    subparsers,
+    *,
+    cmd_update: Callable,
+    cmd_upgrade: Callable | None = None,
+) -> None:
+    """Attach the ``update`` and optional ``upgrade`` subcommands."""
     # =========================================================================
     # update command
     # =========================================================================
@@ -74,3 +79,59 @@ def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
         help="Windows: mutate the venv even while other processes are running from its interpreter (desktop backend, gateway, terminals). Those processes keep native .pyd files locked, so the dependency sync will likely fail partway and strand the install half-updated. Use only if you know the detected holders are false positives.",
     )
     update_parser.set_defaults(func=cmd_update)
+
+    if cmd_upgrade is None:
+        return
+
+    upgrade_parser = subparsers.add_parser(
+        "upgrade",
+        help="Upgrade Hermes Agent to the latest published Release",
+        description=(
+            "Fetch the latest GitHub Release and merge its tag into the local "
+            "hermes-release maintenance branch"
+        ),
+    )
+    upgrade_parser.add_argument(
+        "--gateway",
+        action="store_true",
+        default=False,
+        help="Gateway mode: use file-based IPC for prompts instead of stdin",
+    )
+    upgrade_parser.add_argument(
+        "--check",
+        action="store_true",
+        default=False,
+        help="Check whether a Release upgrade is available without installing anything",
+    )
+    upgrade_parser.add_argument(
+        "--no-backup",
+        action="store_true",
+        default=False,
+        help="Skip all pre-update backups for this run",
+    )
+    upgrade_parser.add_argument(
+        "--backup",
+        action="store_true",
+        default=False,
+        help="Force a full pre-update backup for this run",
+    )
+    upgrade_parser.add_argument(
+        "--yes",
+        "-y",
+        action="store_true",
+        default=False,
+        help="Assume yes for interactive prompts",
+    )
+    upgrade_parser.add_argument(
+        "--force",
+        action="store_true",
+        default=False,
+        help="Windows: proceed even when another hermes.exe is detected",
+    )
+    upgrade_parser.add_argument(
+        "--force-venv",
+        action="store_true",
+        default=False,
+        help="Windows: mutate the venv even while other processes use it",
+    )
+    upgrade_parser.set_defaults(func=cmd_upgrade)
