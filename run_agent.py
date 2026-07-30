@@ -983,7 +983,9 @@ class AIAgent:
     # flushed (shown to the user) ONLY when every retry and fallback has
     # been exhausted; on success they are silently dropped.  Backend logs
     # (agent.log) are unaffected — every individual emission site still
-    # writes to ``logger.warning`` / ``logger.info`` for diagnosis.
+    # writes to ``logger.warning`` / ``logger.info`` for diagnosis.  When
+    # ``show_retry_status`` is enabled, all live messages use the common
+    # ``_emit_status`` channel so CLI, TUI, Desktop, and Gateway stay aligned.
 
     def _buffer_status(self, message: str) -> None:
         """Buffer a retry/fallback status message.
@@ -1012,7 +1014,7 @@ class AIAgent:
         """Buffer a vprint(force=True) retry/fallback line."""
         try:
             if getattr(self, "_show_retry_status", False):
-                self._vprint(f"{self.log_prefix}{message}", force=True)
+                self._emit_status(message)
                 return
             buf = getattr(self, "_retry_status_buffer", None)
             if buf is None:
@@ -1049,6 +1051,10 @@ class AIAgent:
                 # Clear before emitting so a (swallowed) callback error can't
                 # leave the notice set for a stale re-emit on a later turn.
                 self._pending_fallback_notice = None
+                # Live mode already surfaced the switching line through the
+                # common status channel during fallback activation.
+                if getattr(self, "_show_retry_status", False):
+                    return
                 self._emit_status(notice)
         except Exception:
             # Never break the conversation loop on a notice hiccup.

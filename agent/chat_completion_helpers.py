@@ -1872,12 +1872,12 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             f"🔄 Primary model failed — switching to fallback: "
             f"{fb_model} via {fb_provider}"
         )
-        # The buffered line above is dropped on successful recovery, but a
-        # provider/model switch is a durable state change operators must see
-        # even when the fallback succeeds.  Record a one-shot notice that the
-        # success path surfaces exactly once via _emit_pending_fallback_notice
-        # (see run_agent.py); it is discarded on terminal failure since the
-        # buffered line is flushed instead.  See fallback-observability fix.
+        # In the default buffered mode the line above is dropped on successful
+        # recovery, but a provider/model switch is a durable state change
+        # operators must see. Record a one-shot notice for the success path.
+        # Live show_retry_status mode already emitted the switching line via
+        # the common status channel, so _emit_pending_fallback_notice only
+        # clears this marker there rather than emitting a second notice.
         agent._pending_fallback_notice = (
             f"🔄 Switched to fallback model: {old_model} via {old_provider} "
             f"→ {fb_model} via {fb_provider}"

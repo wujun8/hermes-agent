@@ -722,8 +722,9 @@ agent:
   # underneath this wrapper — this is the Hermes-level loop.
   # api_max_retries: 3
 
-  # Show each API retry/fallback status immediately. By default these messages
-  # are buffered and only displayed if every recovery attempt fails.
+  # Show each API retry/fallback status immediately through the common status
+  # channel (CLI, TUI, Desktop, and Gateway). By default these messages are
+  # buffered and only displayed if every recovery attempt fails.
   # show_retry_status: false
 
   # After the agent edits code without fresh passing verification, nudge it to
