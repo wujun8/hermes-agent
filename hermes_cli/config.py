@@ -1040,6 +1040,15 @@ DEFAULT_CONFIG = {
         # on flaky primaries; raise it if you prefer to tolerate longer
         # provider hiccups on a single provider.
         "api_max_retries": 3,
+        # Optional active-turn recovery for long provider outages. When enabled,
+        # exhausted transient API failures park the current in-memory boundary
+        # and use this external command as the readiness signal.
+        "api_outage_recovery": {
+            "enabled": False,
+            "probe_command": "",
+            "probe_interval_seconds": 600,
+            "probe_timeout_seconds": 60,
+        },
         # Emit each retry/fallback status immediately instead of buffering the
         # trace until terminal failure. False preserves the quieter default.
         "show_retry_status": False,

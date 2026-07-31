@@ -31,6 +31,7 @@ from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.conversation_compression import conversation_history_after_compression
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
+from agent.api_outage_recovery import ApiOutageRecoveryWaiter
 from agent.iteration_budget import IterationBudget
 from agent.turn_context import (
     build_turn_context,
@@ -252,6 +253,49 @@ def _is_codex_transient_terminal_failure(status: str, error_obj: Any) -> bool:
     if status != "failed":
         return False
     return _codex_response_error_code(error_obj) in _CODEX_TRANSIENT_TERMINAL_ERROR_CODES
+
+
+def _park_for_api_outage_recovery(
+    agent: Any,
+    messages: List[Dict[str, Any]],
+    conversation_history: Any,
+) -> Optional[Dict[str, Any]]:
+    """Park the exact active API boundary, or return an interrupt result.
+
+    ``None`` means the external probe recovered and the caller should reset its
+    retry counter and continue the existing inner API loop.
+    """
+    config = getattr(agent, "_api_outage_recovery_config", None)
+    if not config or not config.enabled:
+        return None
+    waiter = getattr(agent, "_api_outage_recovery_waiter", None)
+    if not isinstance(waiter, ApiOutageRecoveryWaiter) and not hasattr(waiter, "wait"):
+        waiter = ApiOutageRecoveryWaiter(config)
+        agent._api_outage_recovery_waiter = waiter
+    endpoint_key = "|".join(
+        str(value or "")
+        for value in (agent.provider, agent.model, agent.base_url, agent.api_mode)
+    )
+    outcome = waiter.wait(
+        agent,
+        endpoint_key,
+        agent._emit_status,
+        agent._emit_status,
+    )
+    if outcome == "recovered":
+        return None
+
+    interrupt_text = "Operation interrupted while waiting for API outage recovery."
+    close_interrupted_tool_sequence(messages, interrupt_text)
+    agent._persist_session(messages, conversation_history)
+    agent.clear_interrupt()
+    return {
+        "final_response": interrupt_text,
+        "messages": messages,
+        "api_calls": agent._api_call_count,
+        "completed": False,
+        "interrupted": True,
+    }
 
 
 def _billing_or_entitlement_message(
@@ -1728,6 +1772,22 @@ def run_conversation(
                             retry_count = 0
                             compression_attempts = 0
                             _retry.primary_recovery_attempted = False
+                            continue
+                        if (
+                            _codex_transient_terminal_failure
+                            and getattr(
+                                getattr(agent, "_api_outage_recovery_config", None),
+                                "enabled",
+                                False,
+                            )
+                        ):
+                            _park_result = _park_for_api_outage_recovery(
+                                agent, messages, conversation_history
+                            )
+                            if _park_result is not None:
+                                return _park_result
+                            retry_count = 0
+                            response = None
                             continue
                         # Terminal — flush buffered retry trace so user sees what happened.
                         agent._flush_status_buffer()
@@ -4177,6 +4237,26 @@ def run_conversation(
                         retry_count = 0
                         compression_attempts = 0
                         _retry.primary_recovery_attempted = False
+                        continue
+                    if (
+                        classified.reason in {
+                            FailoverReason.server_error,
+                            FailoverReason.overloaded,
+                            FailoverReason.timeout,
+                        }
+                        and getattr(
+                            getattr(agent, "_api_outage_recovery_config", None),
+                            "enabled",
+                            False,
+                        )
+                    ):
+                        _park_result = _park_for_api_outage_recovery(
+                            agent, messages, conversation_history
+                        )
+                        if _park_result is not None:
+                            return _park_result
+                        retry_count = 0
+                        response = None
                         continue
                     # Terminal — flush buffered retry/fallback trace.
                     agent._flush_status_buffer()

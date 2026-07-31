@@ -106,6 +106,29 @@ agent:
 
 You can also run `hermes config set agent.show_retry_status true`. Live messages are not buffered, so a final failure does not display the same retry status twice.
 
+### Active-turn API outage recovery
+
+Hermes can optionally keep an active turn parked in memory when transient
+provider failures (`server_error`, overload, or timeout) exhaust retries and
+all configured fallbacks. It periodically runs an external readiness command;
+after that command exits successfully, Hermes retries the same model boundary
+without adding a synthetic message or replaying completed tool calls.
+
+```yaml
+agent:
+  api_outage_recovery:
+    enabled: true                 # default: false
+    probe_command: /path/to/check-provider --ready
+    probe_interval_seconds: 600   # minimum: 10
+    probe_timeout_seconds: 60     # minimum: 1
+```
+
+The probe command is executed directly (not through a shell). Its stdout and
+stderr are never added to the conversation or normal logs. Authentication,
+billing, rate-limit, request-format, content-policy, and unknown failures keep
+their existing terminal behavior. Interrupting a parked turn cancels it as an
+interruption rather than an API failure.
+
 ## Update Behavior
 
 `hermes update` settings live under `updates` in `config.yaml`:

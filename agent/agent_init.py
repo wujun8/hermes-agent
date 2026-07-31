@@ -1593,6 +1593,19 @@ def init_agent(
         _api_retries = 3
     agent._api_max_retries = _api_retries
 
+    # Optional active-turn outage parking. Keep the waiter on the agent so its
+    # per-endpoint probe throttle survives false-positive probe/API cycles.
+    from agent.api_outage_recovery import (
+        ApiOutageRecoveryConfig,
+        ApiOutageRecoveryWaiter,
+    )
+    agent._api_outage_recovery_config = ApiOutageRecoveryConfig.from_mapping(
+        _agent_section.get("api_outage_recovery", {})
+    )
+    agent._api_outage_recovery_waiter = ApiOutageRecoveryWaiter(
+        agent._api_outage_recovery_config
+    )
+
     # Retry/fallback status is buffered by default to avoid noisy transient
     # failure chatter. Opt in to live status when operators need immediate
     # visibility into each API retry attempt.
