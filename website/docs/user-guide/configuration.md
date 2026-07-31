@@ -123,6 +123,10 @@ agent:
     probe_timeout_seconds: 60     # minimum: 1
 ```
 
+`enabled: true` requires a nonempty `probe_command`. If the command is empty or
+only whitespace, outage recovery is effectively disabled and exhausted API
+failures keep their existing terminal behavior.
+
 The probe command is executed directly with `shell=False`; shell syntax is not
 interpreted, so pipes, redirection, globbing, and operators such as `&&` do not
 work. Put multi-step logic in an executable script. To supply environment
@@ -140,6 +144,11 @@ disabled for that chain.
 Parked turns and probe-throttle timestamps exist only in process memory and are
 **not durable**. Restarting the Hermes process, gateway, or machine discards the
 parked turn rather than resuming it.
+
+Probe throttling is per Agent instance, not process-global. Concurrent sessions
+and subagents each have an independent Agent and may therefore run the same
+read-only probe during the same interval; Hermes does not coordinate or dedupe
+probes across Agents.
 
 Authentication, billing, rate-limit, request-format, content-policy, and unknown
 failures keep their existing terminal behavior. Interrupting a parked turn

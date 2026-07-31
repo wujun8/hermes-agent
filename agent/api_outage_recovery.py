@@ -25,9 +25,12 @@ class ApiOutageRecoveryConfig:
     def from_mapping(cls, raw: Any) -> "ApiOutageRecoveryConfig":
         if not isinstance(raw, Mapping):
             raw = {}
-        enabled = str(raw.get("enabled", False)).strip().lower() in _TRUE_VALUES
         command_raw = raw.get("probe_command", "")
         command = command_raw.strip() if isinstance(command_raw, str) else ""
+        enabled = (
+            str(raw.get("enabled", False)).strip().lower() in _TRUE_VALUES
+            and bool(command)
+        )
         try:
             interval = max(10, int(raw.get("probe_interval_seconds", 600)))
         except (TypeError, ValueError):
@@ -193,3 +196,9 @@ class ApiOutageRecoveryWaiter:
                 self._sleep(0.2)
         finally:
             agent._api_outage_waiting = False
+            try:
+                agent._touch_activity("API outage recovery wait ended")
+            except Exception:
+                # Cleanup observability is best-effort and must not replace the
+                # wait result or an exception from a status callback.
+                pass

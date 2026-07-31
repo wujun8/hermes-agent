@@ -68,6 +68,33 @@ def test_live_api_outage_wait_requires_flag_and_fresh_activity(
     assert delegate_tool._is_live_api_outage_wait(child) is expected
 
 
+_MISSING = object()
+
+
+@pytest.mark.parametrize(
+    ("last_activity", "expected"),
+    [
+        (_MISSING, False),
+        (None, False),
+        ("999", False),
+        (True, False),
+        (1001.0, False),
+        (911.0, True),
+        (909.0, False),
+    ],
+)
+def test_live_api_outage_wait_activity_timestamp_is_fail_closed_at_boundaries(
+    last_activity, expected
+):
+    child = _OutageChild(waiting=True)
+    if last_activity is _MISSING:
+        del child._last_activity_ts
+    else:
+        child._last_activity_ts = last_activity
+
+    assert delegate_tool._is_live_api_outage_wait(child, now=1000.0) is expected
+
+
 def test_wait_helper_pauses_timeout_budget_then_future_can_complete():
     child = _OutageChild(waiting=True)
     future = Future()

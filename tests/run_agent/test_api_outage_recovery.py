@@ -87,6 +87,7 @@ def test_probe_fail_fail_success_is_interval_throttled_and_safe():
     assert all("Probe still failing; next probe in ~600s" in notice for notice in notices[1:3])
     assert "succeeded" in notices[3]
     assert agent.touches
+    assert agent.touches[-1] == "API outage recovery wait ended"
 
 
 def test_real_agent_wait_marker_is_live_only_while_waiter_is_blocked():
@@ -120,7 +121,7 @@ def test_real_agent_wait_marker_is_live_only_while_waiter_is_blocked():
     assert delegate_tool._is_live_api_outage_wait(agent) is False
 
 
-def test_wait_marker_clears_on_interrupt_and_callback_exception():
+def test_wait_marker_clears_and_touches_activity_on_interrupt():
     interrupted_agent = FakeAgent()
     interrupted_agent._interrupt_requested = True
     waiter = ApiOutageRecoveryWaiter(ApiOutageRecoveryConfig(True, "", 600, 60))
@@ -129,8 +130,18 @@ def test_wait_marker_clears_on_interrupt_and_callback_exception():
         interrupted_agent, "interrupt", lambda _m: None, lambda _m: None
     ) == "interrupted"
     assert interrupted_agent._api_outage_waiting is False
+    assert interrupted_agent.touches[-1] == "API outage recovery wait ended"
 
-    exception_agent = FakeAgent()
+
+def test_wait_callback_exception_is_preserved_when_exit_touch_also_fails():
+    class ExitTouchFailureAgent(FakeAgent):
+        def _touch_activity(self, detail):
+            super()._touch_activity(detail)
+            if detail == "API outage recovery wait ended":
+                raise RuntimeError("exit touch failed")
+
+    exception_agent = ExitTouchFailureAgent()
+    waiter = ApiOutageRecoveryWaiter(ApiOutageRecoveryConfig(True, "", 600, 60))
 
     def fail_status(_message):
         raise RuntimeError("status sink failed")
@@ -143,6 +154,22 @@ def test_wait_marker_clears_on_interrupt_and_callback_exception():
             lambda _m: None,
         )
     assert exception_agent._api_outage_waiting is False
+    assert exception_agent.touches[-1] == "API outage recovery wait ended"
+
+
+def test_wait_success_result_is_preserved_when_exit_touch_fails():
+    class ExitTouchFailureAgent(FakeAgent):
+        def _touch_activity(self, detail):
+            super()._touch_activity(detail)
+            if detail == "API outage recovery wait ended":
+                raise RuntimeError("exit touch failed")
+
+    waiter, _calls, _clock = _waiter([0])
+    agent = ExitTouchFailureAgent()
+
+    assert waiter.wait(agent, "endpoint", lambda _m: None, lambda _m: None) == "recovered"
+    assert agent._api_outage_waiting is False
+    assert agent.touches[-1] == "API outage recovery wait ended"
 
 
 def test_false_positive_then_repark_waits_remaining_interval_before_next_probe():
@@ -280,6 +307,7 @@ def test_interrupt_terminates_probe_process_group_deterministically():
     [
         ({}, ApiOutageRecoveryConfig(False, "", 600, 60)),
         ({"enabled": "yes", "probe_command": "check", "probe_interval_seconds": 1, "probe_timeout_seconds": 0}, ApiOutageRecoveryConfig(True, "check", 10, 1)),
+        ({"enabled": True, "probe_command": "   "}, ApiOutageRecoveryConfig(False, "", 600, 60)),
         ({"enabled": "no", "probe_command": 123, "probe_interval_seconds": "bad", "probe_timeout_seconds": None}, ApiOutageRecoveryConfig(False, "", 600, 60)),
     ],
 )
@@ -299,7 +327,9 @@ def test_config_defaults_are_known_and_disabled():
     assert _validate_config_key("agent.api_outage_recovery.enabled") == (True, None)
 
 
-def _make_agent(*, api_mode="chat_completions", max_retries=1):
+def _make_agent(
+    *, api_mode="chat_completions", max_retries=1, probe_command="probe --ready"
+):
     with (
         patch("run_agent.get_tool_definitions", return_value=[]),
         patch("run_agent.check_toolset_requirements", return_value={}),
@@ -311,7 +341,7 @@ def _make_agent(*, api_mode="chat_completions", max_retries=1):
                     "api_max_retries": max_retries,
                     "api_outage_recovery": {
                         "enabled": True,
-                        "probe_command": "probe --ready",
+                        "probe_command": probe_command,
                         "probe_interval_seconds": 600,
                         "probe_timeout_seconds": 60,
                     },
@@ -387,6 +417,23 @@ def _run(agent, api_side_effect, *, conversation_history=None):
         return agent.run_conversation(
             "hello", conversation_history=conversation_history
         )
+
+
+@pytest.mark.parametrize("probe_command", ["", "   "])
+def test_agent_effectively_disables_outage_recovery_without_usable_probe_command(
+    probe_command,
+):
+    agent = _make_agent(probe_command=probe_command)
+    waiter = MagicMock()
+    agent._api_outage_recovery_waiter = waiter
+
+    assert agent._api_outage_recovery_config.probe_command == ""
+    assert agent._api_outage_recovery_config.enabled is False
+
+    result = _run(agent, HttpError(503, "server overloaded"))
+
+    assert result["failed"] is True
+    waiter.wait.assert_not_called()
 
 
 @pytest.mark.parametrize(
