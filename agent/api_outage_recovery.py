@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import os
 import shlex
+import signal
 import subprocess
-import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping
@@ -59,6 +60,32 @@ class ApiOutageRecoveryWaiter:
         self._runner = runner
         self._last_probe_at: dict[str, float] = {}
 
+    @staticmethod
+    def _stop_process(process: subprocess.Popen) -> None:
+        """Stop a probe and its descendants without leaking a process."""
+        if process.poll() is not None:
+            return
+        try:
+            if os.name == "posix":
+                os.killpg(process.pid, signal.SIGTERM)
+            else:
+                process.terminate()
+            process.wait(timeout=1.0)
+            return
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        try:
+            if os.name == "posix":
+                os.killpg(process.pid, signal.SIGKILL)
+            else:
+                process.kill()
+        except OSError:
+            pass
+        try:
+            process.wait(timeout=1.0)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
     def _run_probe(self, argv: list[str], agent: Any) -> str:
         """Return success/failure/interrupted without exposing probe output."""
         if self._runner is not None:
@@ -75,36 +102,30 @@ class ApiOutageRecoveryWaiter:
             except Exception:
                 return "failure"
 
+        popen_kwargs = {
+            "shell": False,
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+            "text": True,
+        }
+        if os.name == "posix":
+            # A dedicated session lets interruption/timeout stop descendants,
+            # not just the immediate probe executable.
+            popen_kwargs["start_new_session"] = True
         try:
-            process = subprocess.Popen(
-                argv,
-                shell=False,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
+            process = subprocess.Popen(argv, **popen_kwargs)
         except Exception:
             return "failure"
 
-        process_done: list[bool] = []
-
-        def communicate() -> None:
-            process.communicate()
-            process_done.append(True)
-
-        reader = threading.Thread(target=communicate, daemon=True)
-        reader.start()
         deadline = self._clock() + self.config.probe_timeout_seconds
         next_touch = self._clock() + 30.0
-        while not process_done:
+        while process.poll() is None:
             if getattr(agent, "_interrupt_requested", False):
-                process.kill()
-                reader.join(timeout=1.0)
+                self._stop_process(process)
                 return "interrupted"
             now = self._clock()
             if now >= deadline:
-                process.kill()
-                reader.join(timeout=1.0)
+                self._stop_process(process)
                 return "failure"
             if now >= next_touch:
                 agent._touch_activity("running API outage recovery probe")
@@ -119,44 +140,56 @@ class ApiOutageRecoveryWaiter:
         on_parked: Callable[[str], None],
         on_recovered: Callable[[str], None],
     ) -> str:
-        interval = self.config.probe_interval_seconds
-        last_probe = self._last_probe_at.get(endpoint_key)
-        now = self._clock()
-        delay = max(0.0, interval - (now - last_probe)) if last_probe is not None else 0.0
-        on_parked(
-            "⏸️ API outage，当前任务已原地停放；"
-            f"下一次外部探测将在约 {int(delay)} 秒后进行。"
-        )
-        next_touch = now + 30.0
-
-        while True:
-            if getattr(agent, "_interrupt_requested", False):
-                return "interrupted"
-
-            now = self._clock()
-            if now >= next_touch:
-                agent._touch_activity("waiting for API outage recovery probe")
-                next_touch = now + 30.0
-
+        agent._api_outage_waiting = True
+        try:
+            agent._touch_activity("waiting for API outage recovery probe")
+            interval = self.config.probe_interval_seconds
             last_probe = self._last_probe_at.get(endpoint_key)
-            due = last_probe is None or now - last_probe >= interval
-            if due and self.config.probe_command:
-                # Record before launching: timeout/failure and false-positive
-                # recovery are both throttled from this exact attempt.
-                self._last_probe_at[endpoint_key] = now
-                try:
-                    argv = shlex.split(self.config.probe_command)
-                    if argv:
-                        probe_result = self._run_probe(argv, agent)
-                        if probe_result == "interrupted":
-                            return "interrupted"
-                        if probe_result == "success":
-                            on_recovered("✅ API 外部探测恢复成功，正在从原 API 边界继续任务。")
-                            return "recovered"
-                except Exception:
-                    # Missing executable, malformed command, timeout, and probe
-                    # failures all mean "keep waiting". Deliberately do not log
-                    # command output: it may contain credentials.
-                    pass
+            now = self._clock()
+            delay = (
+                max(0.0, interval - (now - last_probe))
+                if last_probe is not None
+                else 0.0
+            )
+            on_parked(
+                "⏸️ API outage: active turn parked in memory; "
+                f"next external probe in ~{int(delay)}s."
+            )
+            next_touch = now + 30.0
 
-            self._sleep(0.2)
+            while True:
+                if getattr(agent, "_interrupt_requested", False):
+                    return "interrupted"
+
+                now = self._clock()
+                if now >= next_touch:
+                    agent._touch_activity("waiting for API outage recovery probe")
+                    next_touch = now + 30.0
+
+                last_probe = self._last_probe_at.get(endpoint_key)
+                due = last_probe is None or now - last_probe >= interval
+                if due and self.config.probe_command:
+                    # Record before launching: timeout/failure and false-positive
+                    # recovery are both throttled from this exact attempt.
+                    self._last_probe_at[endpoint_key] = now
+                    try:
+                        argv = shlex.split(self.config.probe_command)
+                    except ValueError:
+                        argv = []
+                    probe_result = self._run_probe(argv, agent) if argv else "failure"
+                    if probe_result == "interrupted":
+                        return "interrupted"
+                    if probe_result == "success":
+                        on_recovered(
+                            "✅ External API recovery probe succeeded; "
+                            "resuming from the same API boundary."
+                        )
+                        return "recovered"
+                    on_parked(
+                        "⚠️ Probe still failing; "
+                        f"next probe in ~{interval}s."
+                    )
+
+                self._sleep(0.2)
+        finally:
+            agent._api_outage_waiting = False

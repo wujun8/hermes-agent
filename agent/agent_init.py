@@ -1605,6 +1605,9 @@ def init_agent(
     agent._api_outage_recovery_waiter = ApiOutageRecoveryWaiter(
         agent._api_outage_recovery_config
     )
+    # Delegation timeout accounting reads this explicit marker.  The waiter
+    # owns all transitions and refreshes activity while it is true.
+    agent._api_outage_waiting = False
 
     # Retry/fallback status is buffered by default to avoid noisy transient
     # failure chatter. Opt in to live status when operators need immediate

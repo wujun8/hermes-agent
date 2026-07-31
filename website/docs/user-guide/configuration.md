@@ -123,11 +123,27 @@ agent:
     probe_timeout_seconds: 60     # minimum: 1
 ```
 
-The probe command is executed directly (not through a shell). Its stdout and
-stderr are never added to the conversation or normal logs. Authentication,
-billing, rate-limit, request-format, content-policy, and unknown failures keep
-their existing terminal behavior. Interrupting a parked turn cancels it as an
-interruption rather than an API failure.
+The probe command is executed directly with `shell=False`; shell syntax is not
+interpreted, so pipes, redirection, globbing, and operators such as `&&` do not
+work. Put multi-step logic in an executable script. To supply environment
+variables without a shell, use a command such as
+`/usr/bin/env FOO=bar /path/to/check-provider --ready`. Probe stdout and stderr
+are discarded and never added to the conversation or normal logs.
+
+The probe must test the endpoint for the provider/runtime that is active when
+Hermes parks. After a fallback chain is exhausted, that is currently the last
+active fallback, not automatically the primary provider. A single probe command
+may therefore be unable to represent every endpoint in a heterogeneous fallback
+chain; use a script that checks the relevant routes or leave this feature
+disabled for that chain.
+
+Parked turns and probe-throttle timestamps exist only in process memory and are
+**not durable**. Restarting the Hermes process, gateway, or machine discards the
+parked turn rather than resuming it.
+
+Authentication, billing, rate-limit, request-format, content-policy, and unknown
+failures keep their existing terminal behavior. Interrupting a parked turn
+cancels it as an interruption rather than an API failure.
 
 ## Update Behavior
 
