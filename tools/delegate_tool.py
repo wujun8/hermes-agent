@@ -604,6 +604,8 @@ _MIN_SUMMARY_CHARS = 2000
 # in via delegation.child_timeout_seconds.
 DEFAULT_CHILD_TIMEOUT: Optional[float] = None
 _HEARTBEAT_INTERVAL = 30  # seconds between parent activity heartbeats during delegation
+_API_OUTAGE_ACTIVITY_FRESHNESS = 90.0
+_CHILD_RESULT_POLL_INTERVAL = 0.25
 # Stale-heartbeat thresholds. A child with no API-call progress is either:
 #   - idle between turns (no current_tool) — probably stuck on a slow API call
 #   - inside a tool (current_tool set) — probably running a legitimately long
@@ -1788,6 +1790,67 @@ def _apply_summary_budget(results: List[Dict[str, Any]], parent_agent) -> None:
         )
 
 
+def _is_live_api_outage_wait(child, *, now: Optional[float] = None) -> bool:
+    """Return whether ``child`` is actively reporting an API recovery wait.
+
+    The flag alone is insufficient: a wedged child could leave it set forever.
+    A recent wall-clock activity touch is therefore required as a fail-closed
+    liveness signal.
+    """
+    if getattr(child, "_api_outage_waiting", False) is not True:
+        return False
+    last_activity = getattr(child, "_last_activity_ts", None)
+    if isinstance(last_activity, bool) or not isinstance(last_activity, (int, float)):
+        return False
+    age = (time.time() if now is None else now) - float(last_activity)
+    return 0.0 <= age <= _API_OUTAGE_ACTIVITY_FRESHNESS
+
+
+class _ChildActiveTimeout(FuturesTimeoutError):
+    """The delegation active-time budget expired (not a child exception)."""
+
+
+def _wait_for_child_result(
+    future,
+    child,
+    timeout: Optional[float],
+    *,
+    poll_interval: float = _CHILD_RESULT_POLL_INTERVAL,
+):
+    """Wait for a child while charging only active time to its timeout.
+
+    API-outage recovery waits pause the budget only while their activity touch
+    remains fresh. Polling also lets a cleared flag resume the existing budget
+    rather than granting a new timeout window.
+    """
+    if timeout is None:
+        return future.result()
+
+    remaining = float(timeout)
+    last_poll = time.monotonic()
+    while True:
+        live_outage_before = _is_live_api_outage_wait(child)
+        if not live_outage_before and remaining <= 0:
+            raise _ChildActiveTimeout()
+        wait_seconds = (
+            poll_interval
+            if live_outage_before
+            else min(poll_interval, max(remaining, 0.0))
+        )
+        try:
+            return future.result(timeout=wait_seconds)
+        except FuturesTimeoutError:
+            # ``TimeoutError`` may be the child's real exception. A completed
+            # future distinguishes that from our polling deadline.
+            if future.done():
+                return future.result()
+            now_mono = time.monotonic()
+            elapsed = now_mono - last_poll
+            if not (live_outage_before and _is_live_api_outage_wait(child)):
+                remaining -= elapsed
+            last_poll = now_mono
+
+
 def _run_single_child(
     task_index: int,
     goal: str,
@@ -1845,59 +1908,63 @@ def _run_single_child(
                 continue
             # Pull detail from the child's own activity tracker
             desc = f"delegate_task: subagent {task_index} working"
+            live_outage_wait = _is_live_api_outage_wait(child)
+            if live_outage_wait:
+                desc = "delegate_task: subagent waiting for API recovery"
             try:
                 child_summary = child.get_activity_summary()
                 child_tool = child_summary.get("current_tool")
                 child_iter = child_summary.get("api_call_count", 0)
                 child_max = child_summary.get("max_iterations", 0)
 
-                # Stale detection: count cycles where neither the iteration
-                # count nor the current_tool advances. A child running a
-                # legitimately long-running tool (terminal command, web
-                # fetch) keeps current_tool set but doesn't advance
-                # api_call_count — we don't want that to look stale at the
-                # idle threshold.
-                iter_advanced = child_iter > _last_seen_iter[0]
-                tool_changed = child_tool != _last_seen_tool[0]
-                if iter_advanced or tool_changed:
+                if live_outage_wait:
+                    # API recovery is intentional idle time. Fresh activity
+                    # touches prove liveness, so it must not accrue stale
+                    # heartbeat cycles.
                     _last_seen_iter[0] = child_iter
                     _last_seen_tool[0] = child_tool
                     _stale_count[0] = 0
+                    desc += f" (iteration {child_iter}/{child_max})"
                 else:
-                    _stale_count[0] += 1
+                    # Stale detection: count cycles where neither the iteration
+                    # count nor the current_tool advances. A child running a
+                    # legitimately long-running tool gets the higher threshold.
+                    iter_advanced = child_iter > _last_seen_iter[0]
+                    tool_changed = child_tool != _last_seen_tool[0]
+                    if iter_advanced or tool_changed:
+                        _last_seen_iter[0] = child_iter
+                        _last_seen_tool[0] = child_tool
+                        _stale_count[0] = 0
+                    else:
+                        _stale_count[0] += 1
 
-                # Pick threshold based on whether the child is currently
-                # inside a tool call. In-tool threshold is high enough to
-                # cover legitimately slow tools; idle threshold stays
-                # tight so the gateway timeout can fire on a truly wedged
-                # child.
-                stale_limit = (
-                    _HEARTBEAT_STALE_CYCLES_IN_TOOL
-                    if child_tool
-                    else _HEARTBEAT_STALE_CYCLES_IDLE
-                )
-                if _stale_count[0] >= stale_limit:
-                    logger.warning(
-                        "Subagent %d appears stale (no progress for %d "
-                        "heartbeat cycles, tool=%s) — stopping heartbeat",
-                        task_index,
-                        _stale_count[0],
-                        child_tool or "<none>",
+                    stale_limit = (
+                        _HEARTBEAT_STALE_CYCLES_IN_TOOL
+                        if child_tool
+                        else _HEARTBEAT_STALE_CYCLES_IDLE
                     )
-                    break  # stop touching parent, let gateway timeout fire
+                    if _stale_count[0] >= stale_limit:
+                        logger.warning(
+                            "Subagent %d appears stale (no progress for %d "
+                            "heartbeat cycles, tool=%s) — stopping heartbeat",
+                            task_index,
+                            _stale_count[0],
+                            child_tool or "<none>",
+                        )
+                        break  # stop touching parent, let gateway timeout fire
 
-                if child_tool:
-                    desc = (
-                        f"delegate_task: subagent running {child_tool} "
-                        f"(iteration {child_iter}/{child_max})"
-                    )
-                else:
-                    child_desc = child_summary.get("last_activity_desc", "")
-                    if child_desc:
+                    if child_tool:
                         desc = (
-                            f"delegate_task: subagent {child_desc} "
+                            f"delegate_task: subagent running {child_tool} "
                             f"(iteration {child_iter}/{child_max})"
                         )
+                    else:
+                        child_desc = child_summary.get("last_activity_desc", "")
+                        if child_desc:
+                            desc = (
+                                f"delegate_task: subagent {child_desc} "
+                                f"(iteration {child_iter}/{child_max})"
+                            )
             except Exception:
                 pass
             try:
@@ -2010,7 +2077,7 @@ def _run_single_child(
 
         _child_future = _timeout_executor.submit(_run_with_thread_capture)
         try:
-            result = _child_future.result(timeout=child_timeout)
+            result = _wait_for_child_result(_child_future, child, child_timeout)
         except Exception as _timeout_exc:
             # Signal the child to stop so its thread can exit cleanly.
             try:
@@ -2021,7 +2088,7 @@ def _run_single_child(
             except Exception:
                 pass
 
-            is_timeout = isinstance(_timeout_exc, (FuturesTimeoutError, TimeoutError))
+            is_timeout = isinstance(_timeout_exc, _ChildActiveTimeout)
             duration = round(time.monotonic() - child_start, 2)
             logger.warning(
                 "Subagent %d %s after %.1fs",
