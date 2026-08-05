@@ -700,6 +700,73 @@ def _journal_update(
     )
 
 
+def _find_unfinished_release_transaction(
+    git_cmd: list[str], cwd: Path | str
+) -> tuple[Path, dict] | None:
+    """Return the first durable transaction journal that still requires recovery."""
+
+    common = _git_common_dir(git_cmd, cwd)
+    transactions = common / "hermes-upgrade-transactions"
+    try:
+        entries = sorted(transactions.iterdir())
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise RuntimeError(
+            f"Could not inspect release transaction recovery state: {exc}"
+        ) from exc
+
+    for entry in entries:
+        try:
+            info = entry.lstat()
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise RuntimeError(
+                f"Unexpected release transaction entry; refusing to continue: {entry}"
+            )
+        journal_path = entry / "journal.json"
+        try:
+            journal_info = journal_path.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise RuntimeError(
+                f"Could not inspect release transaction journal {journal_path}: {exc}"
+            ) from exc
+        if stat.S_ISLNK(journal_info.st_mode) or not stat.S_ISREG(journal_info.st_mode):
+            raise RuntimeError(
+                f"Refusing non-regular release transaction journal: {journal_path}"
+            )
+        try:
+            journal = json.loads(journal_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"Unfinished release transaction journal is unreadable: {journal_path}"
+            ) from exc
+        if not isinstance(journal, dict):
+            raise RuntimeError(
+                f"Unfinished release transaction journal is invalid: {journal_path}"
+            )
+        return journal_path, journal
+    return None
+
+
+def _reject_unfinished_release_transaction(
+    git_cmd: list[str], cwd: Path | str
+) -> None:
+    found = _find_unfinished_release_transaction(git_cmd, cwd)
+    if found is None:
+        return
+    journal_path, journal = found
+    phase = journal.get("phase") or journal.get("state") or "unknown"
+    raise RuntimeError(
+        "An unfinished release transaction is already recorded at "
+        f"{journal_path} (phase={phase}); recover it before starting another "
+        "release upgrade."
+    )
+
+
 def _create_release_upgrade_context(
     git_cmd: list[str],
     cwd: Path | str,
@@ -1134,7 +1201,12 @@ def _upgrade_release_transaction(
             _journal_update(context, "promotion-needs-recovery")
             raise RuntimeError(
                 f"Promotion did not verify. Recover with backup ref {backup_ref} "
-                f"and candidate {candidate_path}."
+                f"and candidate {candidate_path}. Journal: {context.journal_path}. "
+                f"If refs/heads/{branch} still resolves to {candidate_sha}, use the "
+                f"pinned compare-and-swap rollback: git update-ref refs/heads/{branch} "
+                f"{old_sha} {candidate_sha}. Immutable stash: "
+                f"{journal.get('stash_sha') or '<none>'} "
+                f"(stash_pending={journal.get('stash_pending')})."
             )
         _journal_update(context, "promoted")
     except BaseException:
@@ -1198,6 +1270,7 @@ def _prepare_and_promote_release(
     root = Path(cwd)
     branch = "hermes-release"
     _validate_release_tag_name(git_cmd, root, release_tag)
+    _reject_unfinished_release_transaction(git_cmd, root)
     original_branch, original_head_sha = _capture_release_checkout_identity(git_cmd, root)
     maintenance_sha = _git_resolve_commit(git_cmd, root, f"refs/heads/{branch}")
     if maintenance_sha is None:
@@ -1459,6 +1532,19 @@ def _finalize_release_upgrade(
                 f"  Search for marker {journal.get('stash_marker')!r} with: "
                 "git stash list --format='%gd %H %s'"
             )
+            return False
+
+        if stash_pending and journal.get("stash_apply_attempted") and not journal.get(
+            "stash_applied"
+        ):
+            assert stash_sha is not None
+            _journal_update(context, "stash-restore-conflict")
+            print(
+                "✗ Release user-state restore was already attempted and remains "
+                "unresolved; leaving the immutable stash untouched."
+            )
+            print(f"  Recovery journal retained at {context.journal_path}")
+            _print_stash_cleanup_guidance(stash_sha)
             return False
 
         _journal_update(context, "finalizing")
