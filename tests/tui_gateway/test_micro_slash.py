@@ -1413,6 +1413,206 @@ def test_release_close_barrier_does_not_touch_detached_target_or_new_lease(
                 server._sessions.pop("sid-close-barrier", None)
 
 
+def test_deferred_reanchor_entry_guard_blocks_stale_mutation_after_registry_gap(
+    gateway, monkeypatch
+):
+    server, db, _home = gateway
+    old_key = "entry-gap-old"
+    new_key = "entry-gap-new"
+    old_agent = LiveAgent(db, old_key)
+    old_session = _session(server, db, "sid-entry-gap", old_key, old_agent)
+    db.create_session(new_key, source="tui", model="test-model")
+    monkeypatch.setattr(server, "_transfer_active_session_slot", lambda *_a, **_k: True)
+    monkeypatch.setattr(server, "_restart_slash_worker", lambda *_a, **_k: None)
+
+    target, claim_error = server._claim_live_micro_control("sid-entry-gap", old_session)
+    assert claim_error is None
+    assert target is not None
+    old_generation = int(old_session.get("session_generation", 0) or 0)
+    old_row = db.get_session(old_key)
+    new_row = db.get_session(new_key)
+    old_agent.session_id = new_key
+    assert server._sync_session_key_after_compress("sid-entry-gap", old_session) == "deferred"
+    marker = old_session["_deferred_compression_rotation"]
+
+    replacement_agent = LiveAgent(db, new_key)
+    replacement_session = _session(
+        server, db, "sid-entry-gap-replacement", new_key, replacement_agent
+    )
+    replacement_token = object()
+    replacement_state = {"replacement": True}
+    replacement_session["_session_control_inflight"] = replacement_token
+    replacement_session["_micro_control_state"] = replacement_state
+    replacement_key = replacement_session["session_key"]
+    replacement_generation = int(replacement_session.get("session_generation", 0) or 0)
+
+    sync_entered = threading.Event()
+    sync_release = threading.Event()
+    real_sync = server._sync_session_key_after_compress
+
+    def gated_sync(*args, **kwargs):
+        sync_entered.set()
+        assert sync_release.wait(5), "deferred sync entry was not released"
+        return real_sync(*args, **kwargs)
+
+    monkeypatch.setattr(server, "_sync_session_key_after_compress", gated_sync)
+    mutation_calls: list[str] = []
+    monkeypatch.setattr(
+        server,
+        "_transfer_active_session_slot",
+        lambda *_a, **_k: mutation_calls.append("lease") or True,
+    )
+    monkeypatch.setattr(
+        server,
+        "_restart_slash_worker",
+        lambda *_a, **_k: mutation_calls.append("worker"),
+    )
+    with patch("tools.approval.unregister_gateway_notify", lambda *_a: mutation_calls.append("unregister")), patch(
+        "tools.approval.enable_session_yolo", lambda *_a: mutation_calls.append("enable")), patch(
+        "tools.approval.disable_session_yolo", lambda *_a: mutation_calls.append("disable")), patch(
+        "tools.approval.is_session_yolo_enabled", return_value=False), patch(
+        "tools.approval.register_gateway_notify", lambda *_a, **_k: mutation_calls.append("register")
+    ):
+        release_result: dict = {}
+
+        def release_target() -> None:
+            release_result["value"] = server._release_live_micro_control(target)
+
+        release_thread = threading.Thread(target=release_target)
+        release_thread.start()
+        try:
+            assert sync_entered.wait(2), "release did not reach the sync-entry barrier"
+            with server._sessions_lock:
+                server._sessions["sid-entry-gap"] = replacement_session
+            sync_release.set()
+            release_thread.join(timeout=5)
+        finally:
+            sync_release.set()
+            release_thread.join(timeout=5)
+
+    assert not release_thread.is_alive()
+    result = release_result["value"]
+    assert not result
+    assert "changed" in result.warning.lower()
+    assert old_session["session_key"] == old_key
+    assert int(old_session.get("session_generation", 0) or 0) == old_generation
+    assert old_session.get("_session_control_inflight") is None
+    assert old_session.get("_deferred_compression_rotation") is marker
+    assert mutation_calls == []
+    assert db.get_session(old_key) == old_row
+    assert db.get_session(new_key) == new_row
+    assert server._sessions["sid-entry-gap"] is replacement_session
+    assert replacement_session["session_key"] == replacement_key
+    assert int(replacement_session.get("session_generation", 0) or 0) == replacement_generation
+    assert replacement_session.get("_session_control_inflight") is replacement_token
+    assert replacement_session.get("_micro_control_state") is replacement_state
+
+
+def test_deferred_reanchor_reservation_blocks_production_transitions_until_sync_finishes(
+    gateway, monkeypatch
+):
+    server, db, _home = gateway
+    old_key = "reservation-old"
+    new_key = "reservation-new"
+    agent = LiveAgent(db, old_key)
+    session = _session(server, db, "sid-reservation", old_key, agent)
+    db.create_session(new_key, source="tui", model="test-model")
+    monkeypatch.setattr(server, "_restart_slash_worker", lambda *_a, **_k: None)
+    target, claim_error = server._claim_live_micro_control("sid-reservation", session)
+    assert claim_error is None
+    assert target is not None
+    agent.session_id = new_key
+    assert server._sync_session_key_after_compress("sid-reservation", session) == "deferred"
+
+    transfer_entered = threading.Event()
+    transfer_release = threading.Event()
+
+    def blocked_transfer(*_args, **_kwargs):
+        transfer_entered.set()
+        assert transfer_release.wait(5), "re-anchor transfer seam was not released"
+        return True
+
+    monkeypatch.setattr(server, "_transfer_active_session_slot", blocked_transfer)
+    release_result: dict = {}
+    with patch("tools.approval.unregister_gateway_notify"), patch(
+        "tools.approval.enable_session_yolo"
+    ), patch("tools.approval.disable_session_yolo"), patch(
+        "tools.approval.is_session_yolo_enabled", return_value=False
+    ), patch("tools.approval.register_gateway_notify"):
+        release_thread = threading.Thread(
+            target=lambda: release_result.setdefault(
+                "value", server._release_live_micro_control(target)
+            )
+        )
+        release_thread.start()
+        try:
+            assert transfer_entered.wait(2), "release did not retain control through transfer"
+            assert server._pop_session_by_id("sid-reservation") is server._SESSION_CONTROL_BUSY
+            assert server._live_session_payload(
+                "sid-reservation", session, reject_session_control=True
+            ) is None
+            assert server._claim_or_reuse_live(
+                "sid-reservation-reuse", new_key, {}, None
+            ) is server._SESSION_CONTROL_BUSY
+            assert server._claim_or_reuse_live(
+                "sid-reservation-reuse-old", old_key, {}, None
+            ) is server._SESSION_CONTROL_BUSY
+            manual_token, manual_error = server._claim_manual_compression_control(session)
+            assert manual_token is None
+            assert manual_error is server._SESSION_CONTROL_BUSY
+            assert server._try_claim_session_control(session) is None
+            close_response = server._methods["session.close"](
+                "rid", {"session_id": "sid-reservation"}
+            )
+            assert close_response["error"]["code"] == 4009
+            with server._sessions_lock:
+                assert server._sessions["sid-reservation"] is session
+            transfer_release.set()
+            release_thread.join(timeout=5)
+        finally:
+            transfer_release.set()
+            release_thread.join(timeout=5)
+
+    assert not release_thread.is_alive()
+    assert release_result["value"]
+    assert session["session_key"] == new_key
+    assert session.get("_deferred_compression_rotation") is None
+    assert session.get("_session_control_inflight") is None
+
+
+def test_sync_session_key_after_compress_legacy_no_history_lock_compatibility(
+    gateway, monkeypatch
+):
+    server, db, _home = gateway
+    old_key = "legacy-lockless-old"
+    new_key = "legacy-lockless-new"
+    agent = LiveAgent(db, old_key)
+    db.create_session(old_key, source="tui", model="test-model")
+    db.create_session(new_key, source="tui", model="test-model")
+    session = {
+        "agent": agent,
+        "session_key": old_key,
+        "session_generation": 0,
+        "pending_title": "old title",
+        "profile_home": None,
+        "slash_worker": None,
+    }
+    agent.session_id = new_key
+    monkeypatch.setattr(server, "_transfer_active_session_slot", lambda *_a, **_k: True)
+    monkeypatch.setattr(server, "_restart_slash_worker", lambda *_a, **_k: None)
+    with patch("tools.approval.unregister_gateway_notify"), patch(
+        "tools.approval.enable_session_yolo"
+    ), patch("tools.approval.disable_session_yolo"), patch(
+        "tools.approval.is_session_yolo_enabled", return_value=False
+    ), patch("tools.approval.register_gateway_notify"):
+        status = server._sync_session_key_after_compress("sid-legacy-lockless", session)
+
+    assert status == "applied"
+    assert session["session_key"] == new_key
+    assert session["session_generation"] == 1
+    assert session["pending_title"] is None
+
+
 def test_release_reanchor_leaves_history_and_registry_locks_available(
     gateway, monkeypatch
 ):
