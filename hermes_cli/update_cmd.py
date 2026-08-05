@@ -118,21 +118,94 @@ def _capture_head_sha(git_cmd, cwd) -> str | None:
         return None
 
 
-def _local_patches_dir() -> Path:
-    """Return ``$HERMES_HOME/local-patches`` (may not exist yet)."""
-    return Path(get_hermes_home()) / "local-patches"
+_LOCAL_PATCHES_DIRNAME = "local-patches"
+_LOCAL_PATCHES_README = """# Hermes local release patches
+
+These patches are versioned on the ``hermes-release`` maintenance branch.
+
+``hermes upgrade`` snapshots them **before** ``git reset --hard`` to the
+release tag (so in-repo copies survive the reset), reapplies every ``*.patch``
+(sorted by name), commits the result, then refreshes
+``0001-local-maintenance.patch``.
+
+The generated patch deliberately excludes this directory (``:!(local-patches)``)
+so the series does not try to patch itself.
+
+## Regenerate after editing local customizations
+
+```bash
+cd ~/.hermes/hermes-agent
+git diff v2026.x.y HEAD -- . ':!(local-patches)' > local-patches/0001-local-maintenance.patch
+git add local-patches && git commit -m "local: refresh patches"
+```
+
+## Keep out of this series
+
+- Mem0 sync_turns / infer_turns / api_url → ``$HERMES_HOME/plugins/mem0-local``
+  with ``memory.provider: mem0-local`` in config.yaml
+"""
 
 
-def _list_local_release_patches() -> list[Path]:
-    """Sorted ``*.patch`` files used to reapply local customizations after a release reset."""
-    patches_dir = _local_patches_dir()
+def _repo_local_patches_dir(cwd: Path | str | None = None) -> Path:
+    """In-repo ``local-patches/`` on the hermes-release branch."""
+    root = Path(cwd) if cwd is not None else Path(_m().PROJECT_ROOT)
+    return root / _LOCAL_PATCHES_DIRNAME
+
+
+def _home_local_patches_dir() -> Path:
+    """Legacy ``$HERMES_HOME/local-patches`` (migration / emergency fallback)."""
+    return Path(get_hermes_home()) / _LOCAL_PATCHES_DIRNAME
+
+
+def _local_patches_dir(cwd: Path | str | None = None) -> Path:
+    """Prefer in-repo patches; fall back to ``$HERMES_HOME/local-patches``."""
+    repo_dir = _repo_local_patches_dir(cwd)
+    if any(_iter_patch_files(repo_dir)):
+        return repo_dir
+    home_dir = _home_local_patches_dir()
+    if any(_iter_patch_files(home_dir)):
+        return home_dir
+    return repo_dir
+
+
+def _iter_patch_files(patches_dir: Path):
     if not patches_dir.is_dir():
-        return []
-    return sorted(
-        path
-        for path in patches_dir.iterdir()
-        if path.is_file() and path.suffix == ".patch" and not path.name.startswith(".")
-    )
+        return
+    for path in sorted(patches_dir.iterdir()):
+        if (
+            path.is_file()
+            and path.suffix == ".patch"
+            and not path.name.startswith(".")
+            and path.stat().st_size > 0
+        ):
+            yield path
+
+
+def _list_local_release_patches(cwd: Path | str | None = None) -> list[Path]:
+    """Sorted ``*.patch`` files used to reapply local customizations after a release reset."""
+    return list(_iter_patch_files(_local_patches_dir(cwd)))
+
+
+def _snapshot_local_release_patches(cwd: Path | str) -> list[tuple[str, str]]:
+    """Read patch file contents before ``reset --hard`` removes in-repo copies.
+
+    Prefers non-empty in-repo patches; falls back to ``$HERMES_HOME``.
+    """
+    root = Path(cwd)
+    repo_patches = list(_iter_patch_files(_repo_local_patches_dir(root)))
+    home_patches = list(_iter_patch_files(_home_local_patches_dir()))
+    candidates = repo_patches or home_patches
+
+    snapshots: list[tuple[str, str]] = []
+    for path in candidates:
+        try:
+            content = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise RuntimeError(f"Could not read local patch {path}: {exc}") from exc
+        if not content.strip():
+            continue
+        snapshots.append((path.name, content))
+    return snapshots
 
 
 def _git_working_tree_dirty(git_cmd, cwd) -> bool:
@@ -147,27 +220,21 @@ def _git_working_tree_dirty(git_cmd, cwd) -> bool:
     return bool(result.stdout.strip())
 
 
-def _apply_local_release_patches(git_cmd, cwd, release_tag: str) -> None:
-    """Reset-friendly reapply of ``$HERMES_HOME/local-patches/*.patch``.
+def _apply_patch_text(git_cmd, cwd, name: str, content: str) -> None:
+    """Apply one patch from an in-memory snapshot via a temp file."""
+    import tempfile
 
-    Release upgrades reset ``hermes-release`` to the tag first, then replay these
-    patches and commit the result. Keeping customizations outside the git merge
-    path avoids recurring conflicts with upstream release history.
-    """
-    patches = _list_local_release_patches()
-    if not patches:
-        print("→ No local patches under $HERMES_HOME/local-patches; staying on clean release.")
-        return
-
-    for patch in patches:
-        print(f"→ Applying local patch {patch.name}...")
+    with tempfile.TemporaryDirectory(prefix="hermes-local-patch-") as tmp:
+        patch_path = Path(tmp) / name
+        patch_path.write_text(content, encoding="utf-8")
+        print(f"→ Applying local patch {name}...")
         apply_result = subprocess.run(
             git_cmd
             + [
                 "apply",
                 "--3way",
                 "--whitespace=nowarn",
-                str(patch),
+                str(patch_path),
             ],
             cwd=cwd,
             capture_output=True,
@@ -176,9 +243,8 @@ def _apply_local_release_patches(git_cmd, cwd, release_tag: str) -> None:
             errors="replace",
         )
         if apply_result.returncode != 0:
-            # Fall back to a plain apply for patches that predate --3way bases.
             apply_result = subprocess.run(
-                git_cmd + ["apply", "--whitespace=nowarn", str(patch)],
+                git_cmd + ["apply", "--whitespace=nowarn", str(patch_path)],
                 cwd=cwd,
                 capture_output=True,
                 text=True,
@@ -189,25 +255,136 @@ def _apply_local_release_patches(git_cmd, cwd, release_tag: str) -> None:
             err = (apply_result.stderr or apply_result.stdout or "").strip()
             detail = err.splitlines()[0] if err else "git apply failed"
             raise RuntimeError(
-                f"Could not apply local patch {patch.name}: {detail}. "
-                f"Update files under {_local_patches_dir()} against {release_tag}, "
-                "then re-run: hermes upgrade"
+                f"Could not apply local patch {name}: {detail}. "
+                f"Update files under {_LOCAL_PATCHES_DIRNAME}/ against the new "
+                "release, then re-run: hermes upgrade"
             )
 
-    if not _git_working_tree_dirty(git_cmd, cwd):
-        print("→ Local patches applied with no tree changes.")
-        return
 
-    add_result = subprocess.run(
-        git_cmd + ["add", "-A"],
+def _refresh_local_release_patch_file(
+    git_cmd,
+    cwd,
+    release_tag: str,
+    *,
+    patch_body: str,
+) -> Path:
+    """Write the versioned ``local-patches/`` directory for ``patch_body``."""
+    patches_dir = _repo_local_patches_dir(cwd)
+    patches_dir.mkdir(parents=True, exist_ok=True)
+    primary = patches_dir / "0001-local-maintenance.patch"
+    primary.write_text(patch_body, encoding="utf-8")
+    (patches_dir / "README.md").write_text(_LOCAL_PATCHES_README, encoding="utf-8")
+    (patches_dir / ".release_base").write_text(f"{release_tag}\n", encoding="utf-8")
+    for stale in _iter_patch_files(patches_dir):
+        if stale.resolve() != primary.resolve():
+            stale.unlink(missing_ok=True)
+    try:
+        home_dir = _home_local_patches_dir()
+        home_dir.mkdir(parents=True, exist_ok=True)
+        (home_dir / primary.name).write_text(patch_body, encoding="utf-8")
+        (home_dir / "README.md").write_text(_LOCAL_PATCHES_README, encoding="utf-8")
+        (home_dir / ".release_base").write_text(f"{release_tag}\n", encoding="utf-8")
+    except OSError:
+        pass
+    return primary
+
+
+def _diff_local_payload_against_release(git_cmd, cwd, release_tag: str) -> str:
+    """Diff release tag vs current index/worktree, excluding ``local-patches/``."""
+    # Stage payload so newly created files (from git apply) are included.
+    add_payload = subprocess.run(
+        git_cmd
+        + [
+            "add",
+            "-A",
+            "--",
+            ".",
+            f":!({_LOCAL_PATCHES_DIRNAME})",
+        ],
         cwd=cwd,
         capture_output=True,
         text=True,
         encoding="utf-8",
         errors="replace",
     )
-    if add_result.returncode != 0:
-        raise RuntimeError("Failed to stage reapplied local patches.")
+    if add_payload.returncode != 0:
+        raise RuntimeError("Failed to stage reapplied local patch payload.")
+
+    diff_result = subprocess.run(
+        git_cmd
+        + [
+            "diff",
+            "--cached",
+            release_tag,
+            "--",
+            ".",
+            f":!({_LOCAL_PATCHES_DIRNAME})",
+        ],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=True,
+    )
+    return diff_result.stdout
+
+
+def _apply_local_release_patches(
+    git_cmd,
+    cwd,
+    release_tag: str,
+    *,
+    patch_snapshots: list[tuple[str, str]] | None = None,
+) -> None:
+    """Reapply local patches after reset, commit, and refresh the in-repo series.
+
+    Customizations stay out of upstream merge history: upgrade resets to the
+    release tag, replays these patches, and commits onto ``hermes-release``.
+    """
+    snapshots = patch_snapshots
+    if snapshots is None:
+        snapshots = _snapshot_local_release_patches(cwd)
+    if not snapshots:
+        print(
+            f"→ No local patches under {_LOCAL_PATCHES_DIRNAME}/ "
+            "(or $HERMES_HOME/local-patches); staying on clean release."
+        )
+        return
+
+    for name, content in snapshots:
+        _apply_patch_text(git_cmd, cwd, name, content)
+
+    try:
+        patch_body = _diff_local_payload_against_release(git_cmd, cwd, release_tag)
+        _refresh_local_release_patch_file(
+            git_cmd, cwd, release_tag, patch_body=patch_body
+        )
+    except (OSError, subprocess.CalledProcessError, RuntimeError) as exc:
+        raise RuntimeError(f"Failed to refresh local patch series: {exc}") from exc
+
+    add_patches = subprocess.run(
+        git_cmd + ["add", "-A", "--", _LOCAL_PATCHES_DIRNAME],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if add_patches.returncode != 0:
+        raise RuntimeError("Failed to stage refreshed local-patches directory.")
+
+    cached = subprocess.run(
+        git_cmd + ["diff", "--cached", "--quiet"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if cached.returncode == 0:
+        print("→ Local patches applied with no tree changes.")
+        return
 
     commit_result = subprocess.run(
         git_cmd
@@ -228,32 +405,22 @@ def _apply_local_release_patches(git_cmd, cwd, release_tag: str) -> None:
         detail = err.splitlines()[0] if err else "git commit failed"
         raise RuntimeError(f"Failed to commit reapplied local patches: {detail}")
 
-    # Refresh the primary patch so the next upgrade diffs against this release.
-    primary = _local_patches_dir() / "0001-local-maintenance.patch"
-    try:
-        _local_patches_dir().mkdir(parents=True, exist_ok=True)
-        diff_result = subprocess.run(
-            git_cmd + ["diff", f"{release_tag}..HEAD"],
-            cwd=cwd,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            check=True,
-        )
-        primary.write_text(diff_result.stdout, encoding="utf-8")
-        # Drop any older numbered patches so the next upgrade only replays one
-        # refreshed series (avoids double-applying after regeneration).
-        for stale in _list_local_release_patches():
-            if stale.resolve() != primary.resolve():
-                stale.unlink(missing_ok=True)
-        print(f"→ Refreshed local patch series against {release_tag}.")
-    except (OSError, subprocess.CalledProcessError) as exc:
-        print(f"⚠ Local patches applied, but failed to refresh patch file: {exc}")
+    print(f"→ Refreshed in-repo local-patches against {release_tag}.")
 
 
 def _upgrade_release_with_local_patches(git_cmd, cwd, release_tag: str) -> subprocess.CompletedProcess:
     """Reset hermes-release to ``release_tag``, then reapply local patches."""
+    # Snapshot before reset — in-repo local-patches disappear with --hard.
+    try:
+        snapshots = _snapshot_local_release_patches(cwd)
+    except RuntimeError as exc:
+        return subprocess.CompletedProcess(
+            ["snapshot-local-patches"],
+            returncode=1,
+            stdout="",
+            stderr=str(exc),
+        )
+
     reset_result = subprocess.run(
         git_cmd
         + [
@@ -273,7 +440,9 @@ def _upgrade_release_with_local_patches(git_cmd, cwd, release_tag: str) -> subpr
         return reset_result
 
     try:
-        _apply_local_release_patches(git_cmd, cwd, release_tag)
+        _apply_local_release_patches(
+            git_cmd, cwd, release_tag, patch_snapshots=snapshots
+        )
     except RuntimeError as exc:
         return subprocess.CompletedProcess(
             reset_result.args,
@@ -4200,7 +4369,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             if release_tag:
                 # Avoid merging the whole release into a diverged maintenance
                 # branch (that repeatedly conflicts with local patches). Reset
-                # to the tag, then replay $HERMES_HOME/local-patches instead.
+                # to the tag, then replay in-repo local-patches/ instead.
                 pull_result = _upgrade_release_with_local_patches(
                     git_cmd, _m().PROJECT_ROOT, release_tag
                 )
