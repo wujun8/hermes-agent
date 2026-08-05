@@ -174,6 +174,26 @@ def _event_from_wire(raw: Dict[str, Any]) -> MessageEvent:
     src = raw.get("source", {}) or {}
     from gateway.config import Platform
 
+    # The relay is an ingress boundary: validate the optional profile before
+    # constructing/publishing SessionSource, but do not touch the filesystem.
+    # Existence and served-profile authorization happen in GatewayRunner after
+    # the authenticated event reaches the runner.
+    raw_profile = src.get("profile")
+    if raw_profile is None:
+        wire_profile = None
+    elif not isinstance(raw_profile, str) or not raw_profile.strip():
+        raise ValueError("invalid profile")
+    else:
+        try:
+            from hermes_cli.profiles import normalize_profile_name, validate_profile_name
+
+            wire_profile = normalize_profile_name(raw_profile)
+            validate_profile_name(wire_profile)
+        except (TypeError, ValueError, AttributeError):
+            # Keep protocol errors stable and path-free; the remote peer does
+            # not need to know which local validation rule rejected the value.
+            raise ValueError("invalid profile") from None
+
     platform = src.get("platform", "relay")
     try:
         platform_enum = Platform(platform)
@@ -212,7 +232,7 @@ def _event_from_wire(raw: Dict[str, Any]) -> MessageEvent:
         # Consumed by build_session_key's profile namespacing + the per-turn
         # config/credential scope — the same field the /p/<profile>/ HTTP
         # prefix and per-credential polling adapters already set.
-        profile=src.get("profile"),
+        profile=wire_profile,
         # Auto-thread markers (Phase 4): stamped by the CONNECTOR when this
         # event's thread was auto-created by its auto-thread egress policy.
         # Lights the SAME semantic-rename lane native Discord uses

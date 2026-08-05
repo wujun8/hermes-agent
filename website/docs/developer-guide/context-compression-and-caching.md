@@ -101,6 +101,19 @@ auxiliary:
     base_url: null           # Custom OpenAI-compatible endpoint
 ```
 
+### Session-level policy overrides
+
+The global `compression.micro_compact` value remains the default policy, while
+`/micro on|off|inherit|status` controls the exact current session. `on` and
+`off` are stored durably in that session's `state.db` row under `model_config`;
+an absent override means `inherit`, so the effective value follows the current
+profile configuration. Explicit choices survive process restart and resume;
+new sessions do not copy a previous session's choice, and resume hydrates the
+exact target row. Inherited sessions pick up later global-config changes during
+runtime refresh. Changing this policy does not reset the micro cursor, rolling
+summary, counters, or batch-compression state. For the command lifecycle and
+trade-offs, see the [micro-compaction design note](https://github.com/NousResearch/hermes-agent/blob/main/docs/micro-compaction.md).
+
 ### Parameter Details
 
 | Parameter | Default | Range | Description |

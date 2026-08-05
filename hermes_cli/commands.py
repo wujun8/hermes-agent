@@ -87,6 +87,10 @@ class CommandDef:
     # gateway can import commands.py without prompt_toolkit and without
     # pulling in executor dependencies.
     execute: str | None = None
+    # Typed gateway availability is independent from whether a platform's
+    # registered command picker/menu should advertise this command. Keep the
+    # default True so existing commands retain their current menu behavior.
+    advertise_in_gateway_menu: bool = True
 
 
 # Valid values for CommandDef.busy_policy (see field docs above).
@@ -129,6 +133,12 @@ COMMAND_REGISTRY: list[CommandDef] = [
                aliases=("fork",), args_hint="[name]"),
     CommandDef("compress", "Compress conversation context (add 'here [N]' to keep recent N turns; --preview shows what would happen)", "Session",
                aliases=("compact",), args_hint="[here [N] | focus topic | --preview|--dry-run]"),
+    CommandDef("micro", "Set the current session's micro-compaction policy", "Configuration",
+               cli_only=False,
+               args_hint="[on|off|inherit|status]",
+               subcommands=("on", "off", "inherit", "status"),
+               advertise_in_gateway_menu=False,
+               busy_policy="reject"),
     CommandDef("rollback", "List or restore filesystem checkpoints", "Session",
                args_hint="[number]"),
     CommandDef("snapshot", "Create or restore state snapshots of Hermes config/state", "Session",
@@ -516,7 +526,7 @@ def _resolve_config_gates() -> set[str]:
 
 
 def _is_gateway_available(cmd: CommandDef, config_overrides: set[str] | None = None) -> bool:
-    """Check if *cmd* should appear in gateway surfaces (help, menus, mappings).
+    """Check if *cmd* is available to typed gateway surfaces.
 
     Unconditionally available when ``cli_only`` is False.  When ``cli_only``
     is True but ``gateway_config_gate`` is set, the command is available only
@@ -529,6 +539,18 @@ def _is_gateway_available(cmd: CommandDef, config_overrides: set[str] | None = N
         overrides = config_overrides if config_overrides is not None else _resolve_config_gates()
         return cmd.name in overrides
     return False
+
+
+def _is_gateway_menu_advertised(
+    cmd: CommandDef,
+    config_overrides: set[str] | None = None,
+) -> bool:
+    """Return whether a typed gateway command belongs in platform menus.
+
+    A command can remain executable and visible in textual gateway help while
+    being intentionally omitted from a platform's registered command picker.
+    """
+    return cmd.advertise_in_gateway_menu and _is_gateway_available(cmd, config_overrides)
 
 
 def _requires_argument(args_hint: str) -> bool:
@@ -604,7 +626,7 @@ def telegram_bot_commands() -> list[tuple[str, str]]:
     overrides = _resolve_config_gates()
     result: list[tuple[str, str]] = []
     for cmd in COMMAND_REGISTRY:
-        if not _is_gateway_available(cmd, overrides):
+        if not _is_gateway_menu_advertised(cmd, overrides):
             continue
         # Built-in arg-taking commands are included — their handlers show
         # usage text when invoked without arguments, and hiding them from
@@ -1323,7 +1345,7 @@ def slack_native_slashes() -> list[tuple[str, str, str]]:
     _alias_to_cmd = {
         alias: cmd
         for cmd in COMMAND_REGISTRY
-        if _is_gateway_available(cmd, overrides)
+        if _is_gateway_menu_advertised(cmd, overrides)
         for alias in cmd.aliases
     }
     for alias in _SLACK_PRIORITY_ALIASES:
@@ -1333,13 +1355,13 @@ def slack_native_slashes() -> list[tuple[str, str, str]]:
 
     # First pass: canonical names (so they win slots if we hit the cap).
     for cmd in COMMAND_REGISTRY:
-        if not _is_gateway_available(cmd, overrides):
+        if not _is_gateway_menu_advertised(cmd, overrides):
             continue
         _add(cmd.name, cmd.description, cmd.args_hint or "")
 
     # Second pass: aliases.
     for cmd in COMMAND_REGISTRY:
-        if not _is_gateway_available(cmd, overrides):
+        if not _is_gateway_menu_advertised(cmd, overrides):
             continue
         for alias in cmd.aliases:
             # Skip aliases that only differ from canonical by case/punctuation

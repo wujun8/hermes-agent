@@ -199,6 +199,68 @@ It ships opt-in rather than on because of the prompt-cache cost described in
 the next section — that cost is real, it is not universally worth paying, and
 it should be a decision you make rather than one you inherit.
 
+## Session-level policy (`/micro`)
+
+The profile-wide `compression.micro_compact` setting remains the default
+policy. The session-scoped `/micro` command lets you override that policy for
+the exact current session without changing the profile configuration or any of
+the cadence/defrag settings.
+
+| Command | Effect |
+|---|---|
+| `/micro on` | Persist an enabled override for the current session. |
+| `/micro off` | Persist a disabled override for the current session. |
+| `/micro inherit` | Remove the session override; the effective policy follows the current profile's global setting. |
+| `/micro status` | Read-only report of the effective policy, its source, and the global setting. |
+
+Bare `/micro` and any invalid argument only print
+`Usage: /micro on|off|inherit|status`; they do not mutate state. A status
+response has this shape:
+
+```text
+Micro-compaction: ON
+Source: session
+Global: OFF
+```
+
+`Source: session` means an explicit `on` or `off` override is winning. With
+no override, the source is `global (inherited)` and the effective value tracks
+the global value. The durable override is stored in the current session row in
+`state.db` (inside `model_config`; the internal key is
+`micro_compact_override`). An absent key means inheritance. Explicit `on` and
+`off` survive process restart and `/resume`; `inherit` deletes the override
+instead of copying the current global value.
+
+Session boundaries are isolated. `/new` creates a fresh session without
+copying the previous session's explicit policy, while the old session remains
+available for resuming. `/resume` hydrates the exact target row, so an override
+from session A cannot leak into session B. Where the committed core creates a
+rotation or compression child with lineage, an explicit override is retained
+for that child as well. Inherited sessions follow later changes to
+`compression.micro_compact` through the runtime policy refresh; explicit
+session choices do not.
+
+The command changes only the enable policy. It does not reset the micro cursor,
+rolling summary, pass counters, or batch-compression state. Mutating commands
+persist first and apply to the live engine second. The command registry uses
+`busy_policy=reject`: while the current agent turn is running, `/micro` is
+rejected before either the database or live engine is changed.
+
+On the CLI and TUI, a live engine is updated immediately. In the gateway, a
+cached agent is updated immediately; a cold session persists the choice and
+hydrates it when that session's agent starts or resumes. A non-built-in or
+plugin context engine that has no runtime setter does not prevent the durable
+save: Hermes warns that the current engine cannot switch live, and a later
+compatible engine or hydration applies the saved policy. `/micro` is a
+control-plane command, so it creates no provider turn and appends no command
+or reply to conversation history.
+
+The typed gateway command is executable and appears in gateway help, but is
+intentionally omitted from registered platform command menus to preserve their
+capped slots (for example, Slack's `/platform` menu). Users can type it
+directly; in Slack threads use `!micro ...` because native Slack slash commands
+do not reach threads.
+
 ## Prompt caching — the cost you are opting into
 
 Read this before enabling the feature. It is the strongest argument against it.

@@ -378,6 +378,220 @@ class GatewaySlashCommandsMixin:
 
         return "\n".join(lines)
 
+    async def _handle_micro_command(self, event: MessageEvent) -> str:
+        """Handle the DB-first, session-scoped ``/micro`` policy command."""
+        from hermes_cli.micro_command import (
+            execute_micro_command,
+            load_config_readonly,
+        )
+        from hermes_cli.micro_compaction import (
+            MICRO_COMPACT_USAGE,
+            parse_micro_compact_command,
+        )
+
+        source = event.source
+        raw_args = event.get_command_args()
+        try:
+            command = parse_micro_compact_command(raw_args)
+        except (TypeError, ValueError):
+            # Parsing must precede every session/cache/database operation.  In
+            # particular, bare and invalid commands are completely side-effect
+            # free even when the source has never been seen before.
+            return MICRO_COMPACT_USAGE
+
+        session_key = self._session_key_for_source(source)
+        multiplex_profiles = bool(
+            getattr(getattr(self, "config", None), "multiplex_profiles", False)
+        )
+        profile_home = None
+        if multiplex_profiles:
+            profile_home = self._resolve_profile_home_for_source(source)
+
+        def _execute_scoped(call):
+            if not multiplex_profiles:
+                return call()
+            from gateway.run import _profile_runtime_scope
+
+            with _profile_runtime_scope(profile_home):
+                return call()
+
+        async def _execute(call):
+            return await asyncio.to_thread(_execute_scoped, call)
+
+        def _run_service(*, agent, session_db, session_id, ensure_session=None):
+            return execute_micro_command(
+                agent=agent,
+                session_db=session_db,
+                session_id=session_id,
+                raw_args=raw_args,
+                ensure_session=ensure_session,
+                config_loader=load_config_readonly,
+            )
+
+        # Status is a read-only route lookup.  It may report the profile-global
+        # value without an active route, so do not create a SessionStore entry or
+        # even inspect the agent cache on this branch.
+        if command == "status":
+            try:
+                peeked_session_id = await self.async_session_store.peek_session_id(
+                    session_key
+                )
+            except Exception as exc:
+                logger.warning("Could not peek gateway session for /micro: %s", exc)
+                return f"Micro-compaction error: session lookup failed: {exc}"
+            session_id = str(peeked_session_id or "")
+            if not session_id.strip():
+                try:
+                    return await _execute(
+                        lambda: _run_service(
+                            agent=None,
+                            session_db=None,
+                            session_id="",
+                        )
+                    )
+                except Exception as exc:
+                    logger.exception("Gateway /micro execution failed")
+                    return f"Micro-compaction error: command execution failed: {exc}"
+        else:
+            try:
+                entry = await self.async_session_store.get_or_create_session(source)
+            except Exception as exc:
+                logger.warning("Could not resolve gateway session for /micro: %s", exc)
+                return f"Micro-compaction error: session lookup failed: {exc}"
+
+            session_id = str(getattr(entry, "session_id", "") or "")
+            if not session_id.strip():
+                return "Micro-compaction error: a non-empty exact session ID is required"
+
+        runner_session_db = getattr(self, "_session_db", None)
+        cached_agent = None
+        cache = getattr(self, "_agent_cache", None)
+        if cache is not None:
+            cache_lock = getattr(self, "_agent_cache_lock", None)
+            if cache_lock is None:
+                return "Micro-compaction error: agent cache is not available"
+            try:
+                with cache_lock:
+                    cached = cache.get(session_key)
+            except Exception as exc:
+                logger.warning("Could not read cached gateway agent for /micro: %s", exc)
+                return f"Micro-compaction error: agent cache read failed: {exc}"
+            if isinstance(cached, tuple):
+                cached_agent = cached[0] if cached else None
+            else:
+                cached_agent = cached
+
+        if cached_agent is not None:
+            agent_session_id = str(getattr(cached_agent, "session_id", "") or "")
+            if not agent_session_id.strip():
+                return (
+                    "Micro-compaction error: live session identity is incomplete; "
+                    "refusing to mutate"
+                )
+            if agent_session_id != session_id:
+                return (
+                    "Micro-compaction error: live session identity mismatch; "
+                    "refusing to mutate"
+                )
+            raw_session_db = getattr(cached_agent, "_session_db", None)
+            if command != "status" and raw_session_db is None:
+                return "Micro-compaction error: session database is not available"
+            ensure_session = getattr(cached_agent, "_ensure_db_session", None)
+            agent = cached_agent
+            try:
+                return await _execute(
+                    lambda: _run_service(
+                        agent=agent,
+                        session_db=raw_session_db,
+                        session_id=session_id,
+                        ensure_session=ensure_session,
+                    )
+                )
+            except Exception as exc:
+                logger.exception("Gateway /micro execution failed")
+                return f"Micro-compaction error: command execution failed: {exc}"
+
+        # A cold multiplexed session must never borrow the process runner's DB.
+        # Open the profile DB only inside the worker's explicit runtime scope so
+        # both get_hermes_home() and load_config_readonly() resolve identically.
+        if multiplex_profiles:
+            def _execute_cold_profile():
+                from hermes_state import SessionDB
+
+                profile_db = None
+                try:
+                    profile_db_path = Path(profile_home) / "state.db"
+                    if command == "status" and not profile_db_path.exists():
+                        return _run_service(
+                            agent=None,
+                            session_db=None,
+                            session_id=session_id,
+                        )
+                    profile_db = (
+                        SessionDB()
+                        if command != "status"
+                        else SessionDB(read_only=True)
+                    )
+                    ensure_session = None
+                    if command != "status":
+                        def ensure_session():
+                            if profile_db.get_session(session_id) is not None:
+                                return
+                            profile_db.create_session(
+                                session_id=session_id,
+                                source=source.platform.value if source.platform else "unknown",
+                                user_id=source.user_id,
+                                chat_id=source.chat_id,
+                                chat_type=source.chat_type,
+                                thread_id=source.thread_id,
+                            )
+                    return _run_service(
+                        agent=None,
+                        session_db=profile_db,
+                        session_id=session_id,
+                        ensure_session=ensure_session,
+                    )
+                finally:
+                    if profile_db is not None:
+                        profile_db.close()
+
+            try:
+                return await _execute(_execute_cold_profile)
+            except Exception as exc:
+                logger.exception("Gateway /micro execution failed")
+                return f"Micro-compaction error: command execution failed: {exc}"
+
+        # Single-profile cold sessions retain the runner DB lifecycle.  It is
+        # already owned by GatewayRunner and must not be closed here.
+        raw_session_db = getattr(runner_session_db, "_db", None)
+        if command != "status" and raw_session_db is None:
+            return "Micro-compaction error: session database is not available"
+        ensure_session = None
+        if command != "status":
+            def ensure_session():
+                if raw_session_db.get_session(session_id) is not None:
+                    return
+                raw_session_db.create_session(
+                    session_id=session_id,
+                    source=source.platform.value if source.platform else "unknown",
+                    user_id=source.user_id,
+                    chat_id=source.chat_id,
+                    chat_type=source.chat_type,
+                    thread_id=source.thread_id,
+                )
+        try:
+            return await _execute(
+                lambda: _run_service(
+                    agent=None,
+                    session_db=raw_session_db,
+                    session_id=session_id,
+                    ensure_session=ensure_session,
+                )
+            )
+        except Exception as exc:
+            logger.exception("Gateway /micro execution failed")
+            return f"Micro-compaction error: command execution failed: {exc}"
+
     async def _handle_whoami_command(self, event: MessageEvent) -> str:
         """Handle /whoami — show the user's slash command access on this scope.
 

@@ -4,6 +4,8 @@ Handler bodies are byte-identical to their pre-split server.py form; they
 are rebound onto server.py's globals at install time — see method_ctx.py.
 """
 
+import types
+
 from .method_ctx import HandlerRegistry
 
 _registry = HandlerRegistry()
@@ -422,11 +424,133 @@ def _(rid, params: dict) -> dict:
                     "canonical": r.name,
                     "description": r.description,
                     "category": r.category,
+                    "args_hint": r.args_hint,
+                    "subcommands": list(r.subcommands),
+                    "busy_policy": r.busy_policy,
                 },
             )
         return _err(rid, 4011, f"unknown command: {params.get('name')}")
     except Exception as e:
         return _err(rid, 5012, str(e))
+
+
+def _dispatch_manual_compression(
+    rid,
+    params: dict,
+    session: dict,
+    name: str,
+    arg: str,
+    control_token,
+) -> dict:
+    """Run one manual compression after its session control lease is held."""
+    from agent.conversation_compression import (
+        finalize_context_engine_compression_notification,
+    )
+
+    sid = params.get("session_id", "")
+    if _session_uses_compute_host(session):
+        command = f"/{name}" + (f" {arg}" if arg else "")
+        try:
+            ack = _send_compute_host_control(
+                sid,
+                route_name="slash.compress",
+                command=command,
+                wait=True,
+            )
+        except Exception as exc:
+            return _err(rid, 5019, f"compute-host slash.compress failed: {exc}")
+        if ack.get("type") in {"control.error", "error"}:
+            return _err(
+                rid,
+                4009,
+                str(ack.get("message") or "compute-host slash.compress failed"),
+            )
+        _apply_compute_host_metadata_mirror(session, ack)
+        return _ok(
+            rid,
+            {"type": "exec", "output": str(ack.get("output") or "")},
+        )
+
+    try:
+        from agent.manual_compression_feedback import summarize_manual_compression
+        from agent.model_metadata import estimate_request_tokens_rough
+
+        with session["history_lock"]:
+            before_messages = list(session.get("history", []))
+            history_version = int(session.get("history_version", 0))
+        before_count = len(before_messages)
+        _agent = session["agent"]
+        _sys_prompt = getattr(_agent, "_cached_system_prompt", "") or ""
+        _tools = getattr(_agent, "tools", None) or None
+        before_tokens = (
+            estimate_request_tokens_rough(
+                before_messages, system_prompt=_sys_prompt, tools=_tools
+            )
+            if before_count
+            else 0
+        )
+        removed, usage = _compress_session_history(
+            session,
+            arg.strip() or None,
+            approx_tokens=before_tokens,
+            before_messages=before_messages,
+            history_version=history_version,
+        )
+        with session["history_lock"]:
+            after_messages = list(session.get("history", []))
+        after_count = len(after_messages)
+        _sys_prompt_after = getattr(_agent, "_cached_system_prompt", "") or _sys_prompt
+        _tools_after = getattr(_agent, "tools", None) or _tools
+        after_tokens = (
+            estimate_request_tokens_rough(
+                after_messages,
+                system_prompt=_sys_prompt_after,
+                tools=_tools_after,
+            )
+            if after_count
+            else 0
+        )
+        _sync_session_key_after_compress(
+            sid,
+            session,
+            control_token=control_token,
+        )
+        summary = summarize_manual_compression(
+            before_messages,
+            after_messages,
+            before_tokens,
+            after_tokens,
+            compression_state=getattr(_agent, "context_compressor", None),
+        )
+        _emit("session.info", sid, _session_info(session.get("agent"), session))
+        finalize_context_engine_compression_notification(
+            _agent,
+            committed=True,
+        )
+        return _ok(
+            rid,
+            {
+                "type": "exec",
+                "output": "\n".join(
+                    filter(None, [summary["headline"], summary["token_line"], summary.get("note")])
+                ),
+            },
+        )
+    except CompressionLockHeld as e:
+        # Lock-skip is a clean no-op, not a failure: report it as normal
+        # command output, matching the slash mirror and session.compress RPC.
+        from agent.manual_compression_feedback import describe_compression_lock_skip
+
+        return _ok(
+            rid,
+            {"type": "exec", "output": describe_compression_lock_skip(e.holder)},
+        )
+    except Exception as exc:
+        finalize_context_engine_compression_notification(
+            session["agent"],
+            committed=False,
+        )
+        return _err(rid, 5009, f"compress failed: {exc}")
 
 
 @method("command.dispatch")
@@ -953,121 +1077,24 @@ def _(rid, params: dict) -> dict:
     if name in {"compress", "compact"}:
         if not session:
             return _err(rid, 4001, "no active session to compress")
-        if session.get("running"):
-            return _err(
-                rid, 4009, "session busy — /interrupt the current turn before /compress"
-            )
-        from agent.conversation_compression import (
-            finalize_context_engine_compression_notification,
-        )
-
-        sid = params.get("session_id", "")
-        if _session_uses_compute_host(session):
-            command = f"/{name}" + (f" {arg}" if arg else "")
-            try:
-                ack = _send_compute_host_control(
-                    sid,
-                    route_name="slash.compress",
-                    command=command,
-                    wait=True,
-                )
-            except Exception as exc:
-                return _err(rid, 5019, f"compute-host slash.compress failed: {exc}")
-            if ack.get("type") in {"control.error", "error"}:
-                return _err(
-                    rid,
-                    4009,
-                    str(ack.get("message") or "compute-host slash.compress failed"),
-                )
-            _apply_compute_host_metadata_mirror(session, ack)
-            return _ok(
-                rid,
-                {"type": "exec", "output": str(ack.get("output") or "")},
-            )
+        control_token, claim_error = _claim_manual_compression_control(session)
+        if claim_error is not None:
+            return _err(rid, 4009, _manual_compression_busy_text(claim_error))
         try:
-            from agent.manual_compression_feedback import summarize_manual_compression
-            from agent.model_metadata import estimate_request_tokens_rough
-
-            with session["history_lock"]:
-                before_messages = list(session.get("history", []))
-                history_version = int(session.get("history_version", 0))
-            before_count = len(before_messages)
-            _agent = session["agent"]
-            _sys_prompt = getattr(_agent, "_cached_system_prompt", "") or ""
-            _tools = getattr(_agent, "tools", None) or None
-            before_tokens = (
-                estimate_request_tokens_rough(
-                    before_messages, system_prompt=_sys_prompt, tools=_tools
-                )
-                if before_count
-                else 0
-            )
-            removed, usage = _compress_session_history(
+            return _dispatch_manual_compression(
+                rid,
+                params,
                 session,
-                arg.strip() or None,
-                approx_tokens=before_tokens,
-                before_messages=before_messages,
-                history_version=history_version,
+                name,
+                arg,
+                control_token,
             )
-            with session["history_lock"]:
-                after_messages = list(session.get("history", []))
-            after_count = len(after_messages)
-            _sys_prompt_after = (
-                getattr(_agent, "_cached_system_prompt", "") or _sys_prompt
-            )
-            _tools_after = getattr(_agent, "tools", None) or _tools
-            after_tokens = (
-                estimate_request_tokens_rough(
-                    after_messages,
-                    system_prompt=_sys_prompt_after,
-                    tools=_tools_after,
-                )
-                if after_count
-                else 0
-            )
-            _sync_session_key_after_compress(sid, session)
-            summary = summarize_manual_compression(
-                before_messages,
-                after_messages,
-                before_tokens,
-                after_tokens,
-                compression_state=getattr(_agent, "context_compressor", None),
-            )
-            _emit("session.info", sid, _session_info(session.get("agent"), session))
-            finalize_context_engine_compression_notification(
-                _agent,
-                committed=True,
-            )
-            return _ok(
-                rid,
-                {
-                    "type": "exec",
-                    "output": "\n".join(
-                        filter(None, [summary["headline"], summary["token_line"], summary.get("note")])
-                    ),
-                },
-            )
-        except CompressionLockHeld as e:
-            # Lock-skip is a clean no-op, not a failure: report it as
-            # normal command output (matching the slash-mirror and
-            # session.compress RPC), never as a "compress failed" error.
-            # _compress_session_history already discarded the deferred
-            # context-engine notification before raising.
-            from agent.manual_compression_feedback import (
-                describe_compression_lock_skip,
-            )
-            return _ok(
-                rid,
-                {"type": "exec", "output": describe_compression_lock_skip(e.holder)},
-            )
-        except Exception as exc:
-            finalize_context_engine_compression_notification(
-                session["agent"],
-                committed=False,
-            )
-            return _err(rid, 5009, f"compress failed: {exc}")
+        finally:
+            _release_session_control(session, control_token)
 
     return _err(rid, 4018, f"not a quick/plugin/bundle/skill command: {name}")
+
+
 
 
 @method("slash.exec")
@@ -1090,10 +1117,82 @@ def _(rid, params: dict) -> dict:
     _cmd_base = (_cmd_parts[0] if _cmd_parts else "").lower()
     _cmd_arg = _cmd_parts[1] if len(_cmd_parts) > 1 else ""
 
-    live_output = _live_slash_command_output(
-        params.get("session_id", ""), session, _cmd_base, _cmd_arg
-    )
+    if _cmd_base == "micro":
+        # Reuse the central registry's busy policy rather than allowing a
+        # worker/live path to mutate a session during its active turn.  The
+        # live path claims a short per-session control lease here, then does all
+        # config/DB/runtime work outside history_lock.  Prompt/session claims
+        # check the same lease, so releasing the lock cannot reintroduce a
+        # check-then-act race.
+        from hermes_cli.commands import resolve_command
+
+        _micro_def = resolve_command(_cmd_base)
+
+        def _run_micro_slash():
+            if _micro_def is not None and _micro_def.busy_policy == "reject":
+                _micro_target, _micro_claim = _claim_live_micro_control(
+                    params.get("session_id", ""), session
+                )
+            else:
+                _micro_target, _micro_claim = None, None
+            if _micro_claim is _MICRO_TURN_BUSY:
+                return _err(
+                    rid,
+                    4009,
+                    _MICRO_TURN_BUSY_MESSAGE,
+                )
+            if _micro_claim is _SESSION_CONTROL_BUSY:
+                return _err(rid, 4009, _MICRO_CONTROL_BUSY_MESSAGE)
+            if isinstance(_micro_claim, str):
+                return _micro_claim
+            if _micro_target is None:
+                # Cold worker fallback stays unchanged: it owns row creation
+                # and later hydration for sessions with no live agent yet.
+                return _live_slash_command_output(
+                    params.get("session_id", ""), session, _cmd_base, _cmd_arg
+                )
+
+            _micro_response = None
+            _micro_release = None
+            try:
+                _micro_response = _live_slash_command_output(
+                    params.get("session_id", ""),
+                    session,
+                    _cmd_base,
+                    _cmd_arg,
+                    micro_target=_micro_target,
+                )
+            finally:
+                _micro_release = _release_live_micro_control(_micro_target)
+            _release_warning = str(getattr(_micro_release, "warning", "") or "")
+            if _release_warning:
+                if _micro_response is None:
+                    _micro_response = _release_warning
+                elif _release_warning not in str(_micro_response):
+                    _micro_response = f"{_micro_response}\n\n{_release_warning}"
+            if not _micro_release:
+                if _release_warning:
+                    return _micro_response
+                return (
+                    "Micro-compaction error: live session changed while the "
+                    "command was running; refusing to report a new target mutation"
+                )
+            return _micro_response
+
+        live_output = _run_micro_slash()
+        if isinstance(live_output, dict) and "error" in live_output:
+            return live_output
+    else:
+        live_output = _live_slash_command_output(
+            params.get("session_id", ""), session, _cmd_base, _cmd_arg
+        )
     if live_output is not None:
+        if (
+            _cmd_base in {"compress", "compact"}
+            and isinstance(live_output, str)
+            and live_output.lower().startswith("session busy")
+        ):
+            return _err(rid, 4009, live_output)
         return _ok(rid, {"output": live_output or "(no output)"})
 
     if _cmd_base in _PENDING_INPUT_COMMANDS:
@@ -1912,3 +2011,10 @@ def _(rid, params: dict) -> dict:
 def register(server) -> None:
     """Bind this module's handlers onto ``server``'s globals and registry."""
     _registry.install(server)
+    server._dispatch_manual_compression = types.FunctionType(
+        _dispatch_manual_compression.__code__,
+        vars(server),
+        _dispatch_manual_compression.__name__,
+        _dispatch_manual_compression.__defaults__,
+        _dispatch_manual_compression.__closure__,
+    )
