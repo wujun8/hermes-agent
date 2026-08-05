@@ -309,7 +309,7 @@ def normalize_profile_name(name: str) -> str:
     validation, assignment, and subprocess spawn (see issue #18498).
     """
     if not isinstance(name, str):
-        name = str(name)
+        raise ValueError("profile name must be a string")
     stripped = name.strip()
     if not stripped:
         raise ValueError("profile name cannot be empty")
@@ -365,19 +365,86 @@ def validate_alias_name(name: str) -> None:
 
 
 def get_profile_dir(name: str) -> Path:
-    """Resolve a profile name to its HERMES_HOME directory."""
+    """Resolve a profile name to its HERMES_HOME directory.
+
+    This is the non-existence-checking resolver used by profile creation and
+    other APIs that need the destination path before the directory exists.  It
+    still validates the *canonical* single-component profile id before joining
+    it to the profiles root; callers handling ingress for an existing profile
+    must use :func:`resolve_profile_home` instead.
+    """
     canon = normalize_profile_name(name)
+    validate_profile_name(canon)
     if canon == "default":
         return _get_default_hermes_home()
     return _get_profiles_root() / canon
 
 
-def profile_exists(name: str) -> bool:
-    """Check whether a profile directory exists."""
+def resolve_profile_home(name: str, *, require_exists: bool = True) -> Path:
+    """Return a safe profile home for runtime/ingress use.
+
+    ``get_profile_dir`` intentionally supports creation of a not-yet-existing
+    profile.  This resolver is the stricter counterpart for code that is about
+    to bind ``HERMES_HOME`` or open profile state: it validates the canonical
+    id, resolves the profiles root and candidate, rejects symlink escapes, and
+    requires a real directory by default.  The built-in ``default`` profile is
+    always anchored to the authoritative default home and is never interpreted
+    relative to the named-profile root.
+
+    The returned path is resolved for existing named profiles so subsequent
+    consumers cannot accidentally re-enter a symlink that was validated only
+    lexically.  ``require_exists=False`` preserves the creation-friendly
+    behavior for callers that need a validated destination without opening it.
+    """
     canon = normalize_profile_name(name)
+    validate_profile_name(canon)
+
     if canon == "default":
-        return True
-    return get_profile_dir(canon).is_dir()
+        home = _get_default_hermes_home()
+        if not require_exists:
+            return home
+        try:
+            resolved_home = home.resolve(strict=True)
+        except FileNotFoundError as exc:
+            raise FileNotFoundError("default profile home does not exist") from exc
+        if not resolved_home.is_dir():
+            raise NotADirectoryError("default profile home is not a directory")
+        return resolved_home
+
+    profiles_root = _get_profiles_root()
+    candidate = profiles_root / canon
+    if not require_exists:
+        return candidate
+
+    try:
+        resolved_root = profiles_root.resolve(strict=True)
+        resolved_candidate = candidate.resolve(strict=True)
+    except FileNotFoundError as exc:
+        raise FileNotFoundError("profile home does not exist") from exc
+
+    try:
+        resolved_candidate.relative_to(resolved_root)
+    except ValueError as exc:
+        # A valid lexical id can still name a symlink whose target is outside
+        # the profiles root.  Treat that exactly like an invalid runtime home.
+        raise ValueError("profile home is outside the profiles root") from exc
+    if not resolved_candidate.is_dir():
+        raise NotADirectoryError("profile home is not a directory")
+    return resolved_candidate
+
+
+def profile_exists(name: str) -> bool:
+    """Return whether *name* resolves to a safe, existing profile directory.
+
+    This helper is deliberately fail-closed because many compatibility callers
+    use it as a boolean gate.  Invalid names, missing homes, filesystem errors,
+    and symlink escapes all return ``False`` rather than leaking an exception.
+    """
+    try:
+        resolve_profile_home(name, require_exists=True)
+    except (Exception, OSError):
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -969,7 +1036,15 @@ def profiles_to_serve(multiplex: bool) -> List[Tuple[str, Path]]:
     """
     active = get_active_profile_name() or "default"
     if not multiplex:
-        return [(active, get_profile_dir(active))]
+        # ``custom`` means the process was launched with an authoritative
+        # HERMES_HOME outside the standard profile layout.  Keep the historical
+        # single-profile behavior rather than interpreting it as a named
+        # profile under ``profiles/custom``.
+        if active == "custom":
+            from hermes_constants import get_hermes_home
+
+            return [(active, Path(get_hermes_home()))]
+        return [(active, resolve_profile_home(active, require_exists=False))]
 
     serve: List[Tuple[str, Path]] = [("default", _get_default_hermes_home())]
 
@@ -981,9 +1056,16 @@ def profiles_to_serve(multiplex: bool) -> List[Tuple[str, Path]]:
             name = entry.name
             if name == "default":
                 continue  # default is the built-in entry already added above
-            if not _PROFILE_ID_RE.match(name):
+            # Use the same resolver as all other runtime ingress.  In
+            # particular, this removes symlinked profile directories that point
+            # outside the profiles root from the served set.
+            try:
+                canon = normalize_profile_name(name)
+                validate_profile_name(canon)
+                home = resolve_profile_home(canon, require_exists=True)
+            except Exception:
                 continue
-            serve.append((name, entry))
+            serve.append((canon, home))
 
     return serve
 

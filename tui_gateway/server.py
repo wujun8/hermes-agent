@@ -1384,20 +1384,26 @@ def _db_unavailable_error(rid, *, code: int):
 # message persistence all resolve to the right profile. Omitted/own profile → the
 # launch profile (unchanged for single-profile and per-profile-remote setups).
 def _profile_home(profile: str | None) -> Path | None:
-    """Resolve a named profile's home on THIS host, or None for the launch profile."""
-    name = (profile or "").strip()
+    """Resolve a named profile's safe existing home, or None for launch home."""
+    if not isinstance(profile, str):
+        return None
+    name = profile.strip()
     if not name:
         return None
     try:
         from hermes_cli import profiles as profiles_mod
 
-        home = Path(profiles_mod.get_profile_dir(name))
+        # The central resolver validates the canonical id, requires an existing
+        # directory, and rejects symlink targets outside the profiles root
+        # before this function performs any launch-home comparison.
+        home = Path(profiles_mod.resolve_profile_home(name, require_exists=True))
     except Exception:
         return None
-    # Already the launch profile? No override needed.
+    # Already the launch profile? No override needed.  This comparison is safe
+    # only after resolve_profile_home has completed its containment checks.
     if home.resolve() == Path(_hermes_home).resolve():
         return None
-    return home if (home / "state.db").exists() or home.exists() else None
+    return home
 
 
 def _profile_scoped(handler):
