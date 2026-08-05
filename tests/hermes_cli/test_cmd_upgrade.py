@@ -87,14 +87,27 @@ def test_cmd_upgrade_check_reports_already_on_latest_release(capsys):
     assert "Already includes the latest Release (v1.2.3)" in capsys.readouterr().out
 
 
-@pytest.mark.parametrize("transaction_error", [False, True])
+@pytest.mark.parametrize(
+    ("transaction_error", "post_promotion_signal"),
+    [
+        (False, None),
+        (True, None),
+        (False, "called_process_error"),
+        (False, "system_exit"),
+        (False, "keyboard_interrupt"),
+    ],
+)
 def test_cmd_upgrade_release_orchestration_uses_transaction_and_releases_lock(
-    tmp_path, monkeypatch, transaction_error
+    tmp_path, monkeypatch, transaction_error, post_promotion_signal
 ):
     """Release orchestration uses the immutable target and always releases its repo lock."""
     from hermes_cli import update_cmd
 
-    repo = tmp_path / ("transaction-error" if transaction_error else "transaction-success")
+    repo = tmp_path / (
+        f"transaction-error-{post_promotion_signal}"
+        if transaction_error
+        else f"transaction-success-{post_promotion_signal}"
+    )
     repo.mkdir()
     (repo / ".git").mkdir()
     args = SimpleNamespace(
@@ -112,6 +125,8 @@ def test_cmd_upgrade_release_orchestration_uses_transaction_and_releases_lock(
     maintenance_sha = "4" * 40
     lock_instances = []
     subprocess_calls = []
+    lifecycle_events = []
+    transaction_context = object()
 
     class FakeRepositoryUpdateLock:
         def __init__(self, repo_root, git_cmd):
@@ -127,9 +142,19 @@ def test_cmd_upgrade_release_orchestration_uses_transaction_and_releases_lock(
 
         def release(self):
             self.release_calls += 1
+            lifecycle_events.append("lock-release")
 
     class StopAfterSuccessfulTransaction(RuntimeError):
         pass
+
+    def post_promotion_stop(_repo):
+        if post_promotion_signal is None:
+            raise StopAfterSuccessfulTransaction()
+        if post_promotion_signal == "called_process_error":
+            raise subprocess.CalledProcessError(1, ["post-promotion"])
+        if post_promotion_signal == "system_exit":
+            raise SystemExit(23)
+        raise KeyboardInterrupt()
 
     def fake_run(cmd, **kwargs):
         subprocess_calls.append(cmd)
@@ -146,12 +171,20 @@ def test_cmd_upgrade_release_orchestration_uses_transaction_and_releases_lock(
             if transaction_error
             else None
         ),
-        return_value=SimpleNamespace(target_sha=target.target_sha),
+        return_value=SimpleNamespace(
+            target_sha=target.target_sha, context=transaction_context
+        ),
     )
     resolve_target = Mock(return_value=target)
     legacy_replay = Mock(
         side_effect=AssertionError("legacy release replay must not run")
     )
+
+    def finalize_release(*args, **kwargs):
+        assert args[2] is transaction_context
+        assert lock_instances[0].release_calls == 0
+        lifecycle_events.append("finalize")
+        return True
 
     with monkeypatch.context() as patcher:
         patcher.setattr(hm, "PROJECT_ROOT", repo)
@@ -166,24 +199,28 @@ def test_cmd_upgrade_release_orchestration_uses_transaction_and_releases_lock(
         patcher.setattr(
             update_cmd, "_capture_head_sha", lambda _git_cmd, _repo: maintenance_sha
         )
-        patcher.setattr(
-            hm,
-            "_clear_bytecode_cache",
-            lambda _repo: (_ for _ in ()).throw(StopAfterSuccessfulTransaction()),
-        )
+        patcher.setattr(hm, "_clear_bytecode_cache", post_promotion_stop)
         patcher.setattr("hermes_cli.config.load_config", lambda: {})
         patcher.setattr(update_cmd, "RepositoryUpdateLock", FakeRepositoryUpdateLock)
         patcher.setattr(update_cmd, "_resolve_release_target", resolve_target)
         patcher.setattr(update_cmd, "_git_resolve_commit", lambda *args: maintenance_sha)
         patcher.setattr(update_cmd, "_invalidate_update_cache", lambda: None)
         patcher.setattr(update_cmd, "_prepare_and_promote_release", transaction)
+        patcher.setattr(update_cmd, "_finalize_release_upgrade", finalize_release)
         patcher.setattr(update_cmd, "_upgrade_release_with_local_patches", legacy_replay)
         patcher.setattr("subprocess.run", fake_run)
 
-        if transaction_error:
+        if transaction_error or post_promotion_signal == "called_process_error":
             with pytest.raises(SystemExit) as exc_info:
                 update_cmd._cmd_update_impl(args, gateway_mode=False)
             assert exc_info.value.code == 1
+        elif post_promotion_signal == "system_exit":
+            with pytest.raises(SystemExit) as exc_info:
+                update_cmd._cmd_update_impl(args, gateway_mode=False)
+            assert exc_info.value.code == 23
+        elif post_promotion_signal == "keyboard_interrupt":
+            with pytest.raises(KeyboardInterrupt):
+                update_cmd._cmd_update_impl(args, gateway_mode=False)
         else:
             with pytest.raises(StopAfterSuccessfulTransaction):
                 update_cmd._cmd_update_impl(args, gateway_mode=False)
@@ -193,6 +230,9 @@ def test_cmd_upgrade_release_orchestration_uses_transaction_and_releases_lock(
     assert lock_instances[0].git_cmd == expected_git_cmd
     assert lock_instances[0].acquire_calls == 1
     assert lock_instances[0].release_calls == 1
+    assert lifecycle_events == (
+        ["lock-release"] if transaction_error else ["finalize", "lock-release"]
+    )
     resolve_target.assert_called_once_with(expected_git_cmd, repo, args.release_tag)
     transaction.assert_called_once_with(
         expected_git_cmd,

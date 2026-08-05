@@ -100,6 +100,18 @@ class ReleaseUpgradeResult:
     candidate_sha: str
     backup_ref: str
     candidate_path: Path | None = None
+    context: "ReleaseUpgradeContext | None" = None
+
+
+@dataclass
+class ReleaseUpgradeContext:
+    """Durable user-state state carried from promotion to outer finalization."""
+
+    root: Path
+    common_dir: Path
+    transaction_dir: Path
+    journal_path: Path
+    journal: dict
 
 
 def _git_common_dir(git_cmd: list[str], cwd: Path | str) -> Path:
@@ -382,33 +394,41 @@ def _read_release_base_metadata(cwd: Path | str) -> ReleaseBaseMetadata:
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
         raise RuntimeError(f"Refusing non-regular release metadata: {path}")
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raw = path.read_bytes()
+    except OSError as exc:
         raise RuntimeError(f"Invalid release metadata {path}: {exc}") from exc
+    return _parse_release_base_metadata(raw, str(path))
+
+
+def _parse_release_base_metadata(raw: bytes, source: str) -> ReleaseBaseMetadata:
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Invalid release metadata {source}: {exc}") from exc
     if not isinstance(payload, dict):
-        raise RuntimeError(f"Invalid release metadata {path}: expected an object")
+        raise RuntimeError(f"Invalid release metadata {source}: expected an object")
     tag = payload.get("tag")
     base_sha = payload.get("base_sha")
     target_sha = payload.get("target_sha")
     patch_sha256 = payload.get("patch_sha256")
     patch_bytes = payload.get("patch_bytes")
     if not isinstance(tag, str) or not tag:
-        raise RuntimeError(f"Invalid release metadata {path}: missing tag")
+        raise RuntimeError(f"Invalid release metadata {source}: missing tag")
     if not isinstance(base_sha, str) or not _SHA_RE.fullmatch(base_sha):
-        raise RuntimeError(f"Invalid release metadata {path}: missing base_sha")
+        raise RuntimeError(f"Invalid release metadata {source}: missing base_sha")
     if target_sha is not None and (
         not isinstance(target_sha, str) or not _SHA_RE.fullmatch(target_sha)
     ):
-        raise RuntimeError(f"Invalid release metadata {path}: invalid target_sha")
+        raise RuntimeError(f"Invalid release metadata {source}: invalid target_sha")
     if patch_sha256 is not None and (
         not isinstance(patch_sha256, str)
         or not re.fullmatch(r"[0-9a-fA-F]{64}", patch_sha256)
     ):
-        raise RuntimeError(f"Invalid release metadata {path}: invalid patch_sha256")
+        raise RuntimeError(f"Invalid release metadata {source}: invalid patch_sha256")
     if patch_bytes is not None and (
         not isinstance(patch_bytes, int) or patch_bytes < 0
     ):
-        raise RuntimeError(f"Invalid release metadata {path}: invalid patch_bytes")
+        raise RuntimeError(f"Invalid release metadata {source}: invalid patch_bytes")
     return ReleaseBaseMetadata(
         tag=tag,
         base_sha=base_sha.lower(),
@@ -566,10 +586,144 @@ def _generate_runtime_local_payload(
     return _git_diff_bytes(git_cmd, root, metadata.base_sha, head_sha)
 
 
-def _write_transaction_journal(common_dir: Path, payload: dict) -> Path:
-    path = common_dir / "hermes-upgrade-transaction.json"
+def _read_release_base_metadata_at_commit(
+    git_cmd: list[str], cwd: Path | str, head_sha: str
+) -> ReleaseBaseMetadata:
+    """Read release metadata from ``head_sha`` without changing the worktree."""
+
+    result = subprocess.run(
+        git_cmd + ["show", f"{head_sha}:{_LOCAL_PATCHES_DIRNAME}/.release_base"],
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.decode(errors="replace").strip()
+        raise RuntimeError(
+            "Could not read committed release metadata from maintenance HEAD"
+            + (f": {detail.splitlines()[0]}" if detail else "")
+        )
+    return _parse_release_base_metadata(
+        result.stdout,
+        f"{head_sha}:{_LOCAL_PATCHES_DIRNAME}/.release_base",
+    )
+
+
+def _capture_release_checkout_identity(
+    git_cmd: list[str], cwd: Path | str
+) -> tuple[str | None, str]:
+    """Capture symbolic branch (if any) and exact HEAD before mutation."""
+
+    root = Path(cwd)
+    head_sha = _git_resolve_commit(git_cmd, root, "HEAD")
+    if head_sha is None:
+        raise RuntimeError("Could not capture the exact original HEAD SHA.")
+    symbolic = subprocess.run(
+        git_cmd + ["symbolic-ref", "--quiet", "--short", "HEAD"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    original_branch = symbolic.stdout.strip() if symbolic.returncode == 0 else None
+    return original_branch or None, head_sha
+
+
+def _write_transaction_journal(
+    common_dir: Path, payload: dict, *, path: Path | None = None
+) -> Path:
+    path = Path(path) if path is not None else common_dir / "hermes-upgrade-transaction.json"
     _atomic_write_bytes(path, (json.dumps(payload, sort_keys=True, indent=2) + "\n").encode())
     return path
+
+
+def _journal_update(
+    context: ReleaseUpgradeContext, phase: str | None = None, **updates
+) -> None:
+    if phase is not None:
+        context.journal["phase"] = phase
+        # Keep the old key for operators/tools that consumed the first journal.
+        context.journal["state"] = phase
+    context.journal.update(updates)
+    _write_transaction_journal(
+        context.common_dir, context.journal, path=context.journal_path
+    )
+
+
+def _create_release_upgrade_context(
+    git_cmd: list[str],
+    cwd: Path | str,
+    *,
+    original_branch: str | None,
+    original_head_sha: str,
+    maintenance_old_sha: str,
+    release_tag: str,
+    base_sha: str,
+    target_sha: str,
+    payload: bytes,
+    stash_marker: str | None = None,
+) -> ReleaseUpgradeContext:
+    """Create and durably seed a release transaction before live Git moves."""
+
+    root = Path(cwd)
+    common = _git_common_dir(git_cmd, root)
+    transaction_id = uuid.uuid4().hex
+    transaction_dir = common / "hermes-upgrade-transactions" / transaction_id
+    transaction_dir.mkdir(parents=True, exist_ok=False)
+    payload_path = transaction_dir / "runtime-local-maintenance.patch"
+    backup_ref = f"refs/hermes-upgrade/backups/{transaction_id}"
+    candidate_branch = f"hermes-upgrade-candidate/{transaction_id}"
+    candidate_path = common.parent.parent / f"hermes-upgrade-candidate-{transaction_id}"
+    journal_path = transaction_dir / "journal.json"
+    marker = stash_marker or f"hermes-update-autostash-{os.getpid()}-{transaction_id}"
+    journal = {
+        "version": 2,
+        "transaction_id": transaction_id,
+        "phase": "prepared",
+        "state": "prepared",
+        "original_branch": original_branch,
+        "original_ref": f"refs/heads/{original_branch}" if original_branch else None,
+        "original_head_sha": original_head_sha,
+        "maintenance_branch": "hermes-release",
+        "maintenance_old_sha": maintenance_old_sha,
+        "old_sha": maintenance_old_sha,
+        "release_tag": release_tag,
+        "base_sha": base_sha,
+        "target_sha": target_sha,
+        "backup_ref": backup_ref,
+        "backup_created": False,
+        "candidate_branch": candidate_branch,
+        "candidate_path": str(candidate_path),
+        "candidate_sha": None,
+        "candidate_cleanup": False,
+        "payload_path": str(payload_path),
+        "payload_sha256": hashlib.sha256(payload).hexdigest(),
+        "payload_bytes": len(payload),
+        "stash_marker": marker,
+        "stash_sha": None,
+        "stash_pending": False,
+        "stash_apply_attempted": False,
+        "stash_applied": False,
+        "checkout_restored": False,
+        "final_state_verified": False,
+    }
+    context = ReleaseUpgradeContext(
+        root=root,
+        common_dir=common,
+        transaction_dir=transaction_dir,
+        journal_path=journal_path,
+        journal=journal,
+    )
+    # The journal exists before payload capture; the payload itself is then
+    # written as a regular fsynced file before any stash/checkout/reset.
+    _write_transaction_journal(common, journal, path=journal_path)
+    _atomic_write_bytes(payload_path, payload)
+    info = payload_path.lstat()
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise RuntimeError(f"Durable release payload is not a regular file: {payload_path}")
+    _journal_update(context, "payload-persisted")
+    return context
 
 
 def _candidate_artifact_directory(candidate: Path) -> Path:
@@ -709,17 +863,19 @@ def _upgrade_release_transaction(
     cwd: Path | str,
     release_tag: str,
     target_sha: str,
+    *,
+    transaction_context: ReleaseUpgradeContext | None = None,
 ) -> ReleaseUpgradeResult:
-    """Replay committed maintenance changes in isolation, then CAS-promote."""
+    """Replay maintenance changes in isolation, then CAS-promote the candidate."""
 
     root = Path(cwd)
     _validate_release_tag_name(git_cmd, root, release_tag)
     if not _SHA_RE.fullmatch(target_sha):
         raise RuntimeError("Release target is not an immutable commit SHA.")
     target_sha = target_sha.lower()
-    exact_target = _git_resolve_commit(git_cmd, root, f"refs/tags/{release_tag}") or _git_resolve_commit(
-        git_cmd, root, f"refs/hermes-upgrade/tags/{release_tag}"
-    )
+    exact_target = _git_resolve_commit(
+        git_cmd, root, f"refs/tags/{release_tag}"
+    ) or _git_resolve_commit(git_cmd, root, f"refs/hermes-upgrade/tags/{release_tag}")
     if exact_target != target_sha:
         raise RuntimeError(
             f"Release target {release_tag} is not the exact fetched tag commit; refusing to guess."
@@ -727,56 +883,49 @@ def _upgrade_release_transaction(
 
     branch = "hermes-release"
     old_sha = _git_resolve_commit(git_cmd, root, f"refs/heads/{branch}")
-    current_branch = subprocess.run(
-        git_cmd + ["rev-parse", "--abbrev-ref", "HEAD"],
-        cwd=root,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
     if old_sha is None:
         raise RuntimeError(
             "Local maintenance branch 'hermes-release' is missing; create it from "
             "an official release and initialize local-patches/.release_base before upgrading."
         )
-    if current_branch.returncode != 0 or current_branch.stdout.strip() != branch:
+    current_branch, current_head = _capture_release_checkout_identity(git_cmd, root)
+    if current_branch != branch or current_head != old_sha:
         raise RuntimeError(
-            "Release transaction requires the explicit hermes-release branch to be checked out."
+            "Release transaction requires the explicit hermes-release branch at its recorded HEAD."
         )
-    current_sha = _git_resolve_commit(git_cmd, root, "HEAD")
-    if current_sha != old_sha:
-        raise RuntimeError("Live maintenance HEAD changed before promotion; retry the upgrade.")
     if _git_working_tree_dirty(git_cmd, root):
         raise RuntimeError("Live maintenance worktree must be clean after user changes are stashed.")
 
-    metadata = _read_release_base_metadata(root)
-    payload = _generate_runtime_local_payload(git_cmd, root, metadata, head_sha=old_sha)
-    common = _git_common_dir(git_cmd, root)
-    journal_path = common / "hermes-upgrade-transaction.json"
-    if journal_path.exists():
-        raise RuntimeError(
-            f"An unfinished upgrade transaction exists at {journal_path}; "
-            "recover using its candidate path and backup ref before retrying."
+    context = transaction_context
+    if context is None:
+        metadata = _read_release_base_metadata(root)
+        payload = _generate_runtime_local_payload(git_cmd, root, metadata, head_sha=old_sha)
+        context = _create_release_upgrade_context(
+            git_cmd,
+            root,
+            original_branch=current_branch,
+            original_head_sha=current_head,
+            maintenance_old_sha=old_sha,
+            release_tag=release_tag,
+            base_sha=metadata.base_sha,
+            target_sha=target_sha,
+            payload=payload,
         )
+    journal = context.journal
+    if journal.get("maintenance_old_sha") != old_sha:
+        raise RuntimeError("Live maintenance HEAD changed before promotion; retry the upgrade.")
+    payload_path = Path(journal["payload_path"])
+    payload = payload_path.read_bytes()
+    if (
+        len(payload) != journal.get("payload_bytes")
+        or hashlib.sha256(payload).hexdigest() != journal.get("payload_sha256")
+    ):
+        _journal_update(context, "payload-integrity-failed")
+        raise RuntimeError("Durable release payload changed before candidate replay.")
 
-    token = uuid.uuid4().hex
-    backup_ref = f"refs/hermes-upgrade/backups/{token}"
-    candidate_branch = f"hermes-upgrade-candidate/{token}"
-    candidate_path = common.parent.parent / f"hermes-upgrade-candidate-{token}"
-    journal = {
-        "version": 1,
-        "state": "prepared",
-        "old_sha": old_sha,
-        "target_sha": target_sha,
-        "release_tag": release_tag,
-        "backup_ref": backup_ref,
-        "candidate_branch": candidate_branch,
-        "candidate_path": str(candidate_path),
-        "stash_pending": False,
-    }
-    _write_transaction_journal(common, journal)
-
+    backup_ref = journal["backup_ref"]
+    candidate_branch = journal["candidate_branch"]
+    candidate_path = Path(journal["candidate_path"])
     backup = subprocess.run(
         git_cmd + ["update-ref", backup_ref, old_sha],
         cwd=root,
@@ -786,14 +935,13 @@ def _upgrade_release_transaction(
         errors="replace",
     )
     if backup.returncode != 0:
-        journal["state"] = "backup-failed"
-        _write_transaction_journal(common, journal)
+        _journal_update(context, "backup-failed")
         raise RuntimeError("Could not create durable pre-promotion backup ref.")
+    _journal_update(context, "backup-created", backup_created=True)
 
     try:
         worktree = subprocess.run(
-            git_cmd
-            + ["worktree", "add", "-b", candidate_branch, str(candidate_path), target_sha],
+            git_cmd + ["worktree", "add", "-b", candidate_branch, str(candidate_path), target_sha],
             cwd=root,
             capture_output=True,
             text=True,
@@ -801,20 +949,17 @@ def _upgrade_release_transaction(
             errors="replace",
         )
         if worktree.returncode != 0:
-            journal["state"] = "candidate-create-failed"
-            _write_transaction_journal(common, journal)
+            _journal_update(context, "candidate-create-failed")
             detail = (worktree.stderr or worktree.stdout or "").strip()
             raise RuntimeError(
-                f"Could not create isolated upgrade candidate: "
+                "Could not create isolated upgrade candidate: "
                 f"{detail.splitlines()[0] if detail else 'git worktree add failed'}"
             )
-        journal["state"] = "candidate-created"
-        _write_transaction_journal(common, journal)
+        _journal_update(context, "candidate-created", candidate_created=True)
         _apply_payload_to_candidate(git_cmd, candidate_path, payload, label=release_tag)
         _commit_candidate_changes(
             git_cmd, candidate_path, f"local: replay maintenance payload onto {release_tag}"
         )
-
         candidate_head = _git_resolve_commit(git_cmd, candidate_path, "HEAD")
         if candidate_head is None:
             raise RuntimeError("Candidate payload commit did not produce a commit SHA.")
@@ -829,9 +974,7 @@ def _upgrade_release_transaction(
             "patch_sha256": artifact_sha,
             "patch_bytes": len(artifact_payload),
         }
-        _atomic_write_bytes(
-            artifact_dir / "0001-local-maintenance.patch", artifact_payload
-        )
+        _atomic_write_bytes(artifact_dir / "0001-local-maintenance.patch", artifact_payload)
         _atomic_write_bytes(artifact_dir / "README.md", _LOCAL_PATCHES_README.encode())
         _atomic_write_bytes(
             artifact_dir / ".release_base",
@@ -855,20 +998,15 @@ def _upgrade_release_transaction(
         if stage.returncode != 0:
             raise RuntimeError("Could not stage expected local-patches artifacts in candidate.")
         _commit_candidate_changes(
-            git_cmd,
-            candidate_path,
-            f"local: refresh maintenance artifacts for {release_tag}",
+            git_cmd, candidate_path, f"local: refresh maintenance artifacts for {release_tag}"
         )
         candidate_sha = _validate_candidate_tree(git_cmd, candidate_path)
-        journal["state"] = "candidate-validated"
-        journal["candidate_sha"] = candidate_sha
-        _write_transaction_journal(common, journal)
+        _journal_update(context, "candidate-validated", candidate_sha=candidate_sha)
 
         live_sha = _git_resolve_commit(git_cmd, root, "HEAD")
         if live_sha != old_sha or _git_working_tree_dirty(git_cmd, root):
             raise RuntimeError("Live checkout changed while candidate was being validated.")
-        journal["state"] = "promoting"
-        _write_transaction_journal(common, journal)
+        _journal_update(context, "promoting")
         promote = subprocess.run(
             git_cmd + ["update-ref", f"refs/heads/{branch}", candidate_sha, old_sha],
             cwd=root,
@@ -891,17 +1029,16 @@ def _upgrade_release_transaction(
         )
         final_sha = _git_resolve_commit(git_cmd, root, "HEAD")
         if reset.returncode != 0 or final_sha != candidate_sha or _git_working_tree_dirty(git_cmd, root):
-            journal["state"] = "promotion-needs-recovery"
-            _write_transaction_journal(common, journal)
+            _journal_update(context, "promotion-needs-recovery")
             raise RuntimeError(
                 f"Promotion did not verify. Recover with backup ref {backup_ref} "
                 f"and candidate {candidate_path}."
             )
-        journal["state"] = "promoted"
-        _write_transaction_journal(common, journal)
-    except Exception:
-        # Keep candidate worktrees and the journal on every post-backup failure.
-        # They are the recovery evidence; never reset or plain-apply the live tree.
+        _journal_update(context, "promoted")
+    except BaseException:
+        # Candidate and journal are recovery evidence across every exception,
+        # including KeyboardInterrupt/SystemExit.  The outer finalizer decides
+        # whether it is safe to return user state or must leave guidance.
         raise
 
     cleanup = subprocess.run(
@@ -912,8 +1049,9 @@ def _upgrade_release_transaction(
         encoding="utf-8",
         errors="replace",
     )
+    branch_cleanup_ok = False
     if cleanup.returncode == 0:
-        subprocess.run(
+        branch_cleanup = subprocess.run(
             git_cmd + ["branch", "-D", candidate_branch],
             cwd=root,
             capture_output=True,
@@ -921,16 +1059,27 @@ def _upgrade_release_transaction(
             encoding="utf-8",
             errors="replace",
         )
-        try:
-            journal_path.unlink()
-        except OSError:
-            logger.warning("Could not remove completed upgrade journal: %s", journal_path)
+        branch_cleanup_ok = (
+            branch_cleanup.returncode == 0
+            and _git_resolve_commit(git_cmd, root, f"refs/heads/{candidate_branch}") is None
+            and not candidate_path.exists()
+        )
+    if branch_cleanup_ok:
+        _journal_update(context, "candidate-cleanup", candidate_cleanup=True)
     else:
+        _journal_update(context, "candidate-cleanup-failed", candidate_cleanup=False)
         logger.warning(
             "Upgrade promoted successfully but candidate cleanup failed; recovery journal kept at %s",
-            journal_path,
+            context.journal_path,
         )
-    return ReleaseUpgradeResult(old_sha, target_sha, candidate_sha, backup_ref, candidate_path)
+    return ReleaseUpgradeResult(
+        old_sha,
+        target_sha,
+        candidate_sha,
+        backup_ref,
+        candidate_path,
+        context,
+    )
 
 
 def _prepare_and_promote_release(
@@ -941,28 +1090,45 @@ def _prepare_and_promote_release(
     *,
     input_fn=None,
 ) -> ReleaseUpgradeResult:
-    """Stash user state, run the isolated transaction, and restore it safely."""
+    """Capture user state, promote a release, and defer restore to finalization."""
 
     root = Path(cwd)
     branch = "hermes-release"
-    original_branch = subprocess.run(
-        git_cmd + ["rev-parse", "--abbrev-ref", "HEAD"],
-        cwd=root,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    ).stdout.strip()
-    if _git_resolve_commit(git_cmd, root, f"refs/heads/{branch}") is None:
+    _validate_release_tag_name(git_cmd, root, release_tag)
+    original_branch, original_head_sha = _capture_release_checkout_identity(git_cmd, root)
+    maintenance_sha = _git_resolve_commit(git_cmd, root, f"refs/heads/{branch}")
+    if maintenance_sha is None:
         raise RuntimeError(
             "Local maintenance branch 'hermes-release' is missing; refusing to create it from an arbitrary branch."
         )
-    stash_ref = None
-    promoted = False
+    metadata = _read_release_base_metadata_at_commit(git_cmd, root, maintenance_sha)
+    _validate_release_base_metadata(git_cmd, root, metadata, maintenance_sha)
+    payload = _git_diff_bytes(git_cmd, root, metadata.base_sha, maintenance_sha)
+    context = _create_release_upgrade_context(
+        git_cmd,
+        root,
+        original_branch=original_branch,
+        original_head_sha=original_head_sha,
+        maintenance_old_sha=maintenance_sha,
+        release_tag=release_tag,
+        base_sha=metadata.base_sha,
+        target_sha=target_sha.lower(),
+        payload=payload,
+    )
     try:
-        # This is deliberately the first worktree-mutating operation. In
-        # particular, package-lock and local-patches edits are captured too.
-        stash_ref = _stash_local_changes_if_needed(git_cmd, root)
+        _journal_update(context, "stash-pending")
+        stash_ref = _stash_local_changes_if_needed(
+            git_cmd, root, marker=context.journal["stash_marker"]
+        )
+        if stash_ref:
+            _journal_update(
+                context,
+                "stashed",
+                stash_sha=stash_ref.lower(),
+                stash_pending=True,
+            )
+        else:
+            _journal_update(context, "no-stash", stash_pending=False)
         if original_branch != branch:
             checkout = subprocess.run(
                 git_cmd + ["checkout", branch],
@@ -978,33 +1144,329 @@ def _prepare_and_promote_release(
                     f"Could not switch to local maintenance branch '{branch}': "
                     f"{detail.splitlines()[0] if detail else 'git checkout failed'}"
                 )
-        result = _upgrade_release_transaction(git_cmd, root, release_tag, target_sha)
-        promoted = True
-        if stash_ref is not None:
-            restored = _restore_stashed_changes(
-                git_cmd, root, stash_ref, prompt_user=False, input_fn=input_fn
-            )
-            if not restored:
-                raise RuntimeError(
-                    f"Upgrade promoted, but local changes remain in stash {stash_ref}; "
-                    "resolve the restore conflict before continuing."
-                )
+        current_branch, current_head = _capture_release_checkout_identity(git_cmd, root)
+        if current_branch != branch or current_head != maintenance_sha:
+            raise RuntimeError("Maintenance branch checkout did not verify before promotion.")
+        result = _upgrade_release_transaction(
+            git_cmd,
+            root,
+            release_tag,
+            target_sha,
+            transaction_context=context,
+        )
         return result
-    except Exception:
-        if not promoted and original_branch and original_branch != branch:
-            subprocess.run(
-                git_cmd + ["checkout", original_branch],
-                cwd=root,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-            )
-        if stash_ref is not None and not promoted:
-            _restore_stashed_changes(
-                git_cmd, root, stash_ref, prompt_user=False, input_fn=input_fn
-            )
+    except BaseException:
+        # Resolve a stash that may have been created just before an interrupt.
+        _refresh_transaction_stash_identity(git_cmd, root, context)
+        _finalize_release_upgrade(git_cmd, root, context, input_fn=input_fn)
         raise
+
+
+def _refresh_transaction_stash_identity(
+    git_cmd: list[str], root: Path, context: ReleaseUpgradeContext
+) -> str | None:
+    """Resolve the immutable stash commit from the durable transaction marker."""
+
+    current = context.journal.get("stash_sha")
+    if isinstance(current, str) and _SHA_RE.fullmatch(current):
+        return current
+    marker = context.journal.get("stash_marker")
+    if not marker:
+        return None
+    listing = subprocess.run(
+        git_cmd + ["stash", "list", "--format=%H%x00%gs"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if listing.returncode != 0:
+        return None
+    for line in listing.stdout.splitlines():
+        commit, separator, subject = line.partition("\0")
+        commit = commit.strip()
+        if separator and marker in subject and _SHA_RE.fullmatch(commit):
+            _journal_update(
+                context,
+                "stash-pending",
+                stash_sha=commit.lower(),
+                stash_pending=True,
+            )
+            return commit.lower()
+    return None
+
+
+def _transaction_is_promoted(
+    git_cmd: list[str], root: Path, context: ReleaseUpgradeContext
+) -> bool:
+    journal = context.journal
+    candidate_sha = journal.get("candidate_sha")
+    if not isinstance(candidate_sha, str) or not _SHA_RE.fullmatch(candidate_sha):
+        return False
+    live_sha = _git_resolve_commit(
+        git_cmd, root, f"refs/heads/{journal.get('maintenance_branch', 'hermes-release')}"
+    )
+    return live_sha == candidate_sha and journal.get("phase") in {
+        "promoting",
+        "promoted",
+        "candidate-cleanup",
+        "candidate-cleanup-failed",
+        "finalizing",
+        "stash-restore-conflict",
+        "finalized",
+    }
+
+
+def _prepare_worktree_for_release_restore(
+    git_cmd: list[str], root: Path, *, stash_pending: bool
+) -> None:
+    """Discard only update-pipeline output before returning to the user checkout."""
+
+    reset = subprocess.run(
+        git_cmd + ["reset", "--hard", "HEAD"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if reset.returncode != 0:
+        detail = (reset.stderr or reset.stdout or "").strip()
+        raise RuntimeError(
+            "Could not clear generated tracked files before release recovery"
+            + (f": {detail.splitlines()[0]}" if detail else "")
+        )
+    # A pending autostash owns every ordinary untracked path captured before
+    # promotion.  Removing generated untracked files is therefore safe here;
+    # ignored paths (venvs/node_modules) are intentionally untouched.
+    clean = subprocess.run(
+        git_cmd + ["clean", "-fd"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if clean.returncode != 0:
+        detail = (clean.stderr or clean.stdout or "").strip()
+        raise RuntimeError(
+            "Could not clear generated untracked files before release recovery"
+            + (f": {detail.splitlines()[0]}" if detail else "")
+        )
+
+
+def _restore_original_release_checkout(
+    git_cmd: list[str], root: Path, context: ReleaseUpgradeContext
+) -> None:
+    journal = context.journal
+    original_branch = journal.get("original_branch")
+    original_sha = journal["original_head_sha"]
+    promoted = _transaction_is_promoted(git_cmd, root, context)
+    if original_branch:
+        checkout = subprocess.run(
+            git_cmd + ["checkout", "--force", original_branch],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if checkout.returncode != 0:
+            detail = (checkout.stderr or checkout.stdout or "").strip()
+            raise RuntimeError(
+                f"Could not restore original branch '{original_branch}'"
+                + (f": {detail.splitlines()[0]}" if detail else "")
+            )
+        expected_sha = original_sha
+        if promoted and original_branch == journal.get("maintenance_branch"):
+            expected_sha = journal.get("candidate_sha") or original_sha
+        actual_branch = subprocess.run(
+            git_cmd + ["symbolic-ref", "--quiet", "--short", "HEAD"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        actual_sha = _git_resolve_commit(git_cmd, root, "HEAD")
+        if (
+            actual_branch.returncode != 0
+            or actual_branch.stdout.strip() != original_branch
+            or actual_sha != expected_sha
+        ):
+            raise RuntimeError(
+                f"Original branch restore did not verify: expected "
+                f"{original_branch}@{expected_sha}, got "
+                f"{actual_branch.stdout.strip() or 'detached'}@{actual_sha}"
+            )
+        return
+
+    checkout = subprocess.run(
+        git_cmd + ["checkout", "--detach", original_sha],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if checkout.returncode != 0:
+        detail = (checkout.stderr or checkout.stdout or "").strip()
+        raise RuntimeError(
+            "Could not restore original detached HEAD"
+            + (f": {detail.splitlines()[0]}" if detail else "")
+        )
+    actual_sha = _git_resolve_commit(git_cmd, root, "HEAD")
+    actual_branch = subprocess.run(
+        git_cmd + ["rev-parse", "--abbrev-ref", "HEAD"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if actual_sha != original_sha or actual_branch.stdout.strip() != "HEAD":
+        raise RuntimeError(
+            f"Detached HEAD restore did not verify: expected {original_sha}, "
+            f"got {actual_branch.stdout.strip()}@{actual_sha}"
+        )
+
+
+def _finalize_release_upgrade(
+    git_cmd: list[str],
+    cwd: Path | str,
+    context: ReleaseUpgradeContext,
+    *,
+    input_fn=None,
+) -> bool:
+    """Restore the original checkout and apply/drop the immutable stash once."""
+
+    root = Path(cwd)
+    journal = context.journal
+    try:
+        stash_sha = _refresh_transaction_stash_identity(git_cmd, root, context)
+        stash_pending = bool(journal.get("stash_pending"))
+        if stash_pending and not stash_sha:
+            print(
+                "✗ Release update still has an unidentified pending stash; "
+                f"journal: {context.journal_path}"
+            )
+            print(
+                f"  Search for marker {journal.get('stash_marker')!r} with: "
+                "git stash list --format='%gd %H %s'"
+            )
+            return False
+
+        _journal_update(context, "finalizing")
+        _prepare_worktree_for_release_restore(
+            git_cmd, root, stash_pending=stash_pending
+        )
+        if not journal.get("checkout_restored"):
+            _restore_original_release_checkout(git_cmd, root, context)
+            _journal_update(context, checkout_restored=True)
+
+        if stash_pending:
+            assert stash_sha is not None
+            if not journal.get("stash_apply_attempted"):
+                if (
+                    subprocess.run(
+                        git_cmd + ["cat-file", "-e", f"{stash_sha}^{{commit}}"],
+                        cwd=root,
+                        capture_output=True,
+                    ).returncode
+                    != 0
+                ):
+                    raise RuntimeError(
+                        f"Immutable stash {stash_sha} is no longer reachable; "
+                        f"journal: {context.journal_path}"
+                    )
+                _journal_update(context, stash_apply_attempted=True)
+                restored = _restore_stashed_changes(
+                    git_cmd,
+                    root,
+                    stash_sha,
+                    prompt_user=False,
+                    input_fn=input_fn,
+                )
+                if not restored:
+                    _journal_update(context, "stash-restore-conflict")
+                    print(f"  Recovery journal retained at {context.journal_path}")
+                    _print_stash_cleanup_guidance(
+                        stash_sha, _resolve_stash_selector(git_cmd, root, stash_sha)
+                    )
+                    return False
+                _journal_update(context, stash_applied=True)
+
+            selector = _resolve_stash_selector(git_cmd, root, stash_sha)
+            if selector is not None:
+                drop = subprocess.run(
+                    git_cmd + ["stash", "drop", selector],
+                    cwd=root,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+                if drop.returncode != 0:
+                    print(
+                        "⚠ Local changes were restored, but the immutable stash "
+                        "could not be dropped."
+                    )
+                    _print_stash_cleanup_guidance(stash_sha, selector)
+                    _journal_update(context, "stash-drop-failed")
+                    return False
+                if _resolve_stash_selector(git_cmd, root, stash_sha) is not None:
+                    _journal_update(context, "stash-drop-unverified")
+                    return False
+            _journal_update(context, stash_pending=False)
+        else:
+            _journal_update(context, stash_pending=False)
+
+        final_sha = _git_resolve_commit(git_cmd, root, "HEAD")
+        promoted = _transaction_is_promoted(git_cmd, root, context)
+        original_branch = journal.get("original_branch")
+        expected_sha = journal["original_head_sha"]
+        if promoted and original_branch == journal.get("maintenance_branch"):
+            expected_sha = journal.get("candidate_sha") or expected_sha
+        if final_sha != expected_sha:
+            raise RuntimeError(
+                f"Final release checkout verification failed: expected {expected_sha}, "
+                f"got {final_sha}"
+            )
+        if journal.get("candidate_created") and not journal.get("candidate_cleanup"):
+            print(
+                "⚠ Release candidate cleanup is incomplete; keeping durable journal "
+                f"at {context.journal_path}"
+            )
+            return False
+        _journal_update(
+            context,
+            "finalized",
+            final_state_verified=True,
+            finalized=True,
+        )
+        # Delete the journal last.  If this unlink fails, all immutable payload,
+        # stash and candidate identities remain actionable in the directory.
+        context.journal_path.unlink()
+        try:
+            context.transaction_dir.rmdir()
+        except OSError:
+            pass
+        return True
+    except BaseException as exc:
+        # A second Ctrl-C must not erase the only recovery evidence.  Preserve
+        # the journal and let an already-active exception continue propagating.
+        logger.warning(
+            "Release user-state finalization did not complete; journal retained at %s: %s",
+            context.journal_path,
+            exc,
+        )
+        print(f"⚠ Release user-state recovery is incomplete; journal: {context.journal_path}")
+        return False
+
+
+
+
 
 
 _UPDATE_RUNTIME_RELOAD_MODULES = (
@@ -2371,7 +2833,9 @@ def _update_via_zip(args):
     # git-update path for rationale (#30271).
     _finish_dashboard_update_cleanup(node_failures)
 
-def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[str]:
+def _stash_local_changes_if_needed(
+    git_cmd: list[str], cwd: Path, *, marker: str | None = None
+) -> Optional[str]:
     status = subprocess.run(
         git_cmd + ["status", "--porcelain"],
         cwd=cwd,
@@ -2396,7 +2860,7 @@ def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[st
         print("→ Clearing unmerged index entries from a previous conflict...")
         subprocess.run(git_cmd + ["reset"], cwd=cwd, capture_output=True)
 
-    stash_name = (
+    stash_name = marker or (
         f"hermes-update-autostash-{os.getpid()}-{uuid.uuid4().hex}"
     )
     print("→ Local changes detected — stashing before update...")
@@ -4824,6 +5288,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
     release_repo_lock = None
     release_target = None
     release_transaction_result = None
+    release_upgrade_context = None
 
     # Whether this update is running without a human at the keyboard.
     # Interactive terminal updates always stash-and-ask (unchanged behavior);
@@ -5285,6 +5750,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         release_tag,
                         release_target.target_sha,
                         input_fn=gw_input_fn,
+                    )
+                    release_upgrade_context = getattr(
+                        release_transaction_result, "context", None
                     )
                 except RuntimeError as exc:
                     print(f"✗ Could not upgrade to Release {release_tag}.")
@@ -6783,6 +7251,13 @@ def _cmd_update_impl(args, gateway_mode: bool):
             print(f"✗ Update failed: {e}")
             sys.exit(1)
     finally:
+        if release_upgrade_context is not None:
+            _finalize_release_upgrade(
+                git_cmd,
+                _m().PROJECT_ROOT,
+                release_upgrade_context,
+                input_fn=gw_input_fn,
+            )
         if release_repo_lock is not None:
             release_repo_lock.release()
 
