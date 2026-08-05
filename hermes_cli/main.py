@@ -35,7 +35,8 @@ Usage:
     hermes honcho identity <file>          # Seed AI peer identity from a file (SOUL.md etc.)
     hermes honcho migrate                  # Step-by-step migration guide: OpenClaw native → Hermes + Honcho
     hermes version             Show version
-    hermes update              Update to latest version
+    hermes update              Update to latest main-branch code
+    hermes upgrade             Upgrade to latest published Release
     hermes uninstall           Uninstall Hermes Agent
     hermes acp                 Run as an ACP server for editor integration
     hermes sessions browse     Interactive session picker with search
@@ -9061,6 +9062,214 @@ def _size_delta_label(saved_mb: float) -> str:
     return f"grew by {-saved_mb:.1f} MB"
 
 
+def _fetch_latest_release_tag() -> str:
+    """Return the tag name for the latest published GitHub Release."""
+    from urllib import error as urllib_error
+    from urllib import request as urllib_request
+
+    req = urllib_request.Request(
+        "https://api.github.com/repos/NousResearch/hermes-agent/releases/latest",
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "hermes-agent-upgrade",
+        },
+    )
+    try:
+        with urllib_request.urlopen(req, timeout=20) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (OSError, urllib_error.URLError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Could not check GitHub Releases: {exc}") from exc
+
+    tag = str(payload.get("tag_name") or "").strip()
+    if not tag:
+        raise RuntimeError("GitHub latest-release response did not include tag_name")
+    return tag
+
+def _cmd_upgrade_check() -> None:
+    """Implement ``hermes upgrade --check`` against the latest Release tag."""
+    from hermes_cli.config import detect_install_method
+
+    method = detect_install_method(PROJECT_ROOT)
+    if method == "docker":
+        from hermes_cli.config import format_docker_update_message
+
+        print(format_docker_update_message())
+        sys.exit(1)
+    if method == "pip":
+        from hermes_cli.banner import check_via_pypi
+
+        result = check_via_pypi()
+        if result is None:
+            print("✗ Could not reach PyPI to check for release upgrades.")
+            sys.exit(1)
+        if result == 0:
+            print("✓ Already on the latest packaged release.")
+        else:
+            print("⚕ Release upgrade available on PyPI.")
+            print("  Run 'hermes upgrade' to install.")
+        return
+
+    if not (PROJECT_ROOT / ".git").exists():
+        print("✗ Not a git repository — cannot check Release upgrades.")
+        sys.exit(1)
+
+    try:
+        latest_tag = _fetch_latest_release_tag()
+    except RuntimeError as exc:
+        print(f"✗ {exc}")
+        sys.exit(1)
+
+    git_cmd = ["git"]
+    if sys.platform == "win32":
+        git_cmd = ["git", "-c", "windows.appendAtomically=false"]
+
+    print(f"→ Latest Release: {latest_tag}")
+    print("→ Fetching release tags...")
+    fetch_result = subprocess.run(
+        git_cmd + ["fetch", "origin", "--tags"],
+        cwd=PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+    )
+    if fetch_result.returncode != 0:
+        stderr = fetch_result.stderr.strip()
+        print("✗ Failed to fetch release tags.")
+        if stderr:
+            print(f"  {stderr.splitlines()[0]}")
+        sys.exit(1)
+
+    tag_result = subprocess.run(
+        git_cmd + ["rev-parse", "--verify", f"{latest_tag}^{{commit}}"],
+        cwd=PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+    )
+    if tag_result.returncode != 0:
+        print(f"✗ Release tag '{latest_tag}' was not found after fetching tags.")
+        sys.exit(1)
+
+    release_merged = subprocess.run(
+        git_cmd + ["merge-base", "--is-ancestor", latest_tag, "HEAD"],
+        cwd=PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+    )
+    if release_merged.returncode == 0:
+        print(f"✓ Already includes the latest Release ({latest_tag}).")
+    elif release_merged.returncode == 1:
+        print(f"⚕ Release upgrade available: {latest_tag}.")
+        print("  Run 'hermes upgrade' to install.")
+    else:
+        print(f"✗ Failed to compare local branch with Release {latest_tag}.")
+        if release_merged.stderr.strip():
+            print(f"  {release_merged.stderr.strip().splitlines()[0]}")
+        sys.exit(1)
+
+def cmd_upgrade(args):
+    """Upgrade Hermes Agent to the latest published GitHub Release."""
+    from hermes_cli.config import (
+        detect_install_method,
+        format_docker_update_message,
+        is_managed,
+        managed_error,
+        recommended_update_command_for_method,
+    )
+
+    if is_managed():
+        managed_error("upgrade Hermes Agent")
+        return
+
+    method = detect_install_method(PROJECT_ROOT)
+    if method == "docker":
+        print(format_docker_update_message())
+        sys.exit(1)
+    if method in {"nix", "nixos"}:
+        print(recommended_update_command_for_method(method))
+        sys.exit(1)
+    if getattr(args, "check", False):
+        _cmd_upgrade_check()
+        return
+    if method == "pip" and not (PROJECT_ROOT / ".git").exists():
+        _cmd_update_pip(args)
+        return
+
+    try:
+        release_tag = _fetch_latest_release_tag()
+    except RuntimeError as exc:
+        print(f"✗ {exc}")
+        sys.exit(1)
+
+    setattr(args, "release_tag", release_tag)
+    setattr(args, "branch", None)
+
+    gateway_mode = getattr(args, "gateway", False)
+    _update_io_state = _install_hangup_protection(gateway_mode=gateway_mode)
+    try:
+        _cmd_update_impl(args, gateway_mode=gateway_mode)
+    finally:
+        _finalize_update_output(_update_io_state)
+
+def _cmd_update_pip(args):
+    """Update Hermes via pip (for PyPI installs)."""
+    from hermes_cli import __version__
+
+    print(f"→ Current version: {__version__}")
+    print("→ Checking PyPI for updates...")
+
+    from hermes_cli.managed_uv import ensure_uv, update_managed_uv
+
+    # Keep managed uv current before using it.
+    update_managed_uv()
+
+    uv = ensure_uv()
+    in_venv = sys.prefix != sys.base_prefix
+    # pipx-managed installs live under .../pipx/venvs/<name>/...
+    pipx_managed = "pipx" in sys.prefix.split(os.sep)
+    pipx = shutil.which("pipx") if pipx_managed else None
+    # Heuristic for ``uv tool install hermes-agent`` layouts.
+    uv_tool_managed = "uv" in sys.prefix.split(os.sep) and "tools" in sys.prefix.split(os.sep)
+
+    # Only the ``uv pip install`` path inside a venv needs VIRTUAL_ENV
+    # exported (uv refuses to install without it when the launcher shim
+    # didn't activate the venv). ``uv tool upgrade`` / ``pipx upgrade``
+    # operate on a named environment and ignore VIRTUAL_ENV, so we don't
+    # set it for them.
+    export_virtualenv = False
+
+    if uv_tool_managed:
+        if not uv:
+            print("✗ Detected a uv-tool install but managed uv install failed.")
+            print("  Install uv manually: https://docs.astral.sh/uv/getting-started/installation/")
+            sys.exit(1)
+        cmd = [uv, "tool", "upgrade", "hermes-agent"]
+    elif pipx_managed and pipx:
+        # pipx owns its own venv; ``pipx upgrade`` is the only correct path.
+        # Matches scripts/auto-update.sh, which already uses pipx upgrade.
+        cmd = [pipx, "upgrade", "hermes-agent"]
+    elif uv:
+        cmd = [uv, "pip", "install", "--upgrade", "hermes-agent"]
+        if in_venv:
+            # Launcher shim runs the venv interpreter but doesn't export
+            # VIRTUAL_ENV; without it uv errors "No virtual environment found".
+            export_virtualenv = True
+        else:
+            # Outside any venv, ``--system`` lets uv target the active
+            # interpreter, matching pip's default behaviour.
+            cmd.insert(3, "--system")
+    else:
+        cmd = [sys.executable, "-m", "pip", "install", "--upgrade", "hermes-agent"]
+
+    print(f"→ Running: {' '.join(cmd)}")
+    run_kwargs = {}
+    if export_virtualenv:
+        run_kwargs["env"] = {**os.environ, "VIRTUAL_ENV": sys.prefix}
+    result = subprocess.run(cmd, **run_kwargs)
+    if result.returncode != 0:
+        print("✗ Update failed")
+        sys.exit(1)
+
+    print("✓ Update complete! Restart hermes to use the new version.")
+
 def cmd_update(args):
     """Update Hermes Agent to the latest version.
 
@@ -12329,7 +12538,11 @@ def main():
     # =========================================================================
     # update command  (parser built in hermes_cli/subcommands/update.py)
     # =========================================================================
-    build_update_parser(subparsers, cmd_update=cmd_update)
+    build_update_parser(
+        subparsers,
+        cmd_update=cmd_update,
+        cmd_upgrade=cmd_upgrade,
+    )
 
     # =========================================================================
     # uninstall command  (parser built in hermes_cli/subcommands/uninstall.py)

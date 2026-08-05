@@ -4832,7 +4832,7 @@ def _sync_session_key_after_compress(
             pass
 
 
-def _get_usage(agent) -> dict:
+def _get_usage(agent, *, include_account: bool = False) -> dict:
     g = lambda k, fb=None: getattr(agent, k, 0) or (getattr(agent, fb, 0) if fb else 0)
     usage = {
         "model": getattr(agent, "model", "") or "",
@@ -4887,6 +4887,22 @@ def _get_usage(agent) -> dict:
             spent = agent.get_credits_spent_micros()
             if spent is not None:
                 usage["dev_credits_spent_micros"] = int(spent)
+        except Exception:
+            pass
+    if include_account:
+        try:
+            from agent.account_usage import fetch_account_usage, render_account_usage_lines
+
+            provider = getattr(agent, "provider", None)
+            if provider:
+                account_snapshot = fetch_account_usage(
+                    provider,
+                    base_url=getattr(agent, "base_url", None),
+                    api_key=getattr(agent, "api_key", None),
+                )
+                account_lines = render_account_usage_lines(account_snapshot)
+                if account_lines:
+                    usage["account_lines"] = account_lines
         except Exception:
             pass
     return usage
@@ -4961,13 +4977,17 @@ def _current_profile_name() -> str:
 DESKTOP_BACKEND_CONTRACT = 5
 
 
-def _session_usage_snapshot(session: dict | None) -> dict:
+def _session_usage_snapshot(
+    session: dict | None,
+    *,
+    include_account: bool = False,
+) -> dict:
     agent = (session or {}).get("agent")
     mirror_usage = _metadata_mirror(session).get("usage")
     if (session or {}).get("_compute_host_active") and isinstance(mirror_usage, dict):
         return dict(mirror_usage)
     if agent is not None:
-        return _get_usage(agent)
+        return _get_usage(agent, include_account=include_account)
     return dict(mirror_usage) if isinstance(mirror_usage, dict) else {}
 
 

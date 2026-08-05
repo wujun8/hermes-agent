@@ -30,6 +30,15 @@ DEFAULT_CONFIG = {
     "max_live_sessions": 16,
     "agent": {
         "max_turns": 500,
+
+        "api_outage_recovery": {
+            "enabled": False,
+            "probe_command": "",
+            "probe_interval_seconds": 600,
+            "probe_timeout_seconds": 60,
+        },
+        "show_retry_status": False,
+
         # Inactivity timeout for gateway agent execution (seconds).
         # The agent can run indefinitely as long as it's actively calling
         # tools or receiving API responses.  Only fires when the agent has

@@ -117,6 +117,178 @@ def _capture_head_sha(git_cmd, cwd) -> str | None:
     except (subprocess.CalledProcessError, OSError):
         return None
 
+
+def _local_patches_dir() -> Path:
+    """Return ``$HERMES_HOME/local-patches`` (may not exist yet)."""
+    return Path(get_hermes_home()) / "local-patches"
+
+
+def _list_local_release_patches() -> list[Path]:
+    """Sorted ``*.patch`` files used to reapply local customizations after a release reset."""
+    patches_dir = _local_patches_dir()
+    if not patches_dir.is_dir():
+        return []
+    return sorted(
+        path
+        for path in patches_dir.iterdir()
+        if path.is_file() and path.suffix == ".patch" and not path.name.startswith(".")
+    )
+
+
+def _git_working_tree_dirty(git_cmd, cwd) -> bool:
+    result = subprocess.run(
+        git_cmd + ["status", "--porcelain"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    return bool(result.stdout.strip())
+
+
+def _apply_local_release_patches(git_cmd, cwd, release_tag: str) -> None:
+    """Reset-friendly reapply of ``$HERMES_HOME/local-patches/*.patch``.
+
+    Release upgrades reset ``hermes-release`` to the tag first, then replay these
+    patches and commit the result. Keeping customizations outside the git merge
+    path avoids recurring conflicts with upstream release history.
+    """
+    patches = _list_local_release_patches()
+    if not patches:
+        print("→ No local patches under $HERMES_HOME/local-patches; staying on clean release.")
+        return
+
+    for patch in patches:
+        print(f"→ Applying local patch {patch.name}...")
+        apply_result = subprocess.run(
+            git_cmd
+            + [
+                "apply",
+                "--3way",
+                "--whitespace=nowarn",
+                str(patch),
+            ],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if apply_result.returncode != 0:
+            # Fall back to a plain apply for patches that predate --3way bases.
+            apply_result = subprocess.run(
+                git_cmd + ["apply", "--whitespace=nowarn", str(patch)],
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+        if apply_result.returncode != 0:
+            err = (apply_result.stderr or apply_result.stdout or "").strip()
+            detail = err.splitlines()[0] if err else "git apply failed"
+            raise RuntimeError(
+                f"Could not apply local patch {patch.name}: {detail}. "
+                f"Update files under {_local_patches_dir()} against {release_tag}, "
+                "then re-run: hermes upgrade"
+            )
+
+    if not _git_working_tree_dirty(git_cmd, cwd):
+        print("→ Local patches applied with no tree changes.")
+        return
+
+    add_result = subprocess.run(
+        git_cmd + ["add", "-A"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if add_result.returncode != 0:
+        raise RuntimeError("Failed to stage reapplied local patches.")
+
+    commit_result = subprocess.run(
+        git_cmd
+        + [
+            "commit",
+            "--no-gpg-sign",
+            "-m",
+            f"local: reapply patches onto {release_tag}",
+        ],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if commit_result.returncode != 0:
+        err = (commit_result.stderr or commit_result.stdout or "").strip()
+        detail = err.splitlines()[0] if err else "git commit failed"
+        raise RuntimeError(f"Failed to commit reapplied local patches: {detail}")
+
+    # Refresh the primary patch so the next upgrade diffs against this release.
+    primary = _local_patches_dir() / "0001-local-maintenance.patch"
+    try:
+        _local_patches_dir().mkdir(parents=True, exist_ok=True)
+        diff_result = subprocess.run(
+            git_cmd + ["diff", f"{release_tag}..HEAD"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=True,
+        )
+        primary.write_text(diff_result.stdout, encoding="utf-8")
+        # Drop any older numbered patches so the next upgrade only replays one
+        # refreshed series (avoids double-applying after regeneration).
+        for stale in _list_local_release_patches():
+            if stale.resolve() != primary.resolve():
+                stale.unlink(missing_ok=True)
+        print(f"→ Refreshed local patch series against {release_tag}.")
+    except (OSError, subprocess.CalledProcessError) as exc:
+        print(f"⚠ Local patches applied, but failed to refresh patch file: {exc}")
+
+
+def _upgrade_release_with_local_patches(git_cmd, cwd, release_tag: str) -> subprocess.CompletedProcess:
+    """Reset hermes-release to ``release_tag``, then reapply local patches."""
+    reset_result = subprocess.run(
+        git_cmd
+        + [
+            "-c",
+            "gpg.ssh.allowedSignersFile=/dev/null",
+            "reset",
+            "--hard",
+            release_tag,
+        ],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if reset_result.returncode != 0:
+        return reset_result
+
+    try:
+        _apply_local_release_patches(git_cmd, cwd, release_tag)
+    except RuntimeError as exc:
+        return subprocess.CompletedProcess(
+            reset_result.args,
+            returncode=1,
+            stdout=reset_result.stdout,
+            stderr=str(exc),
+        )
+    return subprocess.CompletedProcess(
+        reset_result.args,
+        returncode=0,
+        stdout=reset_result.stdout,
+        stderr=reset_result.stderr,
+    )
+
+
 def _validate_critical_files_syntax(root) -> tuple[bool, str | None, str | None]:
     """Compile each file in ``_UPDATE_CRITICAL_FILES`` to catch SyntaxErrors.
 
@@ -3727,16 +3899,22 @@ def _cmd_update_impl(args, gateway_mode: bool):
     # Fetch and pull
     try:
 
-        # Resolve the target branch up front so the fetch can be scoped to it.
+        # Resolve the target ref up front so the fetch can be scoped to it.
         # A bare `git fetch origin` pulls every ref, and this repo carries
         # thousands of auto-generated branches — an unscoped fetch can stall for
         # minutes on a non-single-branch checkout. Fetch only what we update
         # against.
-        branch = _m()._resolve_update_branch(args)
+        release_tag = getattr(args, "release_tag", None)
+        branch = "hermes-release" if release_tag else _m()._resolve_update_branch(args)
 
         print("→ Fetching updates...")
+        fetch_args = (
+            ["fetch", "origin", "--tags"]
+            if release_tag
+            else ["fetch", "origin", branch]
+        )
         fetch_result = subprocess.run(
-            git_cmd + ["fetch", "origin", branch],
+            git_cmd + fetch_args,
             cwd=_m().PROJECT_ROOT,
             capture_output=True,
             text=True, encoding="utf-8", errors="replace",
@@ -3768,12 +3946,62 @@ def _cmd_update_impl(args, gateway_mode: bool):
         )
         current_branch = result.stdout.strip()
 
+        if release_tag:
+            print(f"→ Target Release: {release_tag}")
+            tag_result = subprocess.run(
+                git_cmd + ["rev-parse", "--verify", f"{release_tag}^{{commit}}"],
+                cwd=_m().PROJECT_ROOT,
+                capture_output=True,
+                text=True, encoding="utf-8", errors="replace",
+            )
+            if tag_result.returncode != 0:
+                print(f"✗ Release tag '{release_tag}' was not found after fetching tags.")
+                sys.exit(1)
+
+            auto_stash_ref = _m()._stash_local_changes_if_needed(git_cmd, _m().PROJECT_ROOT)
+            if current_branch != branch:
+                label = (
+                    "detached HEAD"
+                    if current_branch == "HEAD"
+                    else f"branch '{current_branch}'"
+                )
+                print(f"  ⚠ Currently on {label} — switching to {branch} for upgrade...")
+                local_branch = subprocess.run(
+                    git_cmd + ["rev-parse", "--verify", branch],
+                    cwd=_m().PROJECT_ROOT,
+                    capture_output=True,
+                    text=True, encoding="utf-8", errors="replace",
+                )
+                checkout_args = (
+                    ["checkout", branch]
+                    if local_branch.returncode == 0
+                    else ["checkout", "-B", branch]
+                )
+                checkout_result = subprocess.run(
+                    git_cmd + checkout_args,
+                    cwd=_m().PROJECT_ROOT,
+                    capture_output=True,
+                    text=True, encoding="utf-8", errors="replace",
+                )
+                if checkout_result.returncode != 0:
+                    if auto_stash_ref is not None:
+                        _m()._restore_stashed_changes(
+                            git_cmd,
+                            _m().PROJECT_ROOT,
+                            auto_stash_ref,
+                            prompt_user=False,
+                            input_fn=gw_input_fn,
+                        )
+                    print(f"✗ Could not switch to local maintenance branch '{branch}'.")
+                    if checkout_result.stderr.strip():
+                        print(f"  {checkout_result.stderr.strip().splitlines()[0]}")
+                    sys.exit(1)
         # If user is on a different branch than the update target, switch
         # to the target. When the target is "main" this is the historical
         # "always update against main" behavior; for any other target it's
         # the same thing — get HEAD onto the requested branch first, then
         # fast-forward.
-        if current_branch != branch:
+        elif current_branch != branch:
             label = (
                 "detached HEAD"
                 if current_branch == "HEAD"
@@ -3823,15 +4051,32 @@ def _cmd_update_impl(args, gateway_mode: bool):
             and (gateway_mode or (sys.stdin.isatty() and sys.stdout.isatty()))
         )
 
-        # Check if there are updates
-        result = subprocess.run(
-            git_cmd + ["rev-list", f"HEAD..origin/{branch}", "--count"],
-            cwd=_m().PROJECT_ROOT,
-            capture_output=True,
-            text=True, encoding="utf-8", errors="replace",
-            check=True,
-        )
-        commit_count = int(result.stdout.strip())
+        # Check if there are updates.
+        if release_tag:
+            release_merged = subprocess.run(
+                git_cmd + ["merge-base", "--is-ancestor", release_tag, "HEAD"],
+                cwd=_m().PROJECT_ROOT,
+                capture_output=True,
+                text=True, encoding="utf-8", errors="replace",
+            )
+            if release_merged.returncode == 0:
+                commit_count = 0
+            elif release_merged.returncode == 1:
+                commit_count = 1
+            else:
+                print(f"✗ Failed to compare local branch with Release {release_tag}.")
+                if release_merged.stderr.strip():
+                    print(f"  {release_merged.stderr.strip().splitlines()[0]}")
+                sys.exit(1)
+        else:
+            result = subprocess.run(
+                git_cmd + ["rev-list", f"HEAD..origin/{branch}", "--count"],
+                cwd=_m().PROJECT_ROOT,
+                capture_output=True,
+                text=True, encoding="utf-8", errors="replace",
+                check=True,
+            )
+            commit_count = int(result.stdout.strip())
 
         if commit_count == 0:
             _invalidate_update_cache()
@@ -3934,9 +4179,16 @@ def _cmd_update_impl(args, gateway_mode: bool):
             _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
             return
 
-        print(f"→ Found {commit_count} new commit(s)")
+        if release_tag:
+            print(f"→ Release upgrade available: {release_tag}")
+        else:
+            print(f"→ Found {commit_count} new commit(s)")
 
-        print("→ Pulling updates...")
+        print(
+            "→ Resetting maintenance branch to release, then reapplying local patches..."
+            if release_tag
+            else "→ Pulling updates..."
+        )
         update_succeeded = False
         # Capture the pre-pull SHA so we can auto-roll-back if the new code
         # has a syntax error in a critical-path file (PR #28452 incident:
@@ -3945,19 +4197,47 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # the bad commit and the fix landing).
         pre_pull_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
         try:
-            # Merge the ref we already fetched above (→ Fetching updates...)
-            # instead of `git pull`, which performs a SECOND network fetch of
-            # the same branch (~0.5-1.5 s of redundant round-trip per update).
-            # `merge --ff-only origin/<branch>` is byte-identical in effect to
-            # `pull --ff-only origin <branch>` given the fresh tracking ref;
-            # the divergence fallback below is unchanged.
-            pull_result = subprocess.run(
-                git_cmd + ["merge", "--ff-only", f"origin/{branch}"],
-                cwd=_m().PROJECT_ROOT,
-                capture_output=True,
-                text=True, encoding="utf-8", errors="replace",
-            )
-            if pull_result.returncode != 0:
+            if release_tag:
+                # Avoid merging the whole release into a diverged maintenance
+                # branch (that repeatedly conflicts with local patches). Reset
+                # to the tag, then replay $HERMES_HOME/local-patches instead.
+                pull_result = _upgrade_release_with_local_patches(
+                    git_cmd, _m().PROJECT_ROOT, release_tag
+                )
+                if pull_result.returncode != 0:
+                    print(f"✗ Could not upgrade to Release {release_tag}.")
+                    err = (pull_result.stderr or pull_result.stdout or "").strip()
+                    if err:
+                        print(f"  {err.splitlines()[0]}")
+                    if pre_pull_sha:
+                        print(f"→ Restoring previous HEAD {pre_pull_sha[:10]}...")
+                        subprocess.run(
+                            git_cmd + ["reset", "--hard", pre_pull_sha],
+                            cwd=_m().PROJECT_ROOT,
+                            capture_output=True,
+                            text=True,
+                            encoding="utf-8",
+                            errors="replace",
+                        )
+                    print(
+                        "  Update or regenerate patches under "
+                        f"{_local_patches_dir()}, then re-run: hermes upgrade"
+                    )
+                    sys.exit(1)
+            else:
+                # Merge the ref we already fetched above (→ Fetching updates...)
+                # instead of `git pull`, which performs a SECOND network fetch of
+                # the same branch (~0.5-1.5 s of redundant round-trip per update).
+                # `merge --ff-only origin/<branch>` is byte-identical in effect to
+                # `pull --ff-only origin <branch>` given the fresh tracking ref;
+                # the divergence fallback below is unchanged.
+                pull_result = subprocess.run(
+                    git_cmd + ["merge", "--ff-only", f"origin/{branch}"],
+                    cwd=_m().PROJECT_ROOT,
+                    capture_output=True,
+                    text=True, encoding="utf-8", errors="replace",
+                )
+            if pull_result.returncode != 0 and not release_tag:
                 # ff-only failed — local and remote have diverged (e.g. upstream
                 # force-pushed or rebase).  Since local changes are already
                 # stashed, reset to match the remote exactly.

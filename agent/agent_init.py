@@ -1829,6 +1829,33 @@ def init_agent(
         _api_retries = 3
     agent._api_max_retries = _api_retries
 
+    # Optional active-turn outage parking. Keep the waiter on the agent so its
+    # per-endpoint probe throttle survives false-positive probe/API cycles.
+    from agent.api_outage_recovery import (
+        ApiOutageRecoveryConfig,
+        ApiOutageRecoveryWaiter,
+    )
+    agent._api_outage_recovery_config = ApiOutageRecoveryConfig.from_mapping(
+        _agent_section.get("api_outage_recovery", {})
+    )
+    agent._api_outage_recovery_waiter = ApiOutageRecoveryWaiter(
+        agent._api_outage_recovery_config
+    )
+    # Delegation timeout accounting reads this explicit marker.  The waiter
+    # owns all transitions and refreshes activity while it is true.
+    agent._api_outage_waiting = False
+
+    # Retry/fallback status is buffered by default to avoid noisy transient
+    # failure chatter. Opt in to live status when operators need immediate
+    # visibility into each API retry attempt.
+    _raw_show_retry_status = _agent_section.get("show_retry_status", False)
+    agent._show_retry_status = str(_raw_show_retry_status).strip().lower() in {
+        "true",
+        "1",
+        "yes",
+        "on",
+    }
+
     # Initialize context compressor for automatic context management
     # Compresses conversation when approaching model's context limit
     # Configuration via config.yaml (compression section)
