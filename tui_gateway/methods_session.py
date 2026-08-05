@@ -13,6 +13,12 @@ _profile_scoped = _registry.profile_scoped
 
 @method("session.create")
 def _(rid, params: dict) -> dict:
+    profile = _requested_profile(params)
+    try:
+        profile_home = _profile_home(profile)
+    except TUIProfileSelectionError:
+        return _profile_selection_rpc_error(rid)
+
     sid = uuid.uuid4().hex[:8]
     key = _new_session_key()
     cols = int(params.get("cols", 80))
@@ -34,13 +40,6 @@ def _(rid, params: dict) -> dict:
     resolved_cwd = _completion_cwd(params)
     source = _resolve_session_source(str(params.get("source") or "").strip() or None)
     _enable_gateway_prompts()
-
-    # ``profile`` (app-global remote mode): a new chat started under a non-launch
-    # profile must build its agent + persist against THAT profile's home/state.db,
-    # not the dashboard's launch profile. Stored on the session so _start_agent_build
-    # and each turn re-bind HERMES_HOME. None/own profile → launch (unchanged).
-    profile = (params.get("profile") or "").strip() or None
-    profile_home = _profile_home(profile)
 
     # The desktop composer owns its model/effort/fast as plain UI state and ships
     # it on every session.create. Honor each as a PER-SESSION override (built into
@@ -162,6 +161,11 @@ def _(rid, params: dict) -> dict:
 
 @method("session.list")
 def _(rid, params: dict) -> dict:
+    try:
+        _profile_home(_requested_profile(params))
+    except TUIProfileSelectionError:
+        return _profile_selection_rpc_error(rid)
+
     with _profile_db(params) as db:
         if db is None:
             return _db_unavailable_error(rid, code=5006)
@@ -230,6 +234,11 @@ def _(rid, params: dict) -> dict:
     Honors ``params.profile`` so app-global remote mode lists from the
     focused profile's ``state.db`` (mirrors ``session.resume``).
     """
+    try:
+        _profile_home(_requested_profile(params))
+    except TUIProfileSelectionError:
+        return _profile_selection_rpc_error(rid)
+
     with _profile_db(params) as db:
         if db is None:
             return _ok(rid, {"session_id": None})
@@ -306,6 +315,12 @@ def _(rid, params: dict) -> dict:
 
 @method("session.resume")
 def _(rid, params: dict) -> dict:
+    profile = _requested_profile(params)
+    try:
+        profile_home = _profile_home(profile)
+    except TUIProfileSelectionError:
+        return _profile_selection_rpc_error(rid)
+
     target = params.get("session_id", "")
     if not target:
         return _err(rid, 4006, "session_id required")
@@ -313,10 +328,6 @@ def _(rid, params: dict) -> dict:
         cols = int(params.get("cols", 80))
     except (TypeError, ValueError):
         cols = 80
-    # ``profile`` (app-global remote mode): resume a session that lives in another
-    # local profile's state.db. None/own profile → the launch profile (unchanged).
-    profile = (params.get("profile") or "").strip() or None
-    profile_home = _profile_home(profile)
     # Desktop hydrates persisted transcripts through the authenticated REST
     # route in parallel. Suppress the duplicate WebSocket transcript only when
     # the caller explicitly requests it; other clients keep upstream behavior.
@@ -854,6 +865,12 @@ def _(rid, params: dict) -> dict:
     Honors ``params.profile`` so app-global remote mode deletes from the
     focused profile's ``state.db`` + sessions dir (mirrors ``session.resume``).
     """
+    profile = _requested_profile(params)
+    try:
+        profile_home = _profile_home(profile)
+    except TUIProfileSelectionError:
+        return _profile_selection_rpc_error(rid)
+
     target = params.get("session_id", "")
     if not target:
         return _err(rid, 4006, "session_id required")
@@ -872,8 +889,6 @@ def _(rid, params: dict) -> dict:
     active = {s.get("session_key") for s in snapshot if s.get("session_key")}
     if target in active:
         return _err(rid, 4023, "cannot delete an active session")
-    profile = (params.get("profile") or "").strip() or None
-    profile_home = _profile_home(profile)
     with _profile_db(params) as db:
         if db is None:
             return _db_unavailable_error(rid, code=5036)

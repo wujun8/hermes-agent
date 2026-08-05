@@ -1353,7 +1353,7 @@ def _get_db():
     return _db
 
 
-def _db_for_profile(profile: str | None = None):
+def _db_for_profile(profile: object | None = None):
     """Return SessionDB for ``params.profile`` when it differs from launch.
 
     App-global remote mode passes ``profile`` on session.* RPCs so history/list/
@@ -1386,9 +1386,7 @@ def _profile_db(params: dict | None = None):
     Closes dedicated profile handles; leaves the launch-profile shared handle open.
     Yields None when the db is unavailable.
     """
-    profile = None
-    if isinstance(params, dict):
-        profile = (params.get("profile") or "").strip() or None
+    profile = _requested_profile(params)
     db, owns = _db_for_profile(profile)
     try:
         yield db
@@ -1398,15 +1396,23 @@ def _profile_db(params: dict | None = None):
                 db.close()
 
 
-def _response_profile_name(profile: str | None = None) -> str:
+def _response_profile_name(profile: object | None = None) -> str:
     """Profile name to report on session.* payloads.
 
     Prefer the RPC's requested profile when it is a real non-launch profile;
     otherwise the process launch profile.
     """
-    name = (profile or "").strip()
-    if name and _profile_home(name) is not None:
-        return name
+    if isinstance(profile, str) and profile.strip():
+        try:
+            from hermes_cli import profiles as profiles_mod
+
+            name = profiles_mod.normalize_profile_name(profile.strip())
+            if _profile_home(name) is not None:
+                return name
+        except TUIProfileSelectionError:
+            pass
+        except Exception:
+            pass
     return _current_profile_name()
 
 
@@ -1423,27 +1429,71 @@ def _db_unavailable_error(rid, *, code: int):
 # (a ContextVar override) for the duration of the call so config/skills/model and
 # message persistence all resolve to the right profile. Omitted/own profile → the
 # launch profile (unchanged for single-profile and per-profile-remote setups).
-def _profile_home(profile: str | None) -> Path | None:
-    """Resolve a named profile's safe existing home, or None for launch home."""
-    if not isinstance(profile, str):
+_TUI_PROFILE_SELECTION_MESSAGE = "invalid or unavailable profile"
+_TUI_PROFILE_SELECTION_RPC_CODE = 4026
+
+
+class TUIProfileSelectionError(ValueError):
+    """Private fail-closed error for an explicit unavailable TUI profile."""
+
+    def __init__(self):
+        super().__init__(_TUI_PROFILE_SELECTION_MESSAGE)
+
+    def __str__(self) -> str:
+        return _TUI_PROFILE_SELECTION_MESSAGE
+
+
+def _requested_profile(params: dict | None = None) -> object | None:
+    """Return the raw requested profile without coercing explicit bad values."""
+    if not isinstance(params, dict):
         return None
+    return params.get("profile")
+
+
+def _profile_selection(profile: object | None) -> tuple[str | None, Path | None]:
+    """Return ``(canonical_name, home)`` for a safe explicit profile.
+
+    ``(None, None)`` is the launch scope for an omitted or blank value, and for
+    an explicit profile resolving to the launch home. Every other explicit
+    selection must be a canonical, existing profile that the multiplex TUI is
+    authoritative to serve.
+    """
+    if profile is None:
+        return None, None
+    if not isinstance(profile, str):
+        raise TUIProfileSelectionError
     name = profile.strip()
     if not name:
-        return None
+        return None, None
+
     try:
         from hermes_cli import profiles as profiles_mod
 
-        # The central resolver validates the canonical id, requires an existing
-        # directory, and rejects symlink targets outside the profiles root
-        # before this function performs any launch-home comparison.
-        home = Path(profiles_mod.resolve_profile_home(name, require_exists=True))
+        canonical = profiles_mod.normalize_profile_name(name)
+        home = Path(
+            profiles_mod.resolve_profile_home(canonical, require_exists=True)
+        ).resolve()
+        launch_name = profiles_mod.normalize_profile_name(_current_profile_name())
+        if canonical == launch_name or home == Path(_hermes_home).resolve():
+            return canonical, None
+
+        served = {}
+        for served_name, served_home in profiles_mod.profiles_to_serve(multiplex=True):
+            served[profiles_mod.normalize_profile_name(served_name)] = Path(
+                served_home
+            ).resolve()
+        if served.get(canonical) != home:
+            raise ValueError
+    except TUIProfileSelectionError:
+        raise
     except Exception:
-        return None
-    # Already the launch profile? No override needed.  This comparison is safe
-    # only after resolve_profile_home has completed its containment checks.
-    if home.resolve() == Path(_hermes_home).resolve():
-        return None
-    return home
+        raise TUIProfileSelectionError from None
+    return canonical, home
+
+
+def _profile_home(profile: object | None) -> Path | None:
+    """Resolve a named profile's safe existing home, or None for launch home."""
+    return _profile_selection(profile)[1]
 
 
 def _profile_scoped(handler):
@@ -1457,7 +1507,10 @@ def _profile_scoped(handler):
     """
 
     def wrapper(rid, params):
-        home = _profile_home(params.get("profile") if isinstance(params, dict) else None)
+        try:
+            home = _profile_home(_requested_profile(params))
+        except TUIProfileSelectionError:
+            return _profile_selection_rpc_error(rid)
         if home is None:
             return handler(rid, params)
         token = set_hermes_home_override(home)
@@ -1902,6 +1955,10 @@ def _ok(rid, result: dict) -> dict:
 
 def _err(rid, code: int, msg: str) -> dict:
     return {"jsonrpc": "2.0", "id": rid, "error": {"code": code, "message": msg}}
+
+
+def _profile_selection_rpc_error(rid) -> dict:
+    return _err(rid, _TUI_PROFILE_SELECTION_RPC_CODE, _TUI_PROFILE_SELECTION_MESSAGE)
 
 
 def method(name: str):
