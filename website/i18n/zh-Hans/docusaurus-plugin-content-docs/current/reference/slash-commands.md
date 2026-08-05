@@ -65,6 +65,7 @@ Hermes 有两个斜杠命令入口，均由 `hermes_cli/commands.py` 中的中�
 | 命令 | 描述 |
 |---------|-------------|
 | `/config` | 显示当前配置 |
+| `/micro [on\|off\|inherit\|status]` | 设置或查看当前会话的 micro-compaction 策略。`on` 和 `off` 持久化会话级覆盖，`inherit` 删除覆盖并跟随全局 `compression.micro_compact`，`status` 只读。 |
 | `/model [model-name]` | 显示或更改当前模型。支持：`/model claude-sonnet-4`、`/model provider:model`（切换提供商）、`/model custom:model`（自定义端点）、`/model custom:name:model`（命名自定义提供商）、`/model custom`（从端点自动检测），以及用户自定义别名（`/model fav`、`/model grok`——见[自定义模型别名](#custom-model-aliases)）。使用 `--global` 将更改持久化到 config.yaml。**注意：** `/model` 只能在已配置的提供商之间切换。如需添加新提供商，请退出会话后在终端运行 `hermes model`。 |
 | `/codex-runtime [auto\|codex_app_server\|on\|off]` | 切换 OpenAI/Codex 模型的可选 [Codex app-server runtime](../user-guide/features/codex-app-server-runtime)。`auto`（默认）使用 Hermes 标准 chat completions；`codex_app_server` 将轮次交给 `codex app-server` 子进程，支持原生 shell、apply_patch、ChatGPT 订阅认证和迁移的 Codex 插件。下次会话生效。 |
 | `/personality` | 设置预定义的 personality（人格） |
@@ -194,6 +195,8 @@ hermes config set model.aliases.grok x-ai/grok-4
 
 ## 消息平台斜杠命令
 
+> **Slack 线程命令（`!` 前缀）：** Slack 不会把原生斜杠命令投递到消息线程。在 Slack 线程中使用 `!` 前缀，例如 `!stop`、`!new`、`!status` 或 `!micro on`；gateway 会像斜杠形式一样分发。因为原生 Slack 斜杠命令无法到达线程，`/micro ...` 在 Slack 线程中应写作 `!micro ...`。详见[在 Slack 线程中使用命令](/user-guide/messaging/slack#using-commands-inside-threads-the-cmd-prefix)。
+
 消息 gateway 在 Telegram、Discord、Slack、WhatsApp、Signal、Email、Home Assistant 和 Teams 聊天中支持以下内置命令：
 
 | 命令 | 描述 |
@@ -202,6 +205,7 @@ hermes config set model.aliases.grok x-ai/grok-4
 | `/new` | 开始新对话。 |
 | `/reset` | 重置对话历史。 |
 | `/status` | 显示会话信息，随后显示本地**会话摘要**块（近期轮次数、最常用工具、访问的文件、最新 prompt + 回复）。 |
+| `/micro [on\|off\|inherit\|status]` | 设置或查看当前会话的 micro-compaction 策略。`on` 和 `off` 持久化会话级覆盖，`inherit` 跟随当前全局 `compression.micro_compact`，`status` 只读。已有缓存 agent 会立即应用；冷 gateway 会话会在 agent 启动或恢复时加载已保存的策略。 |
 | `/stop` | 终止所有正在运行的后台进程并中断运行中的 agent。 |
 | `/model [provider:model]` | 显示或更改模型。支持提供商切换（`/model zai:glm-5`）、自定义端点（`/model custom:model`）、命名自定义提供商（`/model custom:local:qwen`）、自动检测（`/model custom`），以及用户自定义别名（`/model fav`、`/model grok`——见[自定义模型别名](#custom-model-aliases)）。使用 `--global` 将更改持久化到 config.yaml。**注意：** `/model` 只能在已配置的提供商之间切换。如需添加新提供商或设置 API 密钥，请在终端（聊天会话外）运行 `hermes model`。 |
 | `/codex-runtime [auto\|codex_app_server\|on\|off]` | 切换可选的 [Codex app-server runtime](../user-guide/features/codex-app-server-runtime)。持久化到 config.yaml 中的 `model.openai_runtime` 并驱逐缓存的 agent，使下一条消息使用新 runtime。下次会话生效。 |
@@ -249,7 +253,8 @@ hermes config set model.aliases.grok x-ai/grok-4
 - `/skills` **仅在搜索/浏览/安装时属于 CLI-only**；其写入审批子命令（`pending`、`approve`、`reject`、`diff`、`approval`）在 `skills.write_approval` 开启时也可在消息平台使用。`/memory` 可在**两个表面**使用。
 - `/verbose` **默认仅限 CLI**，但可通过在 `config.yaml` 中设置 `display.tool_progress_command: true` 为消息平台启用。启用后，它会循环切换 `display.tool_progress` 模式并保存到配置。
 - `/sethome`、`/update`、`/restart`、`/approve`、`/deny`、`/topic`、`/platform` 和 `/commands` 是**仅限消息平台**的命令。
-- `/status`、`/version`、`/background`、`/queue`、`/steer`、`/voice`、`/reload-mcp`、`/reload-skills`、`/rollback`、`/debug`、`/fast`、`/footer`、`/curator`、`/kanban`、`/credits`、`/suggestions`、`/blueprint`、`/sessions` 和 `/yolo` 在 **CLI 和消息 gateway 中均可使用**。
+- `/micro`、`/status`、`/version`、`/background`、`/queue`、`/steer`、`/voice`、`/reload-mcp`、`/reload-skills`、`/rollback`、`/debug`、`/fast`、`/footer`、`/curator`、`/kanban`、`/credits`、`/suggestions`、`/blueprint`、`/sessions` 和 `/yolo` 在 **CLI 和消息 gateway 中均可使用**。
+- `/micro` 在 gateway 的可输入命令入口中可执行且会出现在帮助中，但为保留平台命令菜单的槽位上限（例如 Slack 的 `/platform` 菜单）而有意不加入已注册的平台菜单。可直接输入 `/micro ...`；在 Slack 线程中使用 `!micro ...`，因为原生 Slack 斜杠命令不会到达线程。
 - `/voice join`、`/voice channel` 和 `/voice leave` 仅在 Discord 上有意义。
 
 ## 破坏性命令的确认提示

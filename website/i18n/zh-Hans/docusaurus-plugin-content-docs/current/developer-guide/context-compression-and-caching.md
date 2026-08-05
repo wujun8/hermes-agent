@@ -90,6 +90,15 @@ auxiliary:
     base_url: null           # Custom OpenAI-compatible endpoint
 ```
 
+### 会话级策略覆盖
+
+全局 `compression.micro_compact` 值仍然是默认策略，而
+`/micro on|off|inherit|status` 只控制当前这一会话。`on` 和 `off` 会持久化到 `state.db`
+中该会话行的 `model_config`；没有覆盖值就表示 `inherit`，有效值会跟随当前 profile 配置。
+显式选择会跨进程重启和恢复保留；新会话不会复制上一个会话的选择，恢复时则只加载目标
+会话对应的行。继承策略的会话会在运行时刷新时获取之后的全局配置变化。切换该策略不会
+重置 micro 游标、滚动摘要、计数器或批量压缩状态。命令生命周期和权衡请参阅[微压缩设计说明](https://github.com/NousResearch/hermes-agent/blob/main/docs/micro-compaction.md)。
+
 ### 参数详情
 
 | 参数 | 默认值 | 范围 | 描述 |
