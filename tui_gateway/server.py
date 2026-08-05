@@ -3,6 +3,7 @@ import concurrent.futures
 import contextlib
 import contextvars
 import copy
+from dataclasses import dataclass
 import hashlib
 import inspect
 import json
@@ -171,12 +172,35 @@ class _MicroControlTarget(NamedTuple):
     token: object
 
 
+@dataclass(frozen=True)
+class _MicroControlReleaseResult:
+    """Structured result for releasing one live ``/micro`` control lease."""
+
+    success: bool
+    warning: str = ""
+    reanchored: bool = False
+
+    def __bool__(self) -> bool:
+        return self.success
+
+
 _SESSION_CONTROL_BUSY = object()
 _MICRO_TURN_BUSY = object()
 _MICRO_TURN_BUSY_MESSAGE = (
     "session busy — /micro can't run mid-turn; interrupt the current turn first"
 )
 _MICRO_CONTROL_BUSY_MESSAGE = "session busy — /micro control command already in progress"
+_MANUAL_COMPRESSION_TURN_BUSY_MESSAGE = (
+    "session busy — /interrupt the current turn before /compress"
+)
+_DEFERRED_COMPRESSION_ROTATION_KEY = "_deferred_compression_rotation"
+_MANUAL_COMPRESSION_CONTROL_KEY = "_manual_compression_control"
+_MICRO_CONTROL_STATE_KEY = "_micro_control_state"
+_COMPRESSION_SYNC_UNCHANGED = "unchanged"
+_COMPRESSION_SYNC_APPLIED = "applied"
+_COMPRESSION_SYNC_DEFERRED = "deferred"
+_COMPRESSION_SYNC_FAILED = "failed"
+_MICRO_OVERRIDE_UNKNOWN = object()
 try:
     _slash_timeout = float(os.environ.get("HERMES_TUI_SLASH_TIMEOUT_S") or "45")
 except (ValueError, TypeError):
@@ -3002,41 +3026,229 @@ def _claim_live_micro_control(sid: str, session: dict | None):
             token=token,
         )
         session["_session_control_inflight"] = token
+        # This is one bounded mutable record for the command's C-path audit;
+        # it is overwritten by the next claim and never grows per turn.
+        session[_MICRO_CONTROL_STATE_KEY] = {}
         return target, None
 
 
-def _release_live_micro_control(target: _MicroControlTarget) -> bool:
-    """Clear a live micro claim and report whether its target stayed exact.
+def _claim_manual_compression_control(session: dict):
+    """Reserve the exact session before any direct manual compression work."""
+    history_lock = session.get("history_lock")
+    if history_lock is None:
+        return None, _SESSION_CONTROL_BUSY
+    with history_lock:
+        active = bool(session.get("running"))
+        session_key = str(session.get("session_key") or "")
+        if not active:
+            active = _child_run_active(session_key)
+        if active:
+            return None, _MICRO_TURN_BUSY
+        if session.get("_session_control_inflight") is not None:
+            return None, _SESSION_CONTROL_BUSY
+        token = object()
+        session["_session_control_inflight"] = token
+        # _sync_session_key_after_compress accepts the optional token for
+        # production callers, but this field keeps older TUI test seams and
+        # split handlers that call it positionally safe.
+        session[_MANUAL_COMPRESSION_CONTROL_KEY] = token
+        return token, None
 
-    This cleanup is deliberately defensive: it must not replace an exception
-    from config/DB/plugin/runtime work, including ``BaseException`` subclasses.
+
+def _manual_compression_busy_text(claim_error) -> str:
+    if claim_error is _MICRO_TURN_BUSY:
+        return _MANUAL_COMPRESSION_TURN_BUSY_MESSAGE
+    return _MICRO_CONTROL_BUSY_MESSAGE
+
+
+def _marker_matches_micro_target(marker: dict | None, target: _MicroControlTarget) -> bool:
+    if not isinstance(marker, dict) or marker.get("control_token") is not target.token:
+        return False
+    try:
+        return int(marker.get("generation", -1)) == target.generation
+    except (TypeError, ValueError):
+        return False
+
+
+def _micro_rotation_override_warning(
+    target: _MicroControlTarget,
+    marker: dict,
+    state: dict | None,
+) -> str | None:
+    """Fail closed if a forced rotation left /micro's exact override on old row."""
+    if not isinstance(state, dict) or not state.get("mutation_succeeded"):
+        return None
+    if "requested_override" not in state:
+        return None
+    requested = state["requested_override"]
+    new_session_id = str(marker.get("agent_session_id") or "")
+    if not new_session_id:
+        return (
+            "Micro-compaction warning: forced compression rotation produced no "
+            "current session id; retry /micro on the current session"
+        )
+    try:
+        with _session_db(target.session) as db:
+            row = db.get_session(new_session_id) if db is not None else None
+            if row is None:
+                return (
+                    "Micro-compaction warning: /micro changed only the old row "
+                    "because compression rotated the session; retry /micro on the current session"
+                )
+            getter = getattr(db, "session_micro_compact_override", None)
+            actual = getter(row) if callable(getter) else None
+    except Exception as exc:
+        return (
+            "Micro-compaction warning: could not verify the current continuation "
+            f"override after rotation ({exc}); retry /micro on the current session"
+        )
+    if actual is not requested:
+        return (
+            "Micro-compaction warning: /micro changed only the old row because "
+            "compression rotated the session; retry /micro on the current session"
+        )
+    live_override = getattr(
+        target.agent, "micro_compact_override", _MICRO_OVERRIDE_UNKNOWN
+    )
+    if live_override is not _MICRO_OVERRIDE_UNKNOWN and live_override is not requested:
+        return (
+            "Micro-compaction warning: the current Agent policy did not retain "
+            "the requested override after rotation; retry /micro on the current session"
+        )
+    return None
+
+
+def _release_live_micro_control(
+    target: _MicroControlTarget,
+) -> _MicroControlReleaseResult:
+    """Clear a live micro claim and automatically retry deferred re-anchoring.
+
+    The exact lease is validated and cleared under ``history_lock``.  Registry
+    identity is read only after that lock is released, and all DB/approval/
+    worker re-anchor work runs outside both locks.  The structured result keeps
+    compatibility with old boolean callers while exposing warnings to the
+    production ``slash.exec`` caller.
     """
     session = target.session
+    marker = None
+    state = None
     try:
         with session["history_lock"]:
-            current = _sessions.get(target.sid)
-            unchanged = (
-                current is session
-                and session.get("session_key") == target.session_key
+            lease_matches = (
+                session.get("_session_control_inflight") is target.token
                 and session.get("agent") is target.agent
-                and str(getattr(target.agent, "session_id", "") or "")
-                == target.agent_session_id
+                and int(session.get("session_generation", 0) or 0) == target.generation
                 and (
                     str(session.get("profile_home"))
                     if session.get("profile_home") is not None
                     else None
                 )
                 == target.profile_home
-                and int(session.get("session_generation", 0) or 0) == target.generation
             )
-            if session.get("_session_control_inflight") is target.token:
-                session.pop("_session_control_inflight", None)
-            return unchanged
-    except BaseException:
-        # There is no user/plugin code in this block.  A cleanup failure must
-        # never mask the command's original exception; the next caller will
-        # still see the conservative busy state if the field could not clear.
-        return False
+            if not lease_matches:
+                return _MicroControlReleaseResult(
+                    False,
+                    "Micro-compaction warning: live session changed before the "
+                    "completion could clear its control lease",
+                )
+            candidate = session.get(_DEFERRED_COMPRESSION_ROTATION_KEY)
+            if _marker_matches_micro_target(candidate, target):
+                marker = candidate
+            state = session.get(_MICRO_CONTROL_STATE_KEY)
+            # Only the exact token may be cleared.  A replacement/ABA token is
+            # never touched by this old finally path.
+            session.pop("_session_control_inflight", None)
+
+        # Registry identity is intentionally read only after history_lock is
+        # released.  Replacement/close mutates this map under the same lock.
+        with _sessions_lock:
+            registry_same = _sessions.get(target.sid) is session
+        if not registry_same:
+            return _MicroControlReleaseResult(
+                False,
+                "Micro-compaction warning: live session changed while /micro "
+                "was running; refusing to mutate the replacement",
+            )
+
+        if marker is None:
+            with session["history_lock"]:
+                unchanged = (
+                    session.get("session_key") == target.session_key
+                    and session.get("agent") is target.agent
+                    and str(getattr(target.agent, "session_id", "") or "")
+                    == target.agent_session_id
+                    and int(session.get("session_generation", 0) or 0)
+                    == target.generation
+                )
+                if session.get(_MICRO_CONTROL_STATE_KEY) is state:
+                    session.pop(_MICRO_CONTROL_STATE_KEY, None)
+            if unchanged:
+                return _MicroControlReleaseResult(True)
+            return _MicroControlReleaseResult(
+                False,
+                "Micro-compaction warning: live session changed while /micro "
+                "was running; refusing to report a new target mutation",
+            )
+
+        new_session_id = str(marker.get("agent_session_id") or "")
+        try:
+            sync_status = _sync_session_key_after_compress(target.sid, session)
+        except BaseException as exc:
+            return _MicroControlReleaseResult(
+                False,
+                "Micro-compaction warning: deferred compression rotation remains "
+                f"pending after release ({exc}); retry /micro on the current session",
+            )
+        if sync_status not in {_COMPRESSION_SYNC_APPLIED, _COMPRESSION_SYNC_UNCHANGED}:
+            return _MicroControlReleaseResult(
+                False,
+                "Micro-compaction warning: deferred compression rotation remains "
+                "pending after release; retry /micro on the current session",
+            )
+
+        # Do not inspect or verify a continuation if the exact target was
+        # replaced while re-anchoring.  The old object's frozen profile/agent is
+        # never applied to the replacement session.
+        with _sessions_lock:
+            registry_same = _sessions.get(target.sid) is session
+        with session["history_lock"]:
+            canonical = (
+                registry_same
+                and session.get(_DEFERRED_COMPRESSION_ROTATION_KEY) is None
+                and session.get("session_key") == new_session_id
+                and session.get("agent") is target.agent
+                and str(getattr(target.agent, "session_id", "") or "") == new_session_id
+                and int(session.get("session_generation", 0) or 0) >= target.generation + 1
+                and session.get("_session_control_inflight") is None
+            )
+            if not canonical:
+                return _MicroControlReleaseResult(
+                    False,
+                    "Micro-compaction warning: live session changed during deferred "
+                    "re-anchor; refusing to verify or mutate another session",
+                    reanchored=sync_status == _COMPRESSION_SYNC_APPLIED,
+                )
+        warning = _micro_rotation_override_warning(target, marker, state)
+        with session["history_lock"]:
+            if session.get(_MICRO_CONTROL_STATE_KEY) is state:
+                session.pop(_MICRO_CONTROL_STATE_KEY, None)
+        if warning:
+            return _MicroControlReleaseResult(
+                False,
+                warning,
+                reanchored=True,
+            )
+        return _MicroControlReleaseResult(
+            True,
+            reanchored=True,
+        )
+    except BaseException as exc:
+        # Cleanup must not mask a command's original Exception or BaseException.
+        return _MicroControlReleaseResult(
+            False,
+            "Micro-compaction warning: could not complete live-control release "
+            f"({exc}); retry /micro on the current session",
+        )
 
 
 def _try_claim_session_control(session: dict):
@@ -3055,6 +3267,8 @@ def _release_session_control(session: dict, token) -> None:
         with session["history_lock"]:
             if session.get("_session_control_inflight") is token:
                 session.pop("_session_control_inflight", None)
+            if session.get(_MANUAL_COMPRESSION_CONTROL_KEY) is token:
+                session.pop(_MANUAL_COMPRESSION_CONTROL_KEY, None)
     except BaseException:
         # Transition cleanup must not replace the operation's original failure.
         pass
@@ -4997,7 +5211,7 @@ def _compress_session_history(
     return len(history) - len(compressed), usage
 
 
-def _sync_session_key_after_compress(
+def _sync_session_key_after_compress_legacy(
     sid: str,
     session: dict,
     *,
@@ -5115,6 +5329,237 @@ def _sync_session_key_after_compress(
             _restart_slash_worker(sid, session)
         except Exception:
             pass
+
+
+def _sync_session_key_after_compress(
+    sid: str,
+    session: dict,
+    *,
+    clear_pending_title: bool = True,
+    restart_slash_worker: bool = True,
+    control_token=None,
+) -> str:
+    """Re-anchor ``session_key`` after a compression-driven session rotation.
+
+    A live ``/micro`` claim can overlap a defensive rotation that happened
+    inside a provider/compressor path.  In that case this function records one
+    bounded, coalescing marker and performs no canonical registry mutation.
+    The exact micro lease release retries this function after the registry
+    identity barrier.  A short internal control token serializes a normal
+    re-anchor with a newly arriving micro claim without holding locks across
+    DB, approval, or worker I/O.
+    """
+    agent = session.get("agent")
+    if agent is None:
+        return _COMPRESSION_SYNC_UNCHANGED
+
+    def record_marker(
+        *,
+        active_token,
+        new_session_id: str,
+        old_session_key: str,
+        generation: int,
+        clear_title: bool,
+        restart_worker: bool,
+    ) -> None:
+        existing = session.get(_DEFERRED_COMPRESSION_ROTATION_KEY)
+        existing_generation = (
+            int(existing.get("generation", -1))
+            if isinstance(existing, dict)
+            else -1
+        )
+        same_marker = bool(
+            isinstance(existing, dict)
+            and existing.get("control_token") is active_token
+            and existing_generation == generation
+        )
+        if not same_marker:
+            session[_DEFERRED_COMPRESSION_ROTATION_KEY] = {
+                "agent_session_id": str(new_session_id),
+                "old_session_key": str(old_session_key),
+                "generation": int(generation),
+                "control_token": active_token,
+                "clear_pending_title": bool(clear_title),
+                "restart_slash_worker": bool(restart_worker),
+            }
+            return
+        # One bounded record: repeated forced rotations replace the latest
+        # observed continuation rather than appending historical entries.
+        existing["agent_session_id"] = str(new_session_id)
+        existing["old_session_key"] = str(old_session_key)
+        existing["generation"] = int(generation)
+        existing["control_token"] = active_token
+        existing["clear_pending_title"] = bool(clear_title)
+        existing["restart_slash_worker"] = bool(restart_worker)
+
+    with session["history_lock"]:
+        # Manual compression claims are installed by the shared helper.  Read
+        # that token here so positional/test seams still execute canonical sync
+        # under their own control lease rather than self-deferring.
+        implicit_token = session.get(_MANUAL_COMPRESSION_CONTROL_KEY)
+        if control_token is None and implicit_token is not None:
+            control_token = implicit_token
+        active_control = session.get("_session_control_inflight")
+        new_session_id = str(getattr(agent, "session_id", "") or "")
+        old_key = str(session.get("session_key", "") or "")
+        generation = int(session.get("session_generation", 0) or 0)
+        pending = session.get(_DEFERRED_COMPRESSION_ROTATION_KEY)
+        pending_generation = (
+            int(pending.get("generation", -1))
+            if isinstance(pending, dict)
+            else -1
+        )
+        pending_matches = bool(
+            isinstance(pending, dict)
+            and pending.get("control_token") is not None
+            and pending_generation >= 0
+            and pending_generation <= generation
+            and str(pending.get("agent_session_id") or "") == new_session_id
+        )
+        rotation_needed = bool(new_session_id and new_session_id != old_key)
+        retry_pending = bool(pending_matches and new_session_id)
+
+        if active_control is not None and active_control is not control_token:
+            if rotation_needed:
+                record_marker(
+                    active_token=active_control,
+                    new_session_id=new_session_id,
+                    old_session_key=old_key,
+                    generation=generation,
+                    clear_title=clear_pending_title,
+                    restart_worker=restart_slash_worker,
+                )
+                logger.warning(
+                    "Compression rotation deferred while session control is active: sid=%s",
+                    sid,
+                )
+                return _COMPRESSION_SYNC_DEFERRED
+            if retry_pending:
+                logger.warning(
+                    "Deferred compression rotation still blocked by session control: sid=%s",
+                    sid,
+                )
+                return _COMPRESSION_SYNC_DEFERRED
+            return _COMPRESSION_SYNC_UNCHANGED
+
+        if not rotation_needed and not retry_pending:
+            return _COMPRESSION_SYNC_UNCHANGED
+
+        # A release-triggered retry has no caller token.  Reserve the session
+        # briefly so a new micro claim cannot interleave with canonical updates.
+        owns_internal_token = False
+        operation_token = control_token
+        if operation_token is None:
+            operation_token = object()
+            session["_session_control_inflight"] = operation_token
+            owns_internal_token = True
+        elif active_control is not operation_token:
+            return _COMPRESSION_SYNC_FAILED
+
+        old_key_for_updates = old_key
+        clear_title_for_updates = clear_pending_title
+        restart_worker_for_updates = restart_slash_worker
+        if retry_pending:
+            old_key_for_updates = str(pending.get("old_session_key") or old_key)
+            clear_title_for_updates = bool(
+                pending.get("clear_pending_title", clear_pending_title)
+            )
+            restart_worker_for_updates = bool(
+                pending.get("restart_slash_worker", restart_slash_worker)
+            )
+
+    try:
+        lease_reanchored = _transfer_active_session_slot(
+            sid,
+            session,
+            new_session_id=new_session_id,
+        )
+        if not lease_reanchored:
+            raise RuntimeError(
+                "active session lease could not be transferred to the continuation"
+            )
+
+        from tools.approval import (
+            disable_session_yolo,
+            enable_session_yolo,
+            is_session_yolo_enabled,
+            register_gateway_notify,
+            unregister_gateway_notify,
+        )
+
+        unregister_gateway_notify(old_key_for_updates)
+        yolo_was_on = is_session_yolo_enabled(old_key_for_updates)
+        if yolo_was_on:
+            enable_session_yolo(new_session_id)
+            disable_session_yolo(old_key_for_updates)
+        register_gateway_notify(
+            new_session_id,
+            lambda data: _emit_approval_request(sid, data),
+        )
+
+        with session["history_lock"]:
+            if session.get("_session_control_inflight") is not operation_token:
+                active_control = session.get("_session_control_inflight")
+                if active_control is not None:
+                    record_marker(
+                        active_token=active_control,
+                        new_session_id=new_session_id,
+                        old_session_key=str(session.get("session_key") or old_key),
+                        generation=int(session.get("session_generation", 0) or 0),
+                        clear_title=clear_title_for_updates,
+                        restart_worker=restart_worker_for_updates,
+                    )
+                    return _COMPRESSION_SYNC_DEFERRED
+                raise RuntimeError("compression re-anchor control lease was lost")
+            current_key = str(session.get("session_key") or "")
+            if current_key != new_session_id:
+                session["session_key"] = new_session_id
+                session["session_generation"] = int(
+                    session.get("session_generation", 0) or 0
+                ) + 1
+
+        if clear_title_for_updates:
+            session["pending_title"] = None
+        if restart_worker_for_updates:
+            _restart_slash_worker(sid, session)
+
+        with session["history_lock"]:
+            if session.get("_session_control_inflight") is not operation_token:
+                raise RuntimeError("compression re-anchor control lease changed")
+            marker = session.get(_DEFERRED_COMPRESSION_ROTATION_KEY)
+            if marker is not None:
+                marker_new_id = str(marker.get("agent_session_id") or "")
+                if marker_new_id == new_session_id:
+                    # Clear only after transfer, routing, key/generation, title,
+                    # and worker updates all completed successfully.
+                    session.pop(_DEFERRED_COMPRESSION_ROTATION_KEY, None)
+        return _COMPRESSION_SYNC_APPLIED
+    except BaseException as exc:
+        with session["history_lock"]:
+            marker = session.get(_DEFERRED_COMPRESSION_ROTATION_KEY)
+            if marker is None:
+                # Preserve a bounded retry record even when an unexpected
+                # failure happens after the initial no-lease path partially
+                # progressed the canonical updates.
+                record_marker(
+                    active_token=operation_token,
+                    new_session_id=new_session_id,
+                    old_session_key=old_key_for_updates,
+                    generation=int(session.get("session_generation", 0) or 0),
+                    clear_title=clear_title_for_updates,
+                    restart_worker=restart_worker_for_updates,
+                )
+        logger.warning(
+            "Compression rotation re-anchor failed; deferred marker retained: sid=%s error=%s",
+            sid,
+            exc,
+        )
+        return _COMPRESSION_SYNC_FAILED
+    finally:
+        if owns_internal_token:
+            with session["history_lock"]:
+                if session.get("_session_control_inflight") is operation_token:
+                    session.pop("_session_control_inflight", None)
 
 
 def _get_usage(agent, *, include_account: bool = False) -> dict:
@@ -12538,6 +12983,7 @@ _LIVE_SESSION_DIRECT_COMMANDS = frozenset(
     {
         "clear",
         "compress",
+        "compact",
         "effort",
         "history",
         "micro",
@@ -12734,6 +13180,7 @@ def _live_slash_command_output(
     arg: str,
     *,
     micro_target: _MicroControlTarget | None = None,
+    compression_control_token=None,
 ) -> Optional[str]:
     name = (name or "").lstrip("/").lower()
     arg = arg or ""
@@ -12773,9 +13220,26 @@ def _live_slash_command_output(
             if micro_target is not None
             else session
         )
+        micro_state = (
+            micro_target.session.get(_MICRO_CONTROL_STATE_KEY)
+            if micro_target is not None
+            else None
+        )
+        micro_subcommand = (arg or "").strip().lower().split(maxsplit=1)[0]
+        if isinstance(micro_state, dict) and micro_subcommand in {
+            "on",
+            "off",
+            "inherit",
+        }:
+            micro_state["requested_override"] = {
+                "on": True,
+                "off": False,
+                "inherit": None,
+            }[micro_subcommand]
+            micro_state["mutation_succeeded"] = False
         db_context = _session_db(target_session_view)
         with db_context as db:
-            return execute_micro_command(
+            result = execute_micro_command(
                 agent=agent,
                 session_db=db,
                 session_id=session_key,
@@ -12783,6 +13247,9 @@ def _live_slash_command_output(
                 ensure_session=getattr(agent, "_ensure_db_session", None),
                 config_loader=_session_micro_config_loader(target_session_view),
             )
+        if isinstance(micro_state, dict) and "requested_override" in micro_state:
+            micro_state["mutation_succeeded"] = "override saved:" in str(result).lower()
+        return result
     if name == "model" and not arg.strip():
         return _format_live_model_output(session or {})
     if name not in _LIVE_SESSION_DIRECT_COMMANDS:
@@ -12797,10 +13264,15 @@ def _live_slash_command_output(
         session is not None and _session_uses_compute_host(session)
     ):
         return None
-    if name == "compress":
+    if name in {"compress", "compact"}:
         if session is None:
             return "no active session for /compress"
-        return _mirror_slash_side_effects(sid, session, f"/compress {arg}".strip())
+        return _mirror_slash_side_effects(
+            sid,
+            session,
+            f"/{name} {arg}".strip(),
+            compression_control_token=compression_control_token,
+        )
     if name == "usage":
         if session is None:
             return "(._.) No active agent -- send a message first."
@@ -12840,7 +13312,13 @@ def _live_slash_command_output(
 
 
 
-def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
+def _mirror_slash_side_effects(
+    sid: str,
+    session: dict,
+    command: str,
+    *,
+    compression_control_token=None,
+) -> str:
     """Apply side effects that must also hit the gateway's live agent."""
     parts = command.lstrip("/").split(None, 1)
     if not parts:
@@ -12857,6 +13335,26 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
         # session never compresses and the deferred context-engine
         # notification wiring below is never exercised for that route.
         name = "compress"
+
+    # Reserve the exact session before compute-host forwarding, worker-side
+    # mirror effects, or any local compressor call.  The recursive second
+    # entry keeps the existing body flat while ensuring every slash alias uses
+    # the same ABA-safe release path.
+    if name == "compress" and compression_control_token is None:
+        compression_control_token, claim_error = _claim_manual_compression_control(
+            session
+        )
+        if claim_error is not None:
+            return _manual_compression_busy_text(claim_error)
+        try:
+            return _mirror_slash_side_effects(
+                sid,
+                session,
+                command,
+                compression_control_token=compression_control_token,
+            )
+        finally:
+            _release_session_control(session, compression_control_token)
 
     # Reject agent-mutating commands during an in-flight turn.  These
     # all do read-then-mutate on live agent/session state that the
@@ -12930,7 +13428,11 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
                     describe_compression_lock_skip,
                 )
                 return describe_compression_lock_skip(e.holder)
-            _sync_session_key_after_compress(sid, session)
+            _sync_session_key_after_compress(
+                sid,
+                session,
+                control_token=compression_control_token,
+            )
 
             with session["history_lock"]:
                 _after_messages = list(session.get("history", []))

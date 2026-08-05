@@ -4,6 +4,8 @@ Handler bodies are byte-identical to their pre-split server.py form; they
 are rebound onto server.py's globals at install time — see method_ctx.py.
 """
 
+import types
+
 from .method_ctx import HandlerRegistry
 
 _registry = HandlerRegistry()
@@ -2384,12 +2386,13 @@ def _(rid, params: dict) -> dict:
     return _ok(rid, {"removed": removed})
 
 
-@method("session.compress")
-def _(rid, params: dict) -> dict:
-    session, err = _sess_nowait(params, rid)
-    if err:
-        return err
-    assert session is not None
+def _run_session_compression(
+    rid,
+    params: dict,
+    session: dict,
+    control_token,
+) -> dict:
+    """Run session compression after its exact control lease is held."""
     if _session_uses_compute_host(session):
         sid = str(params.get("session_id") or "")
         focus_topic = str(params.get("focus_topic", "") or "").strip()
@@ -2410,16 +2413,10 @@ def _(rid, params: dict) -> dict:
         host_result = ack.get("result")
         if isinstance(host_result, dict):
             # The host owns the isolated session's agent/history, so preserve
-            # its structured compression result verbatim. In particular this
-            # carries `status: aborted` and `summary.aborted`; flattening the
-            # old text-only acknowledgement made Desktop show aborted work as a
-            # success toast.
+            # its structured compression result verbatim.
             return _ok(rid, {**host_result, "turn_isolation": True})
         host_info = ack.get("session_info") if isinstance(ack.get("session_info"), dict) else {}
         host_messages = _history_to_messages(ack.get("messages")) if isinstance(ack.get("messages"), list) else []
-        # `messages` is returned at top level for the desktop transcript
-        # replacement. Keep the host acknowledgement metadata, but do not send
-        # the same (potentially large) transcript a second time inside it.
         host_ack = {key: value for key, value in ack.items() if key != "messages"}
         return _ok(
             rid,
@@ -2432,13 +2429,7 @@ def _(rid, params: dict) -> dict:
                 "usage": host_info.get("usage") if isinstance(host_info.get("usage"), dict) else {},
             },
         )
-    session, err = _sess(params, rid)
-    if err:
-        return err
-    if session.get("running"):
-        return _err(
-            rid, 4009, "session busy — /interrupt the current turn before /compress"
-        )
+
     from agent.conversation_compression import (
         finalize_context_engine_compression_notification,
     )
@@ -2484,8 +2475,6 @@ def _(rid, params: dict) -> dict:
             with session["history_lock"]:
                 messages = list(session.get("history", []))
             after_count = len(messages)
-            # Re-read system prompt + tools after compression — _compress_context
-            # may have rebuilt the system prompt (_cached_system_prompt=None).
             _sys_prompt_after = (
                 getattr(_agent, "_cached_system_prompt", "") or _sys_prompt
             )
@@ -2500,7 +2489,11 @@ def _(rid, params: dict) -> dict:
                 else 0
             )
             agent = session["agent"]
-            _sync_session_key_after_compress(sid, session)
+            _sync_session_key_after_compress(
+                sid,
+                session,
+                control_token=control_token,
+            )
             summary = summarize_manual_compression(
                 before_messages,
                 messages,
@@ -2526,34 +2519,44 @@ def _(rid, params: dict) -> dict:
                     "summary": summary,
                     "usage": usage,
                     "info": info,
-                    # Keep this identical to session.resume / session.history:
-                    # raw tool results can contain large or sensitive payloads
-                    # that belong in persisted history, not the transcript
-                    # replacement response.
                     "messages": _history_to_messages(messages),
                 },
             )
         finally:
-            # Always clear the pinned compressing status so the bar
-            # reverts to neutral whether compaction succeeded, was a
-            # no-op, or raised.
             _status_update(sid, "ready")
     except CompressionLockHeld as e:
         _status_update(sid, "ready")
-        from agent.manual_compression_feedback import (
-            describe_compression_lock_skip,
+        from agent.manual_compression_feedback import describe_compression_lock_skip
+
+        return _ok(
+            rid,
+            {
+                "compressed": False,
+                "lock_held": True,
+                "message": describe_compression_lock_skip(e.holder),
+            },
         )
-        return _ok(rid, {
-            "compressed": False,
-            "lock_held": True,
-            "message": describe_compression_lock_skip(e.holder),
-        })
     except Exception as e:
         finalize_context_engine_compression_notification(
             session["agent"],
             committed=False,
         )
         return _err(rid, 5005, str(e))
+
+
+@method("session.compress")
+def _(rid, params: dict) -> dict:
+    session, err = _sess_nowait(params, rid)
+    if err:
+        return err
+    assert session is not None
+    control_token, claim_error = _claim_manual_compression_control(session)
+    if claim_error is not None:
+        return _err(rid, 4009, _manual_compression_busy_text(claim_error))
+    try:
+        return _run_session_compression(rid, params, session, control_token)
+    finally:
+        _release_session_control(session, control_token)
 
 
 @method("session.save")
@@ -3109,3 +3112,10 @@ def _(rid, params: dict) -> dict:
 def register(server) -> None:
     """Bind this module's handlers onto ``server``'s globals and registry."""
     _registry.install(server)
+    server._run_session_compression = types.FunctionType(
+        _run_session_compression.__code__,
+        vars(server),
+        _run_session_compression.__name__,
+        _run_session_compression.__defaults__,
+        _run_session_compression.__closure__,
+    )

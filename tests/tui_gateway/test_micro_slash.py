@@ -526,6 +526,67 @@ def test_live_micro_lease_blocks_prompt_and_second_micro_until_release(gateway, 
     assert agent.run_conversation_calls == 0
 
 
+def test_manual_compression_routes_reject_before_any_mutation_during_micro(
+    gateway, monkeypatch
+):
+    server, db, _home = gateway
+    key = "manual-compress-busy"
+    agent = LiveAgent(db, key)
+    session = _session(server, db, "sid-manual-compress-busy", key, agent)
+    session["history"] = [{"role": "user", "content": "before"}]
+    history_before = list(session["history"])
+    row_before = db.get_session(key)
+    key_before = session["session_key"]
+    generation_before = session.get("session_generation", 0)
+    compressor_calls: list[tuple] = []
+
+    def fail_compress(*args, **kwargs):
+        compressor_calls.append((args, kwargs))
+        pytest.fail("manual compression must reject before invoking the compressor")
+
+    monkeypatch.setattr(server, "_compress_session_history", fail_compress)
+    thread, release, first = _start_blocked_micro(
+        server, db, monkeypatch, sid="sid-manual-compress-busy"
+    )
+    try:
+        responses = [
+            _call(
+                server,
+                "slash.exec",
+                session_id="sid-manual-compress-busy",
+                command="/compress",
+            ),
+            _call(
+                server,
+                "slash.exec",
+                session_id="sid-manual-compress-busy",
+                command="/compact",
+            ),
+            _call(
+                server,
+                "command.dispatch",
+                session_id="sid-manual-compress-busy",
+                name="compress",
+                arg="",
+            ),
+            _call(
+                server,
+                "session.compress",
+                session_id="sid-manual-compress-busy",
+            ),
+        ]
+        assert all(response.get("error", {}).get("code") == 4009 for response in responses)
+        assert all("busy" in response["error"]["message"].lower() for response in responses)
+        assert compressor_calls == []
+        assert session["session_key"] == key_before
+        assert session.get("session_generation", 0) == generation_before
+        assert session["history"] == history_before
+        assert db.get_session(key) == row_before
+    finally:
+        _join_blocked_micro(thread, release)
+    assert "result" in first["response"]
+
+
 def _assert_micro_lease_cleared(
     session: dict, *, expected_running: bool = False
 ) -> None:
@@ -859,40 +920,214 @@ def test_compression_rotation_defers_during_micro_and_reanchors_after_release(ga
     session = _session(server, db, "sid-rotation", old_key, agent)
     db.create_session(new_key, source="tui", model="test-model")
     generation_before = session.get("session_generation", 0)
+    monkeypatch.setattr(server, "_transfer_active_session_slot", lambda *_a, **_k: True)
+    monkeypatch.setattr(server, "_restart_slash_worker", lambda *_a, **_k: None)
     thread, release, first = _start_blocked_micro(
         server, db, monkeypatch, sid="sid-rotation"
     )
     try:
         # Compression has already produced a continuation id, but the gateway
         # must defer the registry/session-key re-anchor while /micro owns the
-        # exact session object.
+        # exact session object.  The production lease release below performs
+        # the retry; this test deliberately never calls sync after release.
         agent.session_id = new_key
-        server._sync_session_key_after_compress("sid-rotation", session)
+        status = server._sync_session_key_after_compress("sid-rotation", session)
+        assert status == "deferred"
         assert session["session_key"] == old_key
         assert session.get("session_generation", 0) == generation_before
         assert db.session_micro_compact_override(db.get_session(old_key)) is None
         assert db.session_micro_compact_override(db.get_session(new_key)) is None
-        agent.session_id = old_key
     finally:
         _join_blocked_micro(thread, release)
 
     assert "result" in first["response"]
+    assert "warning" in first["response"]["result"]["output"].lower()
+    assert "old row" in first["response"]["result"]["output"].lower()
+    assert session["session_key"] == new_key
+    assert session["session_generation"] == generation_before + 1
+    assert session.get("_session_control_inflight") is None
+    assert session.get("_deferred_compression_rotation") is None
+    # The defensive fail-closed path is explicit: /micro changed only the old
+    # row and the user must retry on the canonical continuation.
     assert db.session_micro_compact_override(db.get_session(old_key)) is True
     assert db.session_micro_compact_override(db.get_session(new_key)) is None
 
+
+def test_deferred_rotations_coalesce_latest_target_and_canonical_fields(
+    gateway, monkeypatch
+):
+    server, db, _home = gateway
+    old_key = "coalesce-old"
+    first_key = "coalesce-first"
+    latest_key = "coalesce-latest"
+    agent = LiveAgent(db, old_key)
+    session = _session(server, db, "sid-coalesce", old_key, agent)
+    db.create_session(first_key, source="tui", model="test-model")
+    db.create_session(latest_key, source="tui", model="test-model")
     monkeypatch.setattr(server, "_transfer_active_session_slot", lambda *_a, **_k: True)
     monkeypatch.setattr(server, "_restart_slash_worker", lambda *_a, **_k: None)
+    generation_before = session.get("session_generation", 0)
+    target, claim_error = server._claim_live_micro_control("sid-coalesce", session)
+    assert claim_error is None
+    assert target is not None
+    try:
+        agent.session_id = first_key
+        assert server._sync_session_key_after_compress("sid-coalesce", session) == "deferred"
+        marker = session["_deferred_compression_rotation"]
+        assert marker["agent_session_id"] == first_key
+        agent.session_id = latest_key
+        assert server._sync_session_key_after_compress("sid-coalesce", session) == "deferred"
+        assert len(session["_deferred_compression_rotation"]) <= 7
+        assert session["_deferred_compression_rotation"]["agent_session_id"] == latest_key
+    finally:
+        with patch("tools.approval.unregister_gateway_notify"), patch(
+            "tools.approval.enable_session_yolo"
+        ), patch("tools.approval.disable_session_yolo"), patch(
+            "tools.approval.is_session_yolo_enabled", return_value=False
+        ), patch("tools.approval.register_gateway_notify"):
+            release_result = server._release_live_micro_control(target)
+    assert release_result
+    assert session["session_key"] == latest_key
+    assert session["session_generation"] == generation_before + 1
+    assert session.get("_session_control_inflight") is None
+    assert session.get("_deferred_compression_rotation") is None
+
+
+def test_deferred_reanchor_failure_retains_marker_for_next_safe_trigger(
+    gateway, monkeypatch
+):
+    server, db, _home = gateway
+    old_key = "retry-old"
+    new_key = "retry-new"
+    agent = LiveAgent(db, old_key)
+    session = _session(server, db, "sid-retry", old_key, agent)
+    db.create_session(new_key, source="tui", model="test-model")
+    monkeypatch.setattr(server, "_transfer_active_session_slot", lambda *_a, **_k: True)
+    monkeypatch.setattr(server, "_restart_slash_worker", lambda *_a, **_k: None)
+    target, claim_error = server._claim_live_micro_control("sid-retry", session)
+    assert claim_error is None
+    assert target is not None
     agent.session_id = new_key
+    assert server._sync_session_key_after_compress("sid-retry", session) == "deferred"
+    real_sync = server._sync_session_key_after_compress
+
+    def fail_sync(*_args, **_kwargs):
+        raise RuntimeError("injected re-anchor failure")
+
+    monkeypatch.setattr(server, "_sync_session_key_after_compress", fail_sync)
+    failed = server._release_live_micro_control(target)
+    assert not failed
+    assert "retry" in failed.warning.lower()
+    assert "injected re-anchor failure" in failed.warning
+    assert session.get("_session_control_inflight") is None
+    assert session.get("_deferred_compression_rotation") is not None
+    assert session["session_key"] == old_key
+
+    monkeypatch.setattr(server, "_sync_session_key_after_compress", real_sync)
     with patch("tools.approval.unregister_gateway_notify"), patch(
         "tools.approval.enable_session_yolo"
     ), patch("tools.approval.disable_session_yolo"), patch(
         "tools.approval.is_session_yolo_enabled", return_value=False
     ), patch("tools.approval.register_gateway_notify"):
-        server._sync_session_key_after_compress("sid-rotation", session)
+        assert real_sync("sid-retry", session) == "applied"
     assert session["session_key"] == new_key
-    assert session["session_generation"] == generation_before + 1
-    assert db.session_micro_compact_override(db.get_session(old_key)) is True
-    assert db.session_micro_compact_override(db.get_session(new_key)) is None
+    assert session.get("_deferred_compression_rotation") is None
+
+
+def test_release_close_barrier_does_not_touch_detached_target_or_new_lease(
+    gateway, monkeypatch
+):
+    server, db, _home = gateway
+    old_key = "close-barrier-old"
+    new_key = "close-barrier-new"
+    old_agent = LiveAgent(db, old_key)
+    old_session = _session(server, db, "sid-close-barrier", old_key, old_agent)
+    db.create_session(new_key, source="tui", model="test-model")
+    target, claim_error = server._claim_live_micro_control("sid-close-barrier", old_session)
+    assert claim_error is None
+    assert target is not None
+    new_agent = LiveAgent(db, new_key)
+    new_session = _session(server, db, "sid-close-barrier-new", new_key, new_agent)
+    try:
+        with server._sessions_lock:
+            server._sessions.pop("sid-close-barrier", None)
+            server._sessions["sid-close-barrier"] = new_session
+        result = server._release_live_micro_control(target)
+        assert not result
+        assert "changed" in result.warning.lower()
+        assert old_session.get("_session_control_inflight") is None
+        assert new_session.get("_session_control_inflight") is None
+        assert server._sessions["sid-close-barrier"] is new_session
+    finally:
+        with server._sessions_lock:
+            if server._sessions.get("sid-close-barrier") is new_session:
+                server._sessions.pop("sid-close-barrier", None)
+
+
+def test_release_reanchor_leaves_history_and_registry_locks_available(
+    gateway, monkeypatch
+):
+    server, db, _home = gateway
+    old_key = "lock-race-old"
+    new_key = "lock-race-new"
+    agent = LiveAgent(db, old_key)
+    session = _session(server, db, "sid-lock-race", old_key, agent)
+    db.create_session(new_key, source="tui", model="test-model")
+    monkeypatch.setattr(server, "_restart_slash_worker", lambda *_a, **_k: None)
+    target, claim_error = server._claim_live_micro_control("sid-lock-race", session)
+    assert claim_error is None
+    assert target is not None
+    agent.session_id = new_key
+    assert server._sync_session_key_after_compress("sid-lock-race", session) == "deferred"
+    transfer_entered = threading.Event()
+    transfer_release = threading.Event()
+
+    def blocked_transfer(*_args, **_kwargs):
+        transfer_entered.set()
+        assert transfer_release.wait(2), "blocked re-anchor was not released"
+        return True
+
+    monkeypatch.setattr(server, "_transfer_active_session_slot", blocked_transfer)
+    release_result: dict = {}
+
+    def release_target() -> None:
+        with patch("tools.approval.unregister_gateway_notify"), patch(
+            "tools.approval.enable_session_yolo"
+        ), patch("tools.approval.disable_session_yolo"), patch(
+            "tools.approval.is_session_yolo_enabled", return_value=False
+        ), patch("tools.approval.register_gateway_notify"):
+            release_result["value"] = server._release_live_micro_control(target)
+
+    release_thread = threading.Thread(target=release_target)
+    release_thread.start()
+    assert transfer_entered.wait(2)
+    history_acquired = threading.Event()
+    registry_acquired = threading.Event()
+
+    def acquire_history() -> None:
+        with session["history_lock"]:
+            history_acquired.set()
+
+    def acquire_registry() -> None:
+        with server._sessions_lock:
+            registry_acquired.set()
+
+    history_thread = threading.Thread(target=acquire_history)
+    registry_thread = threading.Thread(target=acquire_registry)
+    history_thread.start()
+    registry_thread.start()
+    try:
+        assert history_acquired.wait(2), "history_lock remained held during re-anchor I/O"
+        assert registry_acquired.wait(2), "_sessions_lock remained held during re-anchor I/O"
+    finally:
+        transfer_release.set()
+        release_thread.join(timeout=5)
+        history_thread.join(timeout=5)
+        registry_thread.join(timeout=5)
+    assert not release_thread.is_alive()
+    assert not history_thread.is_alive()
+    assert not registry_thread.is_alive()
+    assert release_result["value"]
 
 
 def test_old_micro_finally_cannot_clear_replacement_session_lease(gateway, monkeypatch):
