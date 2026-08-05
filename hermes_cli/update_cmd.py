@@ -179,9 +179,10 @@ def _atomic_write_bytes(path: Path, payload: bytes) -> None:
 class RepositoryUpdateLock:
     """Cross-process advisory lock scoped to a Git repository common dir.
 
-    The lock file is intentionally never deleted.  Kernel ownership (``flock``
-    or Windows byte-range locking) releases it on process exit, so stale files
-    cannot be mistaken for stale ownership or stolen by a cleanup race.
+    On POSIX the lock is held on the Git common-directory inode itself, not on
+    the metadata pathname.  Removing or replacing ``hermes-update.lock`` can
+    therefore never create a new inode that another updater can acquire.  The
+    metadata file is only an atomically-written diagnostic for operators.
     """
 
     def __init__(self, repo_root: Path | str, git_cmd: list[str] | None = None):
@@ -189,6 +190,7 @@ class RepositoryUpdateLock:
         self.git_cmd = list(git_cmd or ["git"])
         self.lock_path: Path | None = None
         self._handle = None
+        self._handle_is_fd = False
         self.acquired = False
 
     @staticmethod
@@ -198,22 +200,40 @@ class RepositoryUpdateLock:
         except OSError:
             return ""
 
+    @staticmethod
+    def _close_handle(handle, *, is_fd: bool) -> None:
+        try:
+            if is_fd:
+                os.close(handle)
+            else:
+                handle.close()
+        except OSError:
+            logger.debug("Could not close repository update lock", exc_info=True)
+
     def acquire(self):
         if self.acquired:
             return self
         common = _git_common_dir(self.git_cmd, self.repo_root)
         self.lock_path = common / "hermes-update.lock"
+
+        # POSIX directory descriptors are stable across metadata unlink/replace
+        # races.  Windows keeps the open regular file because NTFS denies
+        # unlinking an open file and byte-range locking is its compatible
+        # cross-process primitive.
+        handle_is_fd = fcntl is not None
         try:
-            handle = self.lock_path.open("a+b")
+            if handle_is_fd:
+                handle = os.open(str(common), os.O_RDONLY)
+            else:  # pragma: no cover - exercised on Windows
+                handle = self.lock_path.open("a+b")
         except OSError as exc:
             raise RuntimeError(
                 f"Cannot open repository update lock {self.lock_path}: {exc}"
             ) from exc
 
         try:
-            handle.seek(0)
-            if fcntl is not None:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if handle_is_fd:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
             elif msvcrt is not None:  # pragma: no cover - exercised on Windows
                 handle.write(b"0")
                 handle.flush()
@@ -223,7 +243,7 @@ class RepositoryUpdateLock:
                 raise OSError("no cross-process locking primitive is available")
         except OSError as exc:
             holder = self._holder_text(self.lock_path)
-            handle.close()
+            self._close_handle(handle, is_fd=handle_is_fd)
             detail = f" ({holder})" if holder else ""
             raise RuntimeError(
                 "Cannot acquire repository update lock "
@@ -231,36 +251,52 @@ class RepositoryUpdateLock:
                 f"running{detail}. Wait for it to finish; do not delete the lock file."
             ) from exc
 
+        # Mark ownership before writing diagnostics.  If metadata I/O fails,
+        # release() can see and unlock the acquired kernel handle in this same
+        # exception path instead of leaving it unreachable.
+        self._handle = handle
+        self._handle_is_fd = handle_is_fd
+        self.acquired = True
         metadata = (
             f"pid={os.getpid()}\n"
             f"started={_time.time():.6f}\n"
             f"cwd={self.repo_root}\n"
         ).encode("utf-8")
-        handle.seek(0)
-        handle.truncate()
-        handle.write(metadata)
-        handle.flush()
-        os.fsync(handle.fileno())
-        self._handle = handle
-        self.acquired = True
+        try:
+            if handle_is_fd:
+                _atomic_write_bytes(self.lock_path, metadata)
+            else:  # pragma: no cover - exercised on Windows
+                handle.seek(0)
+                handle.truncate()
+                handle.write(metadata)
+                handle.flush()
+                os.fsync(handle.fileno())
+        except BaseException as exc:
+            self.release()
+            raise RuntimeError(
+                f"Could not write repository update lock metadata {self.lock_path}; "
+                "the lock was released."
+            ) from exc
         return self
 
     def release(self) -> None:
         handle = self._handle
+        handle_is_fd = self._handle_is_fd
         self._handle = None
+        self._handle_is_fd = False
         self.acquired = False
         if handle is None:
             return
         try:
-            if fcntl is not None:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            if handle_is_fd:
+                fcntl.flock(handle, fcntl.LOCK_UN)
             elif msvcrt is not None:  # pragma: no cover - exercised on Windows
                 handle.seek(0)
                 msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
         except OSError:
             logger.debug("Could not release repository update lock", exc_info=True)
         finally:
-            handle.close()
+            self._close_handle(handle, is_fd=handle_is_fd)
 
     def __enter__(self):
         return self.acquire()
@@ -274,35 +310,44 @@ _SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 
 
 def _is_official_origin_url(url: str | None) -> bool:
-    """Return whether ``url`` is an accepted NousResearch repository URL."""
+    """Return whether ``url`` is a strict official repository origin."""
 
     if not isinstance(url, str) or not url.strip():
         return False
     value = url.strip()
+    official_paths = {
+        "NousResearch/hermes-agent",
+        "NousResearch/hermes-agent.git",
+    }
     if value.startswith("git@"):
         host, separator, path = value.partition(":")
         if not separator or host.lower() != "git@github.com":
             return False
-        scheme = "ssh"
-    else:
-        try:
-            parsed = urlsplit(value)
-        except ValueError:
+        if "?" in path or "#" in path:
             return False
-        if parsed.hostname is None or parsed.hostname.lower() != "github.com":
-            return False
-        if parsed.username not in (None, "git"):
-            return False
-        if parsed.query or parsed.fragment:
-            return False
-        scheme = parsed.scheme.lower()
-        path = parsed.path
+        return path in official_paths
+
+    try:
+        parsed = urlsplit(value)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return False
+    if hostname is None or hostname.lower() != "github.com":
+        return False
+    if parsed.username not in (None, "git") or parsed.password is not None:
+        return False
+    if parsed.query or parsed.fragment:
+        return False
+    scheme = parsed.scheme.lower()
     if scheme not in {"https", "ssh"}:
         return False
-    normalized = "/" + path.strip("/")
-    if normalized.lower().endswith(".git"):
-        normalized = normalized[:-4]
-    return normalized.lower() == "/nousresearch/hermes-agent"
+    standard_port = 443 if scheme == "https" else 22
+    if port is not None and port != standard_port:
+        return False
+    if not parsed.path.startswith("/") or parsed.path.startswith("//"):
+        return False
+    return parsed.path[1:] in official_paths
 
 
 def _validate_release_tag_name(
@@ -1573,15 +1618,43 @@ def _home_local_patches_dir() -> Path:
     return Path(get_hermes_home()) / _LOCAL_PATCHES_DIRNAME
 
 
-def _local_patches_dir(cwd: Path | str | None = None) -> Path:
-    """Prefer in-repo patches; fall back to ``$HERMES_HOME/local-patches``."""
-    repo_dir = _repo_local_patches_dir(cwd)
-    if any(_iter_patch_files(repo_dir)):
-        return repo_dir
+def _patch_series_signature(patches: list[Path]) -> tuple[tuple[str, str], ...]:
+    """Return ordered patch names and byte hashes without exposing contents."""
+    signature = []
+    for path in patches:
+        try:
+            payload = path.read_bytes()
+        except OSError as exc:
+            raise RuntimeError(f"Could not read local patch {path}: {exc}") from exc
+        signature.append((path.name, hashlib.sha256(payload).hexdigest()))
+    return tuple(signature)
+
+
+def _select_local_patch_files(cwd: Path | str | None = None) -> list[Path]:
+    """Select one compatible repo/home patch series or fail closed on conflict."""
+    root = Path(cwd) if cwd is not None else Path(_m().PROJECT_ROOT)
+    repo_dir = _repo_local_patches_dir(root)
     home_dir = _home_local_patches_dir()
-    if any(_iter_patch_files(home_dir)):
-        return home_dir
-    return repo_dir
+    repo_patches = list(_iter_patch_files(repo_dir))
+    home_patches = list(_iter_patch_files(home_dir))
+
+    if repo_patches and home_patches:
+        if _patch_series_signature(repo_patches) != _patch_series_signature(home_patches):
+            raise RuntimeError(
+                "Conflicting local patch series found in "
+                f"{repo_dir} and {home_dir}. Migrate to one location, or make "
+                "both series byte-identical, then re-run the update."
+            )
+        return repo_patches
+    return repo_patches or home_patches
+
+
+def _local_patches_dir(cwd: Path | str | None = None) -> Path:
+    """Prefer the repo patch series, checking legacy home state for conflicts."""
+    selected = _select_local_patch_files(cwd)
+    if selected:
+        return selected[0].parent
+    return _repo_local_patches_dir(cwd)
 
 
 def _iter_patch_files(patches_dir: Path):
@@ -1603,21 +1676,13 @@ def _iter_patch_files(patches_dir: Path):
 
 def _list_local_release_patches(cwd: Path | str | None = None) -> list[Path]:
     """Sorted ``*.patch`` files used to reapply local customizations after a release reset."""
-    return list(_iter_patch_files(_local_patches_dir(cwd)))
+    return _select_local_patch_files(cwd)
 
 
 def _snapshot_local_release_patches(cwd: Path | str) -> list[tuple[str, str]]:
-    """Read patch file contents before ``reset --hard`` removes in-repo copies.
-
-    Prefers non-empty in-repo patches; falls back to ``$HERMES_HOME``.
-    """
-    root = Path(cwd)
-    repo_patches = list(_iter_patch_files(_repo_local_patches_dir(root)))
-    home_patches = list(_iter_patch_files(_home_local_patches_dir()))
-    candidates = repo_patches or home_patches
-
+    """Read the selected patch series before ``reset --hard`` removes its copies."""
     snapshots: list[tuple[str, str]] = []
-    for path in candidates:
+    for path in _select_local_patch_files(cwd):
         try:
             content = path.read_text(encoding="utf-8")
         except OSError as exc:
@@ -2836,6 +2901,28 @@ def _update_via_zip(args):
 def _stash_local_changes_if_needed(
     git_cmd: list[str], cwd: Path, *, marker: str | None = None
 ) -> Optional[str]:
+    # An unmerged index contains stage 1/2/3 entries whose identity must survive
+    # an update refusal.  Never reset, stash, or otherwise mutate an unresolved
+    # merge/rebase state; require the user to resolve it first.
+    unmerged = subprocess.run(
+        git_cmd + ["ls-files", "--unmerged"],
+        cwd=cwd,
+        capture_output=True,
+        text=True, encoding="utf-8", errors="replace",
+    )
+    if unmerged.returncode != 0:
+        print("✗ Could not inspect the Git index safely; update aborted.")
+        print("  Resolve conflicts or inspect the repository manually, then re-run the update.")
+        raise RuntimeError(
+            "Could not inspect the Git index safely; resolve conflicts before updating."
+        )
+    if unmerged.stdout.strip():
+        print("✗ Unresolved Git index conflicts detected; update aborted.")
+        print("  Resolve conflicts in the working tree, then re-run the update.")
+        raise RuntimeError(
+            "Unresolved Git index conflicts detected; resolve conflicts before updating."
+        )
+
     status = subprocess.run(
         git_cmd + ["status", "--porcelain"],
         cwd=cwd,
@@ -2845,20 +2932,6 @@ def _stash_local_changes_if_needed(
     )
     if not status.stdout.strip():
         return None
-
-    # If the index has unmerged entries (e.g. from an interrupted merge/rebase),
-    # git stash will fail with "needs merge / could not write index".  Clear the
-    # conflict state with `git reset` so the stash can proceed.  Working-tree
-    # changes are preserved; only the index conflict markers are dropped.
-    unmerged = subprocess.run(
-        git_cmd + ["ls-files", "--unmerged"],
-        cwd=cwd,
-        capture_output=True,
-        text=True, encoding="utf-8", errors="replace",
-    )
-    if unmerged.stdout.strip():
-        print("→ Clearing unmerged index entries from a previous conflict...")
-        subprocess.run(git_cmd + ["reset"], cwd=cwd, capture_output=True)
 
     stash_name = marker or (
         f"hermes-update-autostash-{os.getpid()}-{uuid.uuid4().hex}"
@@ -5164,115 +5237,15 @@ def _discard_lockfile_churn(git_cmd, repo_root):
     return None
 
 def _normalize_managed_eol(git_cmd, repo_root):
-    """Take a managed checkout off ``core.autocrlf=true`` without leaving it dirty.
+    """Compatibility no-op: never rewrite user bytes before autostash.
 
-    Git for Windows ships ``core.autocrlf=true`` in its system config, which
-    renormalizes this repo's LF text files to CRLF in the working tree. That
-    breaks ``git checkout`` on update with "Your local changes would be
-    overwritten", so ``install.ps1`` pins ``core.autocrlf=false`` on the managed
-    clone (#67730). Checkouts created before that landed never got the pin and
-    cannot receive it — the bootstrap installer reuses its build-pinned
-    ``install.ps1`` forever — so ``hermes update``, which ships with the checkout
-    itself, is the only path left that can fix them.
-
-    The pin and the cleanup are one operation. Under ``autocrlf=true`` git
-    compares normalized content, so a CRLF working tree reads clean; pinning
-    alone would expose every text file as modified and hand the update an
-    autostash of the whole tree. So the pin is written only after the tree is
-    verified clean under it, and a checkout we cannot fully normalize is left
-    exactly as it was. Best-effort: never blocks an update.
+    A CRLF-only difference can be intentional user data.  The update transaction
+    must preserve it through the complete stash boundary rather than guessing
+    that it is machine-generated checkout churn.  The helper remains as a call
+    seam for older callers, but all normalization belongs after user state has
+    been safely captured (if it is needed at all).
     """
-    # -c, not config: evaluate the tree as it WOULD look pinned, without
-    # persisting anything we might not be able to follow through on.
-    probe = git_cmd + ["-c", "core.autocrlf=false"]
-
-    def _dirty(*extra):
-        out = subprocess.run(
-            probe + ["diff", "-z", "--name-only", *extra],
-            cwd=repo_root,
-            capture_output=True,
-            text=True, encoding="utf-8", errors="replace",
-        )
-        if out.returncode != 0:
-            return None
-        return {p for p in out.stdout.split("\0") if p}
-
-    def _real_dirty():
-        # Files with a *content* change once CRLF differences are ignored.
-        # NOTE: ``diff --name-only --ignore-cr-at-eol`` still LISTS CR-only
-        # files (the name list is computed from blob/stat differences before
-        # the CR filter is applied), so it cannot be used to isolate real
-        # edits. ``--numstat`` does honor the filter: a CR-only file produces
-        # no numstat record, while a genuinely-edited file does. Parse the
-        # paths out of numstat instead.
-        out = subprocess.run(
-            probe + ["-c", "core.quotepath=false",
-                     "diff", "--numstat", "--ignore-cr-at-eol"],
-            cwd=repo_root,
-            capture_output=True,
-            text=True, encoding="utf-8", errors="replace",
-        )
-        if out.returncode != 0:
-            return None
-        paths = set()
-        for line in out.stdout.splitlines():
-            if not line.strip():
-                continue
-            # Format: "<added>\t<deleted>\t<path>". Rename detection is off in
-            # plain diff, so there is exactly one path field per record.
-            parts = line.split("\t", 2)
-            if len(parts) == 3 and parts[2]:
-                paths.add(parts[2])
-        return paths
-
-    def _eol_only():
-        all_dirty, real_dirty = _dirty(), _real_dirty()
-        if all_dirty is None or real_dirty is None:
-            return None
-        return all_dirty - real_dirty
-
-    try:
-        effective = subprocess.run(
-            git_cmd + ["config", "--get", "core.autocrlf"],
-            cwd=repo_root,
-            capture_output=True,
-            text=True, encoding="utf-8", errors="replace",
-        )
-        # Only "true" rewrites LF to CRLF on checkout. Unset, false, and input
-        # all leave the working tree alone, so there is nothing to repair.
-        if effective.stdout.strip().lower() != "true":
-            return
-
-        eol_only = _eol_only()
-        if eol_only is None:
-            return
-        if eol_only:
-            # Pathspec over stdin, not argv: a fully renormalized checkout is
-            # thousands of paths, well past the Windows command-line limit.
-            subprocess.run(
-                probe
-                + ["checkout", "--pathspec-from-file=-", "--pathspec-file-nul", "--"],
-                cwd=repo_root,
-                input="\0".join(sorted(eol_only)),
-                capture_output=True,
-                text=True, encoding="utf-8", errors="replace",
-                check=False,
-            )
-            if _eol_only():
-                # Still dirty — persisting the pin here would only surface churn
-                # we failed to clear. Leave the checkout as we found it.
-                return
-            print(f"→ Normalized line-ending churn ({len(eol_only)} file(s))")
-
-        subprocess.run(
-            git_cmd + ["config", "core.autocrlf", "false"],
-            cwd=repo_root,
-            capture_output=True,
-            check=False,
-        )
-    except Exception:
-        # Never let line-ending cleanup block an update.
-        pass
+    return None
 
 def _cmd_update_impl(args, gateway_mode: bool):
     """Body of ``cmd_update`` — kept separate so the wrapper can always
@@ -5289,6 +5262,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
     release_target = None
     release_transaction_result = None
     release_upgrade_context = None
+    update_succeeded = False
 
     # Whether this update is running without a human at the keyboard.
     # Interactive terminal updates always stash-and-ask (unchanged behavior);
@@ -7242,7 +7216,23 @@ def _cmd_update_impl(args, gateway_mode: bool):
             sys.exit(1)
 
     except subprocess.CalledProcessError as e:
-        if sys.platform == "win32":
+        if release_tag:
+            if (
+                release_transaction_result is not None
+                or release_upgrade_context is not None
+                or update_succeeded
+            ):
+                print("✗ Release transaction was promoted, but a post-promotion step failed.")
+                print(f"  {e}")
+                print(
+                    "  Recovery/finalization will run before the repository lock is released; "
+                    "the ZIP fallback is intentionally disabled for release upgrades."
+                )
+            else:
+                print(f"✗ Release update failed before promotion: {e}")
+                print("  The ZIP fallback is intentionally disabled for release upgrades.")
+            sys.exit(1)
+        if sys.platform == "win32" and not update_succeeded:
             print(f"⚠ Git update failed: {e}")
             print("→ Falling back to ZIP download...")
             print()

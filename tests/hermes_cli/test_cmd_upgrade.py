@@ -255,6 +255,98 @@ def test_cmd_upgrade_release_orchestration_uses_transaction_and_releases_lock(
     assert list(repo.iterdir()) == [repo / ".git"]
 
 
+def test_windows_release_post_promotion_failure_never_uses_zip_fallback(
+    tmp_path, monkeypatch, capsys
+):
+    from hermes_cli import update_cmd
+
+    repo = tmp_path / "release-post-promotion-error"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    args = SimpleNamespace(
+        release_tag="v1.2.3",
+        yes=True,
+        force=False,
+        force_venv=False,
+    )
+    target = update_cmd.ReleaseTarget(
+        tag=args.release_tag,
+        target_sha="3" * 40,
+        ref="refs/hermes-upgrade/tags/v1.2.3",
+    )
+    lock_instances = []
+    lifecycle_events = []
+    transaction_context = object()
+
+    class FakeRepositoryUpdateLock:
+        def __init__(self, repo_root, git_cmd):
+            self.repo_root = repo_root
+            self.git_cmd = git_cmd
+            self.release_calls = 0
+            lock_instances.append(self)
+
+        def acquire(self):
+            return self
+
+        def release(self):
+            self.release_calls += 1
+            lifecycle_events.append("lock-release")
+
+    def fake_run(cmd, **kwargs):
+        if "--abbrev-ref" in cmd:
+            return _git_completed(cmd, stdout="hermes-release\n")
+        if "merge-base" in cmd:
+            return _git_completed(cmd, returncode=1)
+        raise AssertionError(f"unexpected subprocess call: {cmd!r}")
+
+    transaction = Mock(
+        return_value=SimpleNamespace(target_sha=target.target_sha, context=transaction_context)
+    )
+    zip_fallback = Mock(side_effect=AssertionError("release must not use ZIP fallback"))
+
+    def fail_after_promotion(*_args, **_kwargs):
+        raise subprocess.CalledProcessError(1, ["post-promotion-build"])
+
+    def finalize_release(*args, **kwargs):
+        assert args[2] is transaction_context
+        assert lock_instances[0].release_calls == 0
+        lifecycle_events.append("finalize")
+        return True
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(update_cmd.sys, "platform", "win32")
+        patcher.setattr(hm, "PROJECT_ROOT", repo)
+        patcher.setattr(hm, "_is_windows", lambda: False)
+        patcher.setattr(hm, "_run_pre_update_backup", lambda _args: None)
+        patcher.setattr(hm, "_pause_windows_gateways_for_update", lambda: None)
+        patcher.setattr(hm, "_resume_windows_gateways_after_update", lambda _state: None)
+        patcher.setattr(
+            hm,
+            "_get_origin_url",
+            lambda _git_cmd, _repo: "https://github.com/NousResearch/hermes-agent.git",
+        )
+        patcher.setattr(update_cmd, "_capture_head_sha", lambda *_args: "4" * 40)
+        patcher.setattr(hm, "_clear_bytecode_cache", fail_after_promotion)
+        patcher.setattr("hermes_cli.config.load_config", lambda: {})
+        patcher.setattr(update_cmd, "RepositoryUpdateLock", FakeRepositoryUpdateLock)
+        patcher.setattr(update_cmd, "_resolve_release_target", Mock(return_value=target))
+        patcher.setattr(update_cmd, "_git_resolve_commit", lambda *args: "4" * 40)
+        patcher.setattr(update_cmd, "_invalidate_update_cache", lambda: None)
+        patcher.setattr(update_cmd, "_prepare_and_promote_release", transaction)
+        patcher.setattr(update_cmd, "_finalize_release_upgrade", finalize_release)
+        patcher.setattr(update_cmd, "_update_via_zip", zip_fallback)
+        patcher.setattr("subprocess.run", fake_run)
+
+        with pytest.raises(SystemExit) as exc_info:
+            update_cmd._cmd_update_impl(args, gateway_mode=False)
+
+    assert exc_info.value.code == 1
+    assert "post-promotion" in capsys.readouterr().out.lower()
+    zip_fallback.assert_not_called()
+    assert lifecycle_events == ["finalize", "lock-release"]
+    assert lock_instances[0].release_calls == 1
+
+
 def test_cmd_upgrade_replays_release_through_isolated_transaction(tmp_path):
     """The release seam promotes a real candidate without touching this checkout."""
     from hermes_cli import update_cmd

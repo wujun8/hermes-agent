@@ -12,6 +12,8 @@ import json
 import os
 import stat
 import subprocess
+import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -111,6 +113,198 @@ def test_package_lock_edit_is_not_discarded_before_stash(tmp_path):
 
     assert json.loads(lockfile.read_text(encoding="utf-8"))["intentional"] is True
     assert "package-lock.json" in _git(repo, "status", "--porcelain").stdout.decode()
+
+
+def test_unmerged_index_refuses_autostash_without_mutating_user_state(tmp_path, capsys):
+    repo = _init_repo(tmp_path)
+    _git(repo, "switch", "-c", "feature")
+    (repo / "README.txt").write_text("feature side\n", encoding="utf-8")
+    _commit(repo, "feature conflict")
+    _git(repo, "switch", "main")
+    (repo / "README.txt").write_text("main side\n", encoding="utf-8")
+    _commit(repo, "main conflict")
+    _git(repo, "merge", "feature", check=False)
+
+    before_unmerged = _git(repo, "ls-files", "--unmerged").stdout
+    before_bytes = (repo / "README.txt").read_bytes()
+    before_status = _git(repo, "status", "--porcelain=v1").stdout
+
+    with pytest.raises(RuntimeError, match="resolve conflicts"):
+        update_cmd._stash_local_changes_if_needed(["git"], repo)
+
+    assert _git(repo, "ls-files", "--unmerged").stdout == before_unmerged
+    assert (repo / "README.txt").read_bytes() == before_bytes
+    assert _git(repo, "status", "--porcelain=v1").stdout == before_status
+    assert "resolve conflicts" in capsys.readouterr().out.lower()
+
+
+def test_managed_eol_helper_and_autostash_preserve_intentional_crlf(tmp_path):
+    repo = _init_repo(tmp_path)
+    managed = repo / "managed.txt"
+    (repo / ".gitattributes").write_text("managed.txt -text\n", encoding="utf-8")
+    managed.write_text("one\ntwo\n", encoding="utf-8")
+    _commit(repo, "add managed file")
+    _git(repo, "config", "core.autocrlf", "true")
+    crlf_bytes = b"one\r\ntwo\r\nintentional\r\n"
+    managed.write_bytes(crlf_bytes)
+    before_status = _git(repo, "status", "--porcelain=v1").stdout
+
+    update_cmd._normalize_managed_eol(["git"], repo)
+
+    assert managed.read_bytes() == crlf_bytes
+    assert _git(repo, "status", "--porcelain=v1").stdout == before_status
+
+    stash_ref = update_cmd._stash_local_changes_if_needed(
+        ["git"], repo, marker="hermes-test-crlf"
+    )
+    assert stash_ref
+    stashed_bytes = _git(repo, "show", f"{stash_ref}:managed.txt").stdout
+    assert stashed_bytes == crlf_bytes
+    assert update_cmd._restore_stashed_changes(["git"], repo, stash_ref) is True
+    assert managed.read_bytes() == crlf_bytes
+    assert _git(repo, "status", "--porcelain=v1").stdout == before_status
+
+
+def test_repository_lock_cannot_be_stolen_by_unlinking_metadata(tmp_path):
+    if update_cmd.fcntl is None:
+        pytest.skip("POSIX directory locks are not available")
+    repo = _init_repo(tmp_path)
+    first = update_cmd.RepositoryUpdateLock(repo)
+    second = update_cmd.RepositoryUpdateLock(repo)
+    first.acquire()
+    assert first.lock_path is not None
+    first.lock_path.unlink()
+    try:
+        with pytest.raises(RuntimeError, match="another hermes update/upgrade"):
+            second.acquire()
+    finally:
+        first.release()
+    second.acquire()
+    second.release()
+
+
+@pytest.mark.parametrize("failure_kind", ["write", "fsync"])
+def test_repository_lock_metadata_failure_unlocks_and_closes(tmp_path, monkeypatch, failure_kind):
+    if update_cmd.fcntl is None:
+        pytest.skip("POSIX directory locks are not available")
+    repo = _init_repo(tmp_path)
+    first = update_cmd.RepositoryUpdateLock(repo)
+    with monkeypatch.context() as patcher:
+        if failure_kind == "write":
+            def fail_write(*_args, **_kwargs):
+                raise OSError("injected metadata write failure")
+
+            patcher.setattr(update_cmd, "_atomic_write_bytes", fail_write)
+        else:
+            patcher.setattr(
+                update_cmd.os,
+                "fsync",
+                lambda _fd: (_ for _ in ()).throw(OSError("injected metadata fsync failure")),
+            )
+        with pytest.raises(RuntimeError, match="metadata"):
+            first.acquire()
+    assert first.acquired is False
+
+    second = update_cmd.RepositoryUpdateLock(repo)
+    second.acquire()
+    second.release()
+    first.release()
+
+
+def test_repository_lock_is_released_when_owner_process_exits(tmp_path):
+    repo = _init_repo(tmp_path)
+    ready = tmp_path / "child-ready"
+    source_root = Path(update_cmd.__file__).resolve().parents[1]
+    child_code = (
+        "from pathlib import Path; import sys; "
+        "from hermes_cli.update_cmd import RepositoryUpdateLock; "
+        "lock = RepositoryUpdateLock(Path(sys.argv[1])); lock.acquire(); "
+        "Path(sys.argv[2]).write_text('ready')"
+    )
+    env = os.environ.copy()
+    env["PYTHONPATH"] = os.pathsep.join(
+        part for part in [str(source_root), env.get("PYTHONPATH", "")] if part
+    )
+    child = subprocess.Popen(
+        [sys.executable, "-c", child_code, str(repo), str(ready)],
+        cwd=repo,
+        env=env,
+    )
+    deadline = time.monotonic() + 10
+    while not ready.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert ready.exists()
+    assert child.wait(timeout=10) == 0
+
+    parent_lock = update_cmd.RepositoryUpdateLock(repo)
+    parent_lock.acquire()
+    parent_lock.release()
+
+
+def _write_patch_series(directory: Path, entries: dict[str, bytes]) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    for name, payload in entries.items():
+        (directory / name).write_bytes(payload)
+
+
+def test_conflicting_repo_and_home_patch_series_fail_closed(tmp_path, monkeypatch):
+    repo = _init_repo(tmp_path)
+    home = tmp_path / "home"
+    monkeypatch.setattr(update_cmd, "get_hermes_home", lambda: home)
+    _write_patch_series(repo / "local-patches", {"0001-one.patch": b"repo-only"})
+    _write_patch_series(home / "local-patches", {"0001-one.patch": b"home-only"})
+
+    with pytest.raises(RuntimeError, match="Conflicting local patch series") as exc_info:
+        update_cmd._local_patches_dir(repo)
+    message = str(exc_info.value)
+    assert str(repo / "local-patches") in message
+    assert str(home / "local-patches") in message
+    assert "repo-only" not in message
+    assert "home-only" not in message
+
+    with pytest.raises(RuntimeError, match="Conflicting local patch series"):
+        update_cmd._snapshot_local_release_patches(repo)
+
+
+def test_identical_repo_and_home_patch_series_prefer_repo(tmp_path, monkeypatch):
+    repo = _init_repo(tmp_path)
+    home = tmp_path / "home"
+    monkeypatch.setattr(update_cmd, "get_hermes_home", lambda: home)
+    entries = {
+        "0001-one.patch": b"same-one",
+        "0002-two.patch": b"same-two",
+    }
+    _write_patch_series(repo / "local-patches", entries)
+    _write_patch_series(home / "local-patches", entries)
+
+    assert update_cmd._local_patches_dir(repo) == repo / "local-patches"
+    assert update_cmd._snapshot_local_release_patches(repo) == [
+        ("0001-one.patch", "same-one"),
+        ("0002-two.patch", "same-two"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("git@github.com:NousResearch/hermes-agent.git", True),
+        ("ssh://git@github.com/NousResearch/hermes-agent.git", True),
+        ("https://github.com/NousResearch/hermes-agent.git", True),
+        ("https://github.com/NousResearch/hermes-agent", True),
+        ("https://github.com:443/NousResearch/hermes-agent.git", True),
+        ("ssh://git@github.com:22/NousResearch/hermes-agent.git", True),
+        ("https://git:secret@github.com/NousResearch/hermes-agent.git", False),
+        ("https://github.com:8443/NousResearch/hermes-agent.git", False),
+        ("ssh://git@github.com:2222/NousResearch/hermes-agent.git", False),
+        ("https://github.com/NousResearch/hermes-agent.git?download=1", False),
+        ("https://github.com/NousResearch/hermes-agent.git#main", False),
+        ("git@github.com:NousResearch/hermes-agent.git?download=1", False),
+        ("https://github.com/NousResearch/other.git", False),
+        ("https://gitlab.com/NousResearch/hermes-agent.git", False),
+    ],
+)
+def test_official_origin_url_accepts_only_strict_forms(url, expected):
+    assert update_cmd._is_official_origin_url(url) is expected
 
 
 @pytest.mark.parametrize("artifact_mode", ["missing", "empty", "stale"])
