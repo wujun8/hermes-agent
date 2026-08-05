@@ -27,14 +27,30 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
+import tempfile
 import time as _time
+import uuid
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlsplit
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows
+    fcntl = None
+
+try:
+    import msvcrt
+except ImportError:  # pragma: no cover - POSIX
+    msvcrt = None
 
 from hermes_cli.config import get_hermes_home
 from hermes_constants import venv_python_path
@@ -53,6 +69,942 @@ def _m():
     from hermes_cli import main
 
     return main
+
+
+@dataclass(frozen=True)
+class ReleaseTarget:
+    """An exact, immutable release target resolved from one tag ref."""
+
+    tag: str
+    target_sha: str
+    ref: str
+
+
+@dataclass(frozen=True)
+class ReleaseBaseMetadata:
+    """Validated metadata describing the base of the maintenance delta."""
+
+    tag: str
+    base_sha: str
+    target_sha: str | None = None
+    patch_sha256: str | None = None
+    patch_bytes: int | None = None
+
+
+@dataclass(frozen=True)
+class ReleaseUpgradeResult:
+    """The durable result of a promoted candidate."""
+
+    old_sha: str
+    target_sha: str
+    candidate_sha: str
+    backup_ref: str
+    candidate_path: Path | None = None
+
+
+def _git_common_dir(git_cmd: list[str], cwd: Path | str) -> Path:
+    """Resolve the repository's common Git directory, including worktrees."""
+
+    result = subprocess.run(
+        git_cmd + ["rev-parse", "--git-common-dir"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        detail = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(
+            "Could not resolve Git common directory for update lock"
+            + (f": {detail.splitlines()[0]}" if detail else "")
+        )
+    common = Path(result.stdout.strip())
+    if not common.is_absolute():
+        common = Path(cwd) / common
+    return common.resolve()
+
+
+def _atomic_write_bytes(path: Path, payload: bytes) -> None:
+    """Write a regular file with fsync + replace, never following symlinks."""
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        existing = path.lstat()
+    except FileNotFoundError:
+        existing = None
+    if existing is not None:
+        if stat.S_ISLNK(existing.st_mode):
+            raise RuntimeError(f"Refusing to write through symlink: {path}")
+        if not stat.S_ISREG(existing.st_mode):
+            raise RuntimeError(f"Refusing to replace non-regular file: {path}")
+
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+        try:
+            dir_fd = os.open(str(path.parent), os.O_RDONLY)
+        except OSError:
+            dir_fd = None
+        if dir_fd is not None:
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+    finally:
+        try:
+            tmp_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+class RepositoryUpdateLock:
+    """Cross-process advisory lock scoped to a Git repository common dir.
+
+    The lock file is intentionally never deleted.  Kernel ownership (``flock``
+    or Windows byte-range locking) releases it on process exit, so stale files
+    cannot be mistaken for stale ownership or stolen by a cleanup race.
+    """
+
+    def __init__(self, repo_root: Path | str, git_cmd: list[str] | None = None):
+        self.repo_root = Path(repo_root)
+        self.git_cmd = list(git_cmd or ["git"])
+        self.lock_path: Path | None = None
+        self._handle = None
+        self.acquired = False
+
+    @staticmethod
+    def _holder_text(path: Path) -> str:
+        try:
+            return path.read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            return ""
+
+    def acquire(self):
+        if self.acquired:
+            return self
+        common = _git_common_dir(self.git_cmd, self.repo_root)
+        self.lock_path = common / "hermes-update.lock"
+        try:
+            handle = self.lock_path.open("a+b")
+        except OSError as exc:
+            raise RuntimeError(
+                f"Cannot open repository update lock {self.lock_path}: {exc}"
+            ) from exc
+
+        try:
+            handle.seek(0)
+            if fcntl is not None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            elif msvcrt is not None:  # pragma: no cover - exercised on Windows
+                handle.write(b"0")
+                handle.flush()
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:  # pragma: no cover - unsupported platform
+                raise OSError("no cross-process locking primitive is available")
+        except OSError as exc:
+            holder = self._holder_text(self.lock_path)
+            handle.close()
+            detail = f" ({holder})" if holder else ""
+            raise RuntimeError(
+                "Cannot acquire repository update lock "
+                f"{self.lock_path}: another hermes update/upgrade is already "
+                f"running{detail}. Wait for it to finish; do not delete the lock file."
+            ) from exc
+
+        metadata = (
+            f"pid={os.getpid()}\n"
+            f"started={_time.time():.6f}\n"
+            f"cwd={self.repo_root}\n"
+        ).encode("utf-8")
+        handle.seek(0)
+        handle.truncate()
+        handle.write(metadata)
+        handle.flush()
+        os.fsync(handle.fileno())
+        self._handle = handle
+        self.acquired = True
+        return self
+
+    def release(self) -> None:
+        handle = self._handle
+        self._handle = None
+        self.acquired = False
+        if handle is None:
+            return
+        try:
+            if fcntl is not None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            elif msvcrt is not None:  # pragma: no cover - exercised on Windows
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        except OSError:
+            logger.debug("Could not release repository update lock", exc_info=True)
+        finally:
+            handle.close()
+
+    def __enter__(self):
+        return self.acquire()
+
+    def __exit__(self, _exc_type, _exc, _tb):
+        self.release()
+        return False
+
+
+_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
+
+
+def _is_official_origin_url(url: str | None) -> bool:
+    """Return whether ``url`` is an accepted NousResearch repository URL."""
+
+    if not isinstance(url, str) or not url.strip():
+        return False
+    value = url.strip()
+    if value.startswith("git@"):
+        host, separator, path = value.partition(":")
+        if not separator or host.lower() != "git@github.com":
+            return False
+        scheme = "ssh"
+    else:
+        try:
+            parsed = urlsplit(value)
+        except ValueError:
+            return False
+        if parsed.hostname is None or parsed.hostname.lower() != "github.com":
+            return False
+        if parsed.username not in (None, "git"):
+            return False
+        if parsed.query or parsed.fragment:
+            return False
+        scheme = parsed.scheme.lower()
+        path = parsed.path
+    if scheme not in {"https", "ssh"}:
+        return False
+    normalized = "/" + path.strip("/")
+    if normalized.lower().endswith(".git"):
+        normalized = normalized[:-4]
+    return normalized.lower() == "/nousresearch/hermes-agent"
+
+
+def _validate_release_tag_name(
+    git_cmd: list[str], cwd: Path | str, release_tag: str
+) -> None:
+    if (
+        not isinstance(release_tag, str)
+        or not release_tag
+        or release_tag.startswith("refs/")
+        or "\x00" in release_tag
+    ):
+        raise RuntimeError(f"Invalid release tag name: {release_tag!r}")
+    result = subprocess.run(
+        git_cmd + ["check-ref-format", f"refs/tags/{release_tag}"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"Invalid release tag name: {release_tag!r}")
+
+
+def _origin_url_for_release(git_cmd: list[str], cwd: Path | str) -> str | None:
+    """Resolve the configured origin through this module's local helper."""
+
+    return _get_origin_url(git_cmd, cwd)
+
+
+def _resolve_release_target(
+    git_cmd: list[str], cwd: Path | str, release_tag: str
+) -> ReleaseTarget:
+    """Fetch and resolve one exact official tag into a private ref namespace."""
+
+    _validate_release_tag_name(git_cmd, cwd, release_tag)
+    origin_url = _origin_url_for_release(git_cmd, cwd)
+    if not _is_official_origin_url(origin_url):
+        raise RuntimeError(
+            "Release upgrade requires the official origin "
+            "https://github.com/NousResearch/hermes-agent.git; "
+            f"configured origin is {origin_url or '<missing>'}."
+        )
+
+    private_ref = f"refs/hermes-upgrade/tags/{release_tag}"
+    source_ref = f"refs/tags/{release_tag}"
+    fetch = subprocess.run(
+        git_cmd
+        + ["fetch", "--no-tags", "origin", f"+{source_ref}:{private_ref}"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if fetch.returncode != 0:
+        detail = (fetch.stderr or fetch.stdout or "").strip()
+        raise RuntimeError(
+            f"Could not fetch exact release tag {release_tag}: "
+            f"{detail.splitlines()[0] if detail else 'git fetch failed'}"
+        )
+
+    resolved = subprocess.run(
+        git_cmd + ["rev-parse", "--verify", f"{private_ref}^{{commit}}"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    target_sha = resolved.stdout.strip()
+    if resolved.returncode != 0 or not _SHA_RE.fullmatch(target_sha):
+        raise RuntimeError(
+            f"Fetched release tag {release_tag} did not resolve to an immutable commit."
+        )
+    return ReleaseTarget(release_tag, target_sha.lower(), private_ref)
+
+
+def _read_release_base_metadata(cwd: Path | str) -> ReleaseBaseMetadata:
+    """Parse the JSON ``local-patches/.release_base`` contract."""
+
+    path = Path(cwd) / _LOCAL_PATCHES_DIRNAME / ".release_base"
+    try:
+        info = path.lstat()
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            f"Missing {path}; cannot establish the base of local maintenance changes."
+        ) from exc
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise RuntimeError(f"Refusing non-regular release metadata: {path}")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Invalid release metadata {path}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Invalid release metadata {path}: expected an object")
+    tag = payload.get("tag")
+    base_sha = payload.get("base_sha")
+    target_sha = payload.get("target_sha")
+    patch_sha256 = payload.get("patch_sha256")
+    patch_bytes = payload.get("patch_bytes")
+    if not isinstance(tag, str) or not tag:
+        raise RuntimeError(f"Invalid release metadata {path}: missing tag")
+    if not isinstance(base_sha, str) or not _SHA_RE.fullmatch(base_sha):
+        raise RuntimeError(f"Invalid release metadata {path}: missing base_sha")
+    if target_sha is not None and (
+        not isinstance(target_sha, str) or not _SHA_RE.fullmatch(target_sha)
+    ):
+        raise RuntimeError(f"Invalid release metadata {path}: invalid target_sha")
+    if patch_sha256 is not None and (
+        not isinstance(patch_sha256, str)
+        or not re.fullmatch(r"[0-9a-fA-F]{64}", patch_sha256)
+    ):
+        raise RuntimeError(f"Invalid release metadata {path}: invalid patch_sha256")
+    if patch_bytes is not None and (
+        not isinstance(patch_bytes, int) or patch_bytes < 0
+    ):
+        raise RuntimeError(f"Invalid release metadata {path}: invalid patch_bytes")
+    return ReleaseBaseMetadata(
+        tag=tag,
+        base_sha=base_sha.lower(),
+        target_sha=target_sha.lower() if isinstance(target_sha, str) else None,
+        patch_sha256=patch_sha256.lower() if isinstance(patch_sha256, str) else None,
+        patch_bytes=patch_bytes,
+    )
+
+
+def _git_resolve_commit(git_cmd: list[str], cwd: Path | str, ref: str) -> str | None:
+    result = subprocess.run(
+        git_cmd + ["rev-parse", "--verify", f"{ref}^{{commit}}"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    value = result.stdout.strip()
+    return value.lower() if result.returncode == 0 and _SHA_RE.fullmatch(value) else None
+
+
+def _validate_release_base_metadata(
+    git_cmd: list[str], cwd: Path | str, metadata: ReleaseBaseMetadata, head_sha: str
+) -> None:
+    if not _SHA_RE.fullmatch(head_sha):
+        raise RuntimeError("Current maintenance HEAD is not an immutable commit SHA.")
+    if _git_resolve_commit(git_cmd, cwd, metadata.base_sha) != metadata.base_sha:
+        raise RuntimeError(
+            f"Release metadata base {metadata.base_sha} is missing from the repository."
+        )
+    ancestry = subprocess.run(
+        git_cmd + ["merge-base", "--is-ancestor", metadata.base_sha, head_sha],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if ancestry.returncode != 0:
+        raise RuntimeError(
+            f"Release metadata base {metadata.tag} ({metadata.base_sha}) is not an "
+            "ancestor of the maintenance branch; refusing to guess a payload base."
+        )
+    known_base = _git_resolve_commit(
+        git_cmd, cwd, f"refs/tags/{metadata.tag}"
+    ) or _git_resolve_commit(
+        git_cmd, cwd, f"refs/hermes-upgrade/tags/{metadata.tag}"
+    )
+    if known_base is None or known_base != metadata.base_sha:
+        raise RuntimeError(
+            f"Release metadata tag {metadata.tag} does not resolve consistently to "
+            f"{metadata.base_sha}; refusing to generate local payload."
+        )
+    if metadata.target_sha and _git_resolve_commit(git_cmd, cwd, metadata.target_sha) != metadata.target_sha:
+        raise RuntimeError(
+            f"Release metadata target {metadata.target_sha} is missing from the repository."
+        )
+
+
+def _maintenance_pathspec() -> str:
+    return f":(exclude){_LOCAL_PATCHES_DIRNAME}"
+
+
+def _reject_gitlink_changes(
+    git_cmd: list[str], cwd: Path | str, base_sha: str, head_sha: str
+) -> None:
+    raw = subprocess.run(
+        git_cmd
+        + ["diff", "--raw", "-z", base_sha, head_sha, "--", ".", _maintenance_pathspec()],
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if raw.returncode != 0:
+        detail = raw.stderr.decode(errors="replace").strip()
+        raise RuntimeError(
+            f"Could not inspect local maintenance delta{': ' + detail if detail else ''}."
+        )
+    for record in raw.stdout.split(b"\0"):
+        if record and (b" 160000 " in record or record.startswith(b":160000 ")):
+            raise RuntimeError(
+                "Local maintenance delta contains a Git submodule/gitlink; "
+                "recursive submodule replay is not supported."
+            )
+
+
+def _validate_patch_artifact(
+    cwd: Path | str, metadata: ReleaseBaseMetadata
+) -> None:
+    """Validate artifact shape, but never use it as the payload source."""
+
+    path = Path(cwd) / _LOCAL_PATCHES_DIRNAME / "0001-local-maintenance.patch"
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        logger.warning("Local patch artifact is missing; using Git history instead: %s", path)
+        return
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise RuntimeError(f"Refusing non-regular local patch artifact: {path}")
+    content = path.read_bytes()
+    if metadata.patch_sha256 and hashlib.sha256(content).hexdigest() != metadata.patch_sha256:
+        logger.warning("Local patch artifact is stale; using Git history instead: %s", path)
+    if metadata.patch_bytes is not None and len(content) != metadata.patch_bytes:
+        logger.warning("Local patch artifact size is stale; using Git history instead: %s", path)
+
+
+def _git_diff_bytes(
+    git_cmd: list[str], cwd: Path | str, base_sha: str, head_sha: str
+) -> bytes:
+    _reject_gitlink_changes(git_cmd, cwd, base_sha, head_sha)
+    result = subprocess.run(
+        git_cmd
+        + [
+            "diff",
+            "--binary",
+            "--full-index",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--find-renames",
+            base_sha,
+            head_sha,
+            "--",
+            ".",
+            _maintenance_pathspec(),
+        ],
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.decode(errors="replace").strip()
+        raise RuntimeError(
+            f"Could not generate Git maintenance payload{': ' + detail if detail else ''}."
+        )
+    return result.stdout
+
+
+def _generate_runtime_local_payload(
+    git_cmd: list[str],
+    cwd: Path | str,
+    metadata: ReleaseBaseMetadata,
+    *,
+    head_sha: str | None = None,
+) -> bytes:
+    """Generate the local payload from committed Git truth, not patch files."""
+
+    root = Path(cwd)
+    if head_sha is None:
+        head_sha = _git_resolve_commit(git_cmd, root, "HEAD")
+    if head_sha is None:
+        raise RuntimeError("Could not resolve the maintenance branch HEAD.")
+    _validate_release_base_metadata(git_cmd, root, metadata, head_sha)
+    _validate_patch_artifact(root, metadata)
+    return _git_diff_bytes(git_cmd, root, metadata.base_sha, head_sha)
+
+
+def _write_transaction_journal(common_dir: Path, payload: dict) -> Path:
+    path = common_dir / "hermes-upgrade-transaction.json"
+    _atomic_write_bytes(path, (json.dumps(payload, sort_keys=True, indent=2) + "\n").encode())
+    return path
+
+
+def _candidate_artifact_directory(candidate: Path) -> Path:
+    directory = candidate / _LOCAL_PATCHES_DIRNAME
+    try:
+        info = directory.lstat()
+    except FileNotFoundError:
+        directory.mkdir(parents=True)
+        return directory
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise RuntimeError(f"Refusing non-directory local-patches path: {directory}")
+    allowed = {"0001-local-maintenance.patch", "README.md", ".release_base"}
+    for entry in directory.iterdir():
+        try:
+            entry_info = entry.lstat()
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(entry_info.st_mode):
+            raise RuntimeError(f"Refusing symlink in local-patches: {entry}")
+        if entry.name in allowed:
+            if not stat.S_ISREG(entry_info.st_mode):
+                raise RuntimeError(f"Refusing non-regular local-patches artifact: {entry}")
+        elif entry.suffix == ".patch" and stat.S_ISREG(entry_info.st_mode):
+            entry.unlink()
+        else:
+            raise RuntimeError(f"Unexpected local-patches entry in candidate: {entry.name}")
+    return directory
+
+
+def _commit_candidate_changes(git_cmd: list[str], candidate: Path, message: str) -> None:
+    cached = subprocess.run(
+        git_cmd + ["diff", "--cached", "--quiet"],
+        cwd=candidate,
+        capture_output=True,
+    )
+    if cached.returncode == 0:
+        return
+    if cached.returncode != 1:
+        raise RuntimeError("Could not inspect candidate index before commit.")
+    commit = subprocess.run(
+        git_cmd + ["commit", "--no-gpg-sign", "-m", message],
+        cwd=candidate,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if commit.returncode != 0:
+        detail = (commit.stderr or commit.stdout or "").strip()
+        raise RuntimeError(
+            f"Could not commit isolated upgrade candidate: "
+            f"{detail.splitlines()[0] if detail else 'git commit failed'}"
+        )
+
+
+def _apply_payload_to_candidate(
+    git_cmd: list[str], candidate: Path, payload: bytes, *, label: str
+) -> None:
+    if not payload:
+        return
+    fd, tmp_name = tempfile.mkstemp(prefix="hermes-upgrade-payload-", suffix=".patch")
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        applied = subprocess.run(
+            git_cmd
+            + ["apply", "--3way", "--index", "--whitespace=nowarn", str(tmp_path)],
+            cwd=candidate,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        unmerged = subprocess.run(
+            git_cmd + ["ls-files", "--unmerged"],
+            cwd=candidate,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if applied.returncode != 0 or unmerged.stdout.strip():
+            detail = (applied.stderr or applied.stdout or "").strip()
+            raise RuntimeError(
+                f"Release payload {label} conflicts in isolated candidate: "
+                f"{detail.splitlines()[0] if detail else 'git apply --3way failed'}"
+            )
+    finally:
+        try:
+            tmp_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _validate_candidate_tree(git_cmd: list[str], candidate: Path) -> str:
+    status = subprocess.run(
+        git_cmd + ["status", "--porcelain"],
+        cwd=candidate,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    unmerged = subprocess.run(
+        git_cmd + ["ls-files", "--unmerged"],
+        cwd=candidate,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if status.returncode != 0 or status.stdout.strip() or unmerged.stdout.strip():
+        raise RuntimeError("Candidate worktree is not clean after replay.")
+    syntax_ok, failing_path, syntax_error = _validate_critical_files_syntax(candidate)
+    if not syntax_ok:
+        raise RuntimeError(
+            f"Candidate validation failed at {failing_path}: {syntax_error or 'syntax error'}"
+        )
+    if (Path(candidate) / "hermes_cli" / "main.py").is_file():
+        imports_ok, failing_module, import_error = _validate_critical_modules_import(candidate)
+        if not imports_ok:
+            raise RuntimeError(
+                f"Candidate import validation failed at {failing_module}: "
+                f"{import_error or 'import error'}"
+            )
+    resolved = _git_resolve_commit(git_cmd, candidate, "HEAD")
+    if resolved is None:
+        raise RuntimeError("Candidate HEAD did not resolve to an immutable commit.")
+    return resolved
+
+
+def _upgrade_release_transaction(
+    git_cmd: list[str],
+    cwd: Path | str,
+    release_tag: str,
+    target_sha: str,
+) -> ReleaseUpgradeResult:
+    """Replay committed maintenance changes in isolation, then CAS-promote."""
+
+    root = Path(cwd)
+    _validate_release_tag_name(git_cmd, root, release_tag)
+    if not _SHA_RE.fullmatch(target_sha):
+        raise RuntimeError("Release target is not an immutable commit SHA.")
+    target_sha = target_sha.lower()
+    exact_target = _git_resolve_commit(git_cmd, root, f"refs/tags/{release_tag}") or _git_resolve_commit(
+        git_cmd, root, f"refs/hermes-upgrade/tags/{release_tag}"
+    )
+    if exact_target != target_sha:
+        raise RuntimeError(
+            f"Release target {release_tag} is not the exact fetched tag commit; refusing to guess."
+        )
+
+    branch = "hermes-release"
+    old_sha = _git_resolve_commit(git_cmd, root, f"refs/heads/{branch}")
+    current_branch = subprocess.run(
+        git_cmd + ["rev-parse", "--abbrev-ref", "HEAD"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if old_sha is None:
+        raise RuntimeError(
+            "Local maintenance branch 'hermes-release' is missing; create it from "
+            "an official release and initialize local-patches/.release_base before upgrading."
+        )
+    if current_branch.returncode != 0 or current_branch.stdout.strip() != branch:
+        raise RuntimeError(
+            "Release transaction requires the explicit hermes-release branch to be checked out."
+        )
+    current_sha = _git_resolve_commit(git_cmd, root, "HEAD")
+    if current_sha != old_sha:
+        raise RuntimeError("Live maintenance HEAD changed before promotion; retry the upgrade.")
+    if _git_working_tree_dirty(git_cmd, root):
+        raise RuntimeError("Live maintenance worktree must be clean after user changes are stashed.")
+
+    metadata = _read_release_base_metadata(root)
+    payload = _generate_runtime_local_payload(git_cmd, root, metadata, head_sha=old_sha)
+    common = _git_common_dir(git_cmd, root)
+    journal_path = common / "hermes-upgrade-transaction.json"
+    if journal_path.exists():
+        raise RuntimeError(
+            f"An unfinished upgrade transaction exists at {journal_path}; "
+            "recover using its candidate path and backup ref before retrying."
+        )
+
+    token = uuid.uuid4().hex
+    backup_ref = f"refs/hermes-upgrade/backups/{token}"
+    candidate_branch = f"hermes-upgrade-candidate/{token}"
+    candidate_path = common.parent.parent / f"hermes-upgrade-candidate-{token}"
+    journal = {
+        "version": 1,
+        "state": "prepared",
+        "old_sha": old_sha,
+        "target_sha": target_sha,
+        "release_tag": release_tag,
+        "backup_ref": backup_ref,
+        "candidate_branch": candidate_branch,
+        "candidate_path": str(candidate_path),
+        "stash_pending": False,
+    }
+    _write_transaction_journal(common, journal)
+
+    backup = subprocess.run(
+        git_cmd + ["update-ref", backup_ref, old_sha],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if backup.returncode != 0:
+        journal["state"] = "backup-failed"
+        _write_transaction_journal(common, journal)
+        raise RuntimeError("Could not create durable pre-promotion backup ref.")
+
+    try:
+        worktree = subprocess.run(
+            git_cmd
+            + ["worktree", "add", "-b", candidate_branch, str(candidate_path), target_sha],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if worktree.returncode != 0:
+            journal["state"] = "candidate-create-failed"
+            _write_transaction_journal(common, journal)
+            detail = (worktree.stderr or worktree.stdout or "").strip()
+            raise RuntimeError(
+                f"Could not create isolated upgrade candidate: "
+                f"{detail.splitlines()[0] if detail else 'git worktree add failed'}"
+            )
+        journal["state"] = "candidate-created"
+        _write_transaction_journal(common, journal)
+        _apply_payload_to_candidate(git_cmd, candidate_path, payload, label=release_tag)
+        _commit_candidate_changes(
+            git_cmd, candidate_path, f"local: replay maintenance payload onto {release_tag}"
+        )
+
+        candidate_head = _git_resolve_commit(git_cmd, candidate_path, "HEAD")
+        if candidate_head is None:
+            raise RuntimeError("Candidate payload commit did not produce a commit SHA.")
+        artifact_dir = _candidate_artifact_directory(candidate_path)
+        artifact_payload = _git_diff_bytes(git_cmd, candidate_path, target_sha, candidate_head)
+        artifact_sha = hashlib.sha256(artifact_payload).hexdigest()
+        artifact_metadata = {
+            "format_version": 1,
+            "tag": release_tag,
+            "base_sha": target_sha,
+            "target_sha": target_sha,
+            "patch_sha256": artifact_sha,
+            "patch_bytes": len(artifact_payload),
+        }
+        _atomic_write_bytes(
+            artifact_dir / "0001-local-maintenance.patch", artifact_payload
+        )
+        _atomic_write_bytes(artifact_dir / "README.md", _LOCAL_PATCHES_README.encode())
+        _atomic_write_bytes(
+            artifact_dir / ".release_base",
+            (json.dumps(artifact_metadata, sort_keys=True, indent=2) + "\n").encode(),
+        )
+        stage = subprocess.run(
+            git_cmd
+            + [
+                "add",
+                "--",
+                f"{_LOCAL_PATCHES_DIRNAME}/0001-local-maintenance.patch",
+                f"{_LOCAL_PATCHES_DIRNAME}/README.md",
+                f"{_LOCAL_PATCHES_DIRNAME}/.release_base",
+            ],
+            cwd=candidate_path,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if stage.returncode != 0:
+            raise RuntimeError("Could not stage expected local-patches artifacts in candidate.")
+        _commit_candidate_changes(
+            git_cmd,
+            candidate_path,
+            f"local: refresh maintenance artifacts for {release_tag}",
+        )
+        candidate_sha = _validate_candidate_tree(git_cmd, candidate_path)
+        journal["state"] = "candidate-validated"
+        journal["candidate_sha"] = candidate_sha
+        _write_transaction_journal(common, journal)
+
+        live_sha = _git_resolve_commit(git_cmd, root, "HEAD")
+        if live_sha != old_sha or _git_working_tree_dirty(git_cmd, root):
+            raise RuntimeError("Live checkout changed while candidate was being validated.")
+        journal["state"] = "promoting"
+        _write_transaction_journal(common, journal)
+        promote = subprocess.run(
+            git_cmd + ["update-ref", f"refs/heads/{branch}", candidate_sha, old_sha],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if promote.returncode != 0:
+            raise RuntimeError(
+                "Live maintenance branch changed before promotion; candidate and backup were preserved."
+            )
+        reset = subprocess.run(
+            git_cmd + ["reset", "--hard", candidate_sha],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        final_sha = _git_resolve_commit(git_cmd, root, "HEAD")
+        if reset.returncode != 0 or final_sha != candidate_sha or _git_working_tree_dirty(git_cmd, root):
+            journal["state"] = "promotion-needs-recovery"
+            _write_transaction_journal(common, journal)
+            raise RuntimeError(
+                f"Promotion did not verify. Recover with backup ref {backup_ref} "
+                f"and candidate {candidate_path}."
+            )
+        journal["state"] = "promoted"
+        _write_transaction_journal(common, journal)
+    except Exception:
+        # Keep candidate worktrees and the journal on every post-backup failure.
+        # They are the recovery evidence; never reset or plain-apply the live tree.
+        raise
+
+    cleanup = subprocess.run(
+        git_cmd + ["worktree", "remove", "--force", str(candidate_path)],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if cleanup.returncode == 0:
+        subprocess.run(
+            git_cmd + ["branch", "-D", candidate_branch],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        try:
+            journal_path.unlink()
+        except OSError:
+            logger.warning("Could not remove completed upgrade journal: %s", journal_path)
+    else:
+        logger.warning(
+            "Upgrade promoted successfully but candidate cleanup failed; recovery journal kept at %s",
+            journal_path,
+        )
+    return ReleaseUpgradeResult(old_sha, target_sha, candidate_sha, backup_ref, candidate_path)
+
+
+def _prepare_and_promote_release(
+    git_cmd: list[str],
+    cwd: Path | str,
+    release_tag: str,
+    target_sha: str,
+    *,
+    input_fn=None,
+) -> ReleaseUpgradeResult:
+    """Stash user state, run the isolated transaction, and restore it safely."""
+
+    root = Path(cwd)
+    branch = "hermes-release"
+    original_branch = subprocess.run(
+        git_cmd + ["rev-parse", "--abbrev-ref", "HEAD"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    ).stdout.strip()
+    if _git_resolve_commit(git_cmd, root, f"refs/heads/{branch}") is None:
+        raise RuntimeError(
+            "Local maintenance branch 'hermes-release' is missing; refusing to create it from an arbitrary branch."
+        )
+    stash_ref = None
+    promoted = False
+    try:
+        # This is deliberately the first worktree-mutating operation. In
+        # particular, package-lock and local-patches edits are captured too.
+        stash_ref = _stash_local_changes_if_needed(git_cmd, root)
+        if original_branch != branch:
+            checkout = subprocess.run(
+                git_cmd + ["checkout", branch],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            if checkout.returncode != 0:
+                detail = (checkout.stderr or checkout.stdout or "").strip()
+                raise RuntimeError(
+                    f"Could not switch to local maintenance branch '{branch}': "
+                    f"{detail.splitlines()[0] if detail else 'git checkout failed'}"
+                )
+        result = _upgrade_release_transaction(git_cmd, root, release_tag, target_sha)
+        promoted = True
+        if stash_ref is not None:
+            restored = _restore_stashed_changes(
+                git_cmd, root, stash_ref, prompt_user=False, input_fn=input_fn
+            )
+            if not restored:
+                raise RuntimeError(
+                    f"Upgrade promoted, but local changes remain in stash {stash_ref}; "
+                    "resolve the restore conflict before continuing."
+                )
+        return result
+    except Exception:
+        if not promoted and original_branch and original_branch != branch:
+            subprocess.run(
+                git_cmd + ["checkout", original_branch],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+        if stash_ref is not None and not promoted:
+            _restore_stashed_changes(
+                git_cmd, root, stash_ref, prompt_user=False, input_fn=input_fn
+            )
+        raise
 
 
 _UPDATE_RUNTIME_RELOAD_MODULES = (
@@ -121,23 +1073,25 @@ def _capture_head_sha(git_cmd, cwd) -> str | None:
 _LOCAL_PATCHES_DIRNAME = "local-patches"
 _LOCAL_PATCHES_README = """# Hermes local release patches
 
-These patches are versioned on the ``hermes-release`` maintenance branch.
+These artifacts are maintained on the ``hermes-release`` branch.
 
-``hermes upgrade`` snapshots them **before** ``git reset --hard`` to the
-release tag (so in-repo copies survive the reset), reapplies every ``*.patch``
-(sorted by name), commits the result, then refreshes
-``0001-local-maintenance.patch``.
+``hermes upgrade`` captures user changes before any cleanup, generates the
+maintenance payload from committed Git history (not this file), replays it in
+a temporary candidate worktree with ``git apply --3way --index``, validates the
+candidate, and only then promotes it.  The generated patch is a portable,
+byte-safe snapshot for inspection and recovery; it is never the sole source of
+truth for an upgrade.
 
-The generated patch deliberately excludes this directory (``:!(local-patches)``)
-so the series does not try to patch itself.
+The payload excludes this directory so the series cannot patch itself.  The
+JSON ``.release_base`` file records the human release tag, immutable base SHA,
+and patch hash/size.  A missing or stale patch artifact therefore cannot make a
+committed local change disappear.
 
 ## Regenerate after editing local customizations
 
-```bash
-cd ~/.hermes/hermes-agent
-git diff v2026.x.y HEAD -- . ':!(local-patches)' > local-patches/0001-local-maintenance.patch
-git add local-patches && git commit -m "local: refresh patches"
-```
+Run ``hermes upgrade``.  It atomically refreshes this directory after the
+candidate has been committed and validated.  Manual edits to these artifacts
+are stashed and restored like every other user edit.
 
 ## Keep out of this series
 
@@ -172,11 +1126,15 @@ def _iter_patch_files(patches_dir: Path):
     if not patches_dir.is_dir():
         return
     for path in sorted(patches_dir.iterdir()):
+        try:
+            info = path.lstat()
+        except OSError:
+            continue
         if (
-            path.is_file()
+            stat.S_ISREG(info.st_mode)
             and path.suffix == ".patch"
             and not path.name.startswith(".")
-            and path.stat().st_size > 0
+            and info.st_size > 0
         ):
             yield path
 
@@ -1438,18 +2396,10 @@ def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[st
         print("→ Clearing unmerged index entries from a previous conflict...")
         subprocess.run(git_cmd + ["reset"], cwd=cwd, capture_output=True)
 
-    from datetime import datetime, timezone
-
-    stash_name = datetime.now(timezone.utc).strftime(
-        "hermes-update-autostash-%Y%m%d-%H%M%S"
+    stash_name = (
+        f"hermes-update-autostash-{os.getpid()}-{uuid.uuid4().hex}"
     )
     print("→ Local changes detected — stashing before update...")
-    prev_stash = subprocess.run(
-        git_cmd + ["rev-parse", "--verify", "refs/stash"],
-        cwd=cwd,
-        capture_output=True,
-        text=True, encoding="utf-8", errors="replace",
-    ).stdout.strip()
     push = subprocess.run(
         git_cmd + ["stash", "push", "--include-untracked", "-m", stash_name],
         cwd=cwd,
@@ -1458,47 +2408,40 @@ def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[st
     )
     if push.stdout.strip():
         print(push.stdout.strip())
-    stash_probe = subprocess.run(
-        git_cmd + ["rev-parse", "--verify", "refs/stash"],
+    stash_ref = ""
+    stash_list = subprocess.run(
+        git_cmd + ["stash", "list", "--format=%H%x00%gs"],
         cwd=cwd,
         capture_output=True,
         text=True, encoding="utf-8", errors="replace",
     )
-    stash_ref = stash_probe.stdout.strip()
-    stash_created = (
-        stash_probe.returncode == 0 and bool(stash_ref) and stash_ref != prev_stash
-    )
+    if stash_list.returncode == 0:
+        for line in stash_list.stdout.splitlines():
+            commit, separator, subject = line.partition("\0")
+            if separator and stash_name in subject and _SHA_RE.fullmatch(commit.strip()):
+                stash_ref = commit.strip()
+                break
+    stash_created = bool(stash_ref)
 
     if push.returncode != 0:
         if stash_created:
-            # git stash push exits non-zero when it saved everything but could
-            # not delete some swept untracked files from the working tree
-            # (e.g. a root-owned directory: "warning: failed to remove ...:
-            # Permission denied").  The stash entry is complete — the changes
-            # are safe — so this is not a failure.  Leave the undeletable
-            # files in place and continue the update.
+            # git stash push can save the entry but fail to remove an
+            # undeletable untracked file.  The exact marker above proves this
+            # process owns the entry; never infer ownership from refs/stash
+            # merely changing underneath us.
             if push.stderr.strip():
                 print(push.stderr.strip())
             print(
                 "  ⚠ Some untracked files could not be removed from the "
-                "working tree (permission denied)."
+                "working tree (permission denied); they remain preserved in "
+                f"stash {stash_ref}."
             )
-            print(
-                "    They were still saved to the stash and were left in "
-                "place — the update will continue."
-            )
-            # A partially-failed stash push also aborts its working-tree
-            # cleanup for TRACKED modifications — they are saved in the stash
-            # but still dirty the tree, which would break the checkout/pull
-            # that follows. Safe to reset: everything is in the stash entry.
             subprocess.run(
                 git_cmd + ["reset", "--hard", "HEAD"],
                 cwd=cwd,
                 capture_output=True,
             )
         else:
-            # No stash entry was created: the changes were NOT saved.  This
-            # is a real failure — bail out before the update touches HEAD.
             print("✗ Could not stash local changes — update aborted.")
             if push.stderr.strip():
                 print(f"  {push.stderr.strip().splitlines()[0]}")
@@ -1510,6 +2453,12 @@ def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[st
                 push.returncode, push.args, output=push.stdout, stderr=push.stderr
             )
 
+    if not stash_created:
+        print("✗ Could not identify the exact autostash entry — update aborted.")
+        raise RuntimeError(
+            "The local changes may not be safely stashed; inspect `git stash list` "
+            "and recover before retrying."
+        )
     return stash_ref
 
 def _resolve_stash_selector(
@@ -3740,46 +4689,15 @@ def _resume_windows_gateways_after_update(token: dict | None) -> None:
         )
 
 def _discard_lockfile_churn(git_cmd, repo_root):
-    """Restore tracked ``package-lock.json`` files that npm dirtied locally.
+    """Compatibility hook that deliberately never discards user lockfile edits.
 
-    npm rewrites lockfiles non-deterministically at install/build time. On a
-    managed install those diffs are never intentional, so we discard them so
-    ``hermes update`` sees a clean tree instead of autostashing every run.
-    Best-effort; only ever touches files named ``package-lock.json``.
+    ``package-lock.json`` is ordinary tracked user data.  Older versions used
+    ``git checkout --`` here before the stash probe, which silently destroyed an
+    intentional edit.  The update transaction now stashes the complete dirty
+    tree first; npm may still normalize the lockfile later, but no pre-stash
+    cleanup is safe to perform.
     """
-    try:
-        diff = subprocess.run(
-            git_cmd + ["diff", "--name-only"],
-            cwd=repo_root,
-            capture_output=True,
-            text=True, encoding="utf-8", errors="replace",
-        )
-        if diff.returncode != 0:
-            return
-        dirty_package_dirs = {
-            Path(line.strip()).parent
-            for line in diff.stdout.splitlines()
-            if line.strip().endswith("package.json")
-        }
-        dirty = [
-            line.strip()
-            for line in diff.stdout.splitlines()
-            if line.strip().endswith("package-lock.json")
-            and Path(line.strip()).parent not in dirty_package_dirs
-        ]
-        if not dirty:
-            return
-        subprocess.run(
-            git_cmd + ["checkout", "--", *dirty],
-            cwd=repo_root,
-            capture_output=True,
-            text=True, encoding="utf-8", errors="replace",
-            check=False,
-        )
-        print(f"→ Discarded npm lockfile churn ({len(dirty)} file(s))")
-    except Exception:
-        # Never let lockfile cleanup block an update.
-        pass
+    return None
 
 def _normalize_managed_eol(git_cmd, repo_root):
     """Take a managed checkout off ``core.autocrlf=true`` without leaving it dirty.
@@ -3902,6 +4820,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
         else None
     )
     assume_yes = bool(getattr(args, "yes", False))
+    release_tag = getattr(args, "release_tag", None)
+    release_repo_lock = None
+    release_target = None
+    release_transaction_result = None
 
     # Whether this update is running without a human at the keyboard.
     # Interactive terminal updates always stash-and-ask (unchanged behavior);
@@ -4015,7 +4937,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
     # On Windows, git can fail with "unable to write loose object file: Invalid argument"
     # due to filesystem atomicity issues. Set the recommended workaround.
-    if sys.platform == "win32" and git_dir.exists():
+    if sys.platform == "win32" and git_dir.exists() and not release_tag:
         subprocess.run(
             [
                 "git",
@@ -4042,11 +4964,13 @@ def _cmd_update_impl(args, gateway_mode: bool):
     # tree dirty — forcing an autostash on every update and making branch
     # switches fragile. Restoring them first lets the common case (only
     # lockfile churn) update with a clean tree.
-    _discard_lockfile_churn(git_cmd, _m().PROJECT_ROOT)
+    if not release_tag:
+        _discard_lockfile_churn(git_cmd, _m().PROJECT_ROOT)
     # Same rationale, different generator: line-ending churn is machine-made
     # dirt on a managed checkout, so clear it (and stop generating it) before
     # the stash/branch logic rather than autostashing the entire tree.
-    _normalize_managed_eol(git_cmd, _m().PROJECT_ROOT)
+    if not release_tag:
+        _normalize_managed_eol(git_cmd, _m().PROJECT_ROOT)
 
     # Detect if we're updating from a fork (before any branch logic)
     origin_url = _m()._get_origin_url(git_cmd, _m().PROJECT_ROOT)
@@ -4067,27 +4991,45 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
     # Fetch and pull
     try:
+        if release_tag:
+            release_repo_lock = RepositoryUpdateLock(_m().PROJECT_ROOT, git_cmd)
+            try:
+                release_repo_lock.acquire()
+            except RuntimeError as exc:
+                print(f"✗ Could not acquire the repository update lock: {exc}")
+                sys.exit(1)
 
         # Resolve the target ref up front so the fetch can be scoped to it.
         # A bare `git fetch origin` pulls every ref, and this repo carries
         # thousands of auto-generated branches — an unscoped fetch can stall for
         # minutes on a non-single-branch checkout. Fetch only what we update
         # against.
-        release_tag = getattr(args, "release_tag", None)
         branch = "hermes-release" if release_tag else _m()._resolve_update_branch(args)
 
-        print("→ Fetching updates...")
-        fetch_args = (
-            ["fetch", "origin", "--tags"]
-            if release_tag
-            else ["fetch", "origin", branch]
-        )
-        fetch_result = subprocess.run(
-            git_cmd + fetch_args,
-            cwd=_m().PROJECT_ROOT,
-            capture_output=True,
-            text=True, encoding="utf-8", errors="replace",
-        )
+        if release_tag:
+            print("→ Resolving exact release target...")
+            try:
+                release_target = _resolve_release_target(
+                    git_cmd, _m().PROJECT_ROOT, release_tag
+                )
+            except RuntimeError as exc:
+                print(f"✗ Could not resolve Release {release_tag}.")
+                print(f"  {exc}")
+                sys.exit(1)
+            fetch_result = subprocess.CompletedProcess(
+                git_cmd + ["fetch", "--no-tags", "origin"],
+                returncode=0,
+                stdout="",
+                stderr="",
+            )
+        else:
+            print("→ Fetching updates...")
+            fetch_result = subprocess.run(
+                git_cmd + ["fetch", "origin", branch],
+                cwd=_m().PROJECT_ROOT,
+                capture_output=True,
+                text=True, encoding="utf-8", errors="replace",
+            )
         if fetch_result.returncode != 0:
             stderr = fetch_result.stderr.strip()
             if "Could not resolve host" in stderr or "unable to access" in stderr:
@@ -4117,54 +5059,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
         if release_tag:
             print(f"→ Target Release: {release_tag}")
-            tag_result = subprocess.run(
-                git_cmd + ["rev-parse", "--verify", f"{release_tag}^{{commit}}"],
-                cwd=_m().PROJECT_ROOT,
-                capture_output=True,
-                text=True, encoding="utf-8", errors="replace",
-            )
-            if tag_result.returncode != 0:
-                print(f"✗ Release tag '{release_tag}' was not found after fetching tags.")
-                sys.exit(1)
-
-            auto_stash_ref = _m()._stash_local_changes_if_needed(git_cmd, _m().PROJECT_ROOT)
-            if current_branch != branch:
-                label = (
-                    "detached HEAD"
-                    if current_branch == "HEAD"
-                    else f"branch '{current_branch}'"
-                )
-                print(f"  ⚠ Currently on {label} — switching to {branch} for upgrade...")
-                local_branch = subprocess.run(
-                    git_cmd + ["rev-parse", "--verify", branch],
-                    cwd=_m().PROJECT_ROOT,
-                    capture_output=True,
-                    text=True, encoding="utf-8", errors="replace",
-                )
-                checkout_args = (
-                    ["checkout", branch]
-                    if local_branch.returncode == 0
-                    else ["checkout", "-B", branch]
-                )
-                checkout_result = subprocess.run(
-                    git_cmd + checkout_args,
-                    cwd=_m().PROJECT_ROOT,
-                    capture_output=True,
-                    text=True, encoding="utf-8", errors="replace",
-                )
-                if checkout_result.returncode != 0:
-                    if auto_stash_ref is not None:
-                        _m()._restore_stashed_changes(
-                            git_cmd,
-                            _m().PROJECT_ROOT,
-                            auto_stash_ref,
-                            prompt_user=False,
-                            input_fn=gw_input_fn,
-                        )
-                    print(f"✗ Could not switch to local maintenance branch '{branch}'.")
-                    if checkout_result.stderr.strip():
-                        print(f"  {checkout_result.stderr.strip().splitlines()[0]}")
-                    sys.exit(1)
+            auto_stash_ref = None
         # If user is on a different branch than the update target, switch
         # to the target. When the target is "main" this is the historical
         # "always update against main" behavior; for any other target it's
@@ -4222,8 +5117,24 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
         # Check if there are updates.
         if release_tag:
+            maintenance_sha = _git_resolve_commit(
+                git_cmd, _m().PROJECT_ROOT, f"refs/heads/{branch}"
+            )
+            if maintenance_sha is None:
+                print(
+                    "✗ Local maintenance branch 'hermes-release' is missing; "
+                    "create it from an official release and initialize "
+                    "local-patches/.release_base before upgrading."
+                )
+                sys.exit(1)
             release_merged = subprocess.run(
-                git_cmd + ["merge-base", "--is-ancestor", release_tag, "HEAD"],
+                git_cmd
+                + [
+                    "merge-base",
+                    "--is-ancestor",
+                    release_target.target_sha,
+                    f"refs/heads/{branch}",
+                ],
                 cwd=_m().PROJECT_ROOT,
                 capture_output=True,
                 text=True, encoding="utf-8", errors="replace",
@@ -4354,7 +5265,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             print(f"→ Found {commit_count} new commit(s)")
 
         print(
-            "→ Resetting maintenance branch to release, then reapplying local patches..."
+            "→ Promoting isolated release candidate..."
             if release_tag
             else "→ Pulling updates..."
         )
@@ -4367,32 +5278,24 @@ def _cmd_update_impl(args, gateway_mode: bool):
         pre_pull_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
         try:
             if release_tag:
-                # Avoid merging the whole release into a diverged maintenance
-                # branch (that repeatedly conflicts with local patches). Reset
-                # to the tag, then replay in-repo local-patches/ instead.
-                pull_result = _upgrade_release_with_local_patches(
-                    git_cmd, _m().PROJECT_ROOT, release_tag
-                )
-                if pull_result.returncode != 0:
-                    print(f"✗ Could not upgrade to Release {release_tag}.")
-                    err = (pull_result.stderr or pull_result.stdout or "").strip()
-                    if err:
-                        print(f"  {err.splitlines()[0]}")
-                    if pre_pull_sha:
-                        print(f"→ Restoring previous HEAD {pre_pull_sha[:10]}...")
-                        subprocess.run(
-                            git_cmd + ["reset", "--hard", pre_pull_sha],
-                            cwd=_m().PROJECT_ROOT,
-                            capture_output=True,
-                            text=True,
-                            encoding="utf-8",
-                            errors="replace",
-                        )
-                    print(
-                        "  Update or regenerate patches under "
-                        f"{_local_patches_dir()}, then re-run: hermes upgrade"
+                try:
+                    release_transaction_result = _prepare_and_promote_release(
+                        git_cmd,
+                        _m().PROJECT_ROOT,
+                        release_tag,
+                        release_target.target_sha,
+                        input_fn=gw_input_fn,
                     )
+                except RuntimeError as exc:
+                    print(f"✗ Could not upgrade to Release {release_tag}.")
+                    print(f"  {exc}")
                     sys.exit(1)
+                pull_result = subprocess.CompletedProcess(
+                    ["hermes-release-transaction", release_tag],
+                    returncode=0,
+                    stdout="",
+                    stderr="",
+                )
             else:
                 # Merge the ref we already fetched above (→ Fetching updates...)
                 # instead of `git pull`, which performs a SECOND network fetch of
@@ -4434,9 +5337,15 @@ def _cmd_update_impl(args, gateway_mode: bool):
             # ruff check), this catches it on the user side and rolls back
             # so the CLI stays bootable. The user can then retry ``hermes
             # update`` later once a fix lands upstream.
-            syntax_ok, failing_path, syntax_error = _validate_critical_files_syntax(
-                _m().PROJECT_ROOT
-            )
+            if release_tag:
+                # The isolated candidate was syntax/import validated before
+                # promotion. Do not run the ordinary post-pull rollback path
+                # against the already-promoted live checkout.
+                syntax_ok, failing_path, syntax_error = True, None, None
+            else:
+                syntax_ok, failing_path, syntax_error = _validate_critical_files_syntax(
+                    _m().PROJECT_ROOT
+                )
             if not syntax_ok:
                 print()
                 print("✗ Pulled code has a syntax error in a critical file:")
@@ -5873,6 +6782,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
         else:
             print(f"✗ Update failed: {e}")
             sys.exit(1)
+    finally:
+        if release_repo_lock is not None:
+            release_repo_lock.release()
 
 # --- Hoisted from the body of _cmd_update_impl (self-contained, no closure state) ---
 

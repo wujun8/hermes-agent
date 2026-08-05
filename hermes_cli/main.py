@@ -9124,32 +9124,20 @@ def _cmd_upgrade_check() -> None:
         git_cmd = ["git", "-c", "windows.appendAtomically=false"]
 
     print(f"→ Latest Release: {latest_tag}")
-    print("→ Fetching release tags...")
-    fetch_result = subprocess.run(
-        git_cmd + ["fetch", "origin", "--tags"],
-        cwd=PROJECT_ROOT,
-        capture_output=True,
-        text=True,
-    )
-    if fetch_result.returncode != 0:
-        stderr = fetch_result.stderr.strip()
-        print("✗ Failed to fetch release tags.")
-        if stderr:
-            print(f"  {stderr.splitlines()[0]}")
-        sys.exit(1)
+    print("→ Fetching exact release tag...")
+    from hermes_cli import update_cmd
 
-    tag_result = subprocess.run(
-        git_cmd + ["rev-parse", "--verify", f"{latest_tag}^{{commit}}"],
-        cwd=PROJECT_ROOT,
-        capture_output=True,
-        text=True,
-    )
-    if tag_result.returncode != 0:
-        print(f"✗ Release tag '{latest_tag}' was not found after fetching tags.")
+    try:
+        release_target = update_cmd._resolve_release_target(
+            git_cmd, PROJECT_ROOT, latest_tag
+        )
+    except RuntimeError as exc:
+        print(f"✗ Could not resolve Release {latest_tag}.")
+        print(f"  {exc}")
         sys.exit(1)
 
     release_merged = subprocess.run(
-        git_cmd + ["merge-base", "--is-ancestor", latest_tag, "HEAD"],
+        git_cmd + ["merge-base", "--is-ancestor", release_target.target_sha, "HEAD"],
         cwd=PROJECT_ROOT,
         capture_output=True,
         text=True,
@@ -9204,9 +9192,21 @@ def cmd_upgrade(args):
 
     gateway_mode = getattr(args, "gateway", False)
     _update_io_state = _install_hangup_protection(gateway_mode=gateway_mode)
+    from hermes_cli.update_lock import (
+        UPDATE_EXIT_CONCURRENT,
+        UpdateLock,
+        describe_holder,
+    )
+
+    _update_lock = UpdateLock()
+    if not _update_lock.acquire():
+        print(describe_holder(_update_lock.holder))
+        _finalize_update_output(_update_io_state)
+        sys.exit(UPDATE_EXIT_CONCURRENT)
     try:
         _cmd_update_impl(args, gateway_mode=gateway_mode)
     finally:
+        _update_lock.release()
         _finalize_update_output(_update_io_state)
 
 def _cmd_update_pip(args):
