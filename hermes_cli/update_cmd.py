@@ -454,6 +454,17 @@ class ReleaseGitStateError(RuntimeError):
     """The live checkout no longer matches a durable release snapshot."""
 
 
+class ReleaseFinalizationIncompleteError(RuntimeError):
+    """Release user-state finalization did not reach a verified terminal state."""
+
+    def __init__(self, journal_path: Path | str):
+        self.journal_path = Path(journal_path)
+        super().__init__(
+            "Release finalization incomplete; recovery journal retained at "
+            f"{self.journal_path}."
+        )
+
+
 def _release_snapshot_text(value: object, *, label: str, limit: int) -> str:
     if not isinstance(value, str) or not value or len(value) > limit:
         raise ReleaseGitStateError(f"Release transaction snapshot has an invalid {label}.")
@@ -2771,7 +2782,13 @@ def _prepare_and_promote_release(
                 cwd=root,
                 capture_output=True,
             )
-        _finalize_release_upgrade(git_cmd, root, context, input_fn=input_fn)
+        _finalize_release_upgrade_for_orchestration(
+            git_cmd,
+            root,
+            context,
+            input_fn=input_fn,
+            primary_exc_info=sys.exc_info(),
+        )
         raise
 
 
@@ -3979,8 +3996,67 @@ def _finalize_release_upgrade(
         return False
 
 
+def _finalize_release_upgrade_for_orchestration(
+    git_cmd: list[str],
+    cwd: Path | str,
+    context: ReleaseUpgradeContext,
+    *,
+    input_fn=None,
+    primary_exc_info=None,
+) -> bool:
+    """Apply finalization precedence at the release orchestration boundary.
 
+    The transaction finalizer owns durable cleanup and its detailed warning.
+    This boundary is the sole owner of converting an otherwise-successful
+    ``False`` result into a command failure.  When a primary exception is
+    already active, every finalizer failure is logged and suppressed so the
+    original exception (including process-control exceptions) remains the one
+    that propagates.
+    """
 
+    primary = primary_exc_info[1] if primary_exc_info is not None else None
+    journal_path = getattr(context, "journal_path", "<unknown>")
+    try:
+        finalized = _finalize_release_upgrade(
+            git_cmd,
+            cwd,
+            context,
+            input_fn=input_fn,
+        )
+    except (KeyboardInterrupt, SystemExit) as exc:
+        if primary is None:
+            # With no primary operation failure, finalizer process-control
+            # semantics are authoritative and must not be converted to a
+            # normal upgrade error.
+            raise
+        logger.warning(
+            "Release finalizer raised %s while preserving the primary exception; "
+            "journal retained at %s",
+            type(exc).__name__,
+            journal_path,
+        )
+        return False
+    except BaseException as exc:
+        if primary is None:
+            raise ReleaseFinalizationIncompleteError(journal_path) from exc
+        logger.warning(
+            "Release finalizer raised %s while preserving the primary exception; "
+            "journal retained at %s",
+            type(exc).__name__,
+            journal_path,
+        )
+        return False
+
+    if finalized:
+        return True
+    if primary is not None:
+        logger.warning(
+            "Release finalization incomplete; preserving the primary exception; "
+            "journal retained at %s",
+            journal_path,
+        )
+        return False
+    raise ReleaseFinalizationIncompleteError(journal_path)
 
 
 _UPDATE_RUNTIME_RELOAD_MODULES = (
@@ -7814,6 +7890,8 @@ def _cmd_update_impl(args, gateway_mode: bool):
     release_target = None
     release_transaction_result = None
     release_upgrade_context = None
+    release_success_banner_pending = False
+    release_completion_banner_pending = False
     update_succeeded = False
 
     # Whether this update is running without a human at the keyboard.
@@ -8373,6 +8451,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 sys.exit(1)
 
             update_succeeded = True
+            if release_tag:
+                # Do not announce success until the durable user-state
+                # finalizer has returned True.  A retained recovery journal is
+                # a failed command, not a successful upgrade with a warning.
+                release_success_banner_pending = True
         finally:
             if auto_stash_ref is not None:
                 # Don't attempt stash restore if the code update itself failed —
@@ -8601,8 +8684,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 else:
                     print("  ✓ Desktop app up to date")
 
-        print()
-        print("✓ Code updated!")
+        if not release_tag:
+            print()
+            print("✓ Code updated!")
 
         # ── Post-update state.db integrity guard (#68474) ─────────────────
         # Verify that state.db survived the update intact.  If the live file
@@ -8943,7 +9027,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
             print("  Code and Python deps are updated, but the dashboard/TUI may")
             print("  be in a mixed state until the Node deps are rebuilt.")
         else:
-            print("✓ Update complete!")
+            if release_tag:
+                release_completion_banner_pending = True
+            else:
+                print("✓ Update complete!")
 
         # Search-index optimization notice (v23). Existing installs keep their
         # working search index untouched on update; the compact v23 layout —
@@ -9793,15 +9880,34 @@ def _cmd_update_impl(args, gateway_mode: bool):
             print(f"✗ Update failed: {e}")
             sys.exit(1)
     finally:
-        if release_upgrade_context is not None:
-            _finalize_release_upgrade(
-                git_cmd,
-                _m().PROJECT_ROOT,
-                release_upgrade_context,
-                input_fn=gw_input_fn,
-            )
-        if release_repo_lock is not None:
-            release_repo_lock.release()
+        # Finalization is the release transaction's sole top-level success
+        # owner.  Capture the active exception before entering it so a failed
+        # cleanup can never replace the operation failure already in flight.
+        primary_exc_info = sys.exc_info()
+        try:
+            release_finalization_verified = False
+            if release_upgrade_context is not None:
+                release_finalization_verified = _finalize_release_upgrade_for_orchestration(
+                    git_cmd,
+                    _m().PROJECT_ROOT,
+                    release_upgrade_context,
+                    input_fn=gw_input_fn,
+                    primary_exc_info=primary_exc_info,
+                )
+            if (
+                release_finalization_verified
+                and primary_exc_info[0] is None
+            ):
+                if release_success_banner_pending:
+                    print()
+                    print("✓ Code updated!")
+                if release_completion_banner_pending:
+                    print("✓ Update complete!")
+        finally:
+            # Keep lock release outside the finalizer's failure path, exactly
+            # once, while the release context is still protected above.
+            if release_repo_lock is not None:
+                release_repo_lock.release()
 
 # --- Hoisted from the body of _cmd_update_impl (self-contained, no closure state) ---
 

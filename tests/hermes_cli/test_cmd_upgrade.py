@@ -411,3 +411,352 @@ def test_cmd_upgrade_replays_release_through_isolated_transaction(tmp_path):
     assert (repo / "upstream.txt").read_text(encoding="utf-8") == "release payload\n"
     assert (repo / "local.txt").read_text(encoding="utf-8") == "local maintenance\n"
     assert git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip() == "hermes-release"
+
+
+def _finalization_context(tmp_path):
+    return SimpleNamespace(journal_path=tmp_path / "release-finalization.json")
+
+
+def test_release_finalization_false_raises_dedicated_failure_with_journal_path(
+    tmp_path, monkeypatch
+):
+    from hermes_cli import update_cmd
+
+    context = _finalization_context(tmp_path)
+    finalizer = Mock(return_value=False)
+    monkeypatch.setattr(update_cmd, "_finalize_release_upgrade", finalizer)
+
+    with pytest.raises(
+        update_cmd.ReleaseFinalizationIncompleteError,
+        match=f"{context.journal_path}",
+    ):
+        update_cmd._finalize_release_upgrade_for_orchestration(
+            ["git"], tmp_path, context
+        )
+
+    finalizer.assert_called_once_with(
+        ["git"], tmp_path, context, input_fn=None
+    )
+
+
+@pytest.mark.parametrize(
+    "primary_factory",
+    [
+        lambda: RuntimeError("primary transaction failure"),
+        KeyboardInterrupt,
+    ],
+)
+def test_release_finalization_false_preserves_active_primary_exception(
+    tmp_path, monkeypatch, primary_factory
+):
+    from hermes_cli import update_cmd
+    import sys
+
+    context = _finalization_context(tmp_path)
+    monkeypatch.setattr(update_cmd, "_finalize_release_upgrade", Mock(return_value=False))
+    primary = primary_factory()
+
+    with pytest.raises(type(primary)) as exc_info:
+        try:
+            raise primary
+        except BaseException:
+            update_cmd._finalize_release_upgrade_for_orchestration(
+                ["git"], tmp_path, context, primary_exc_info=sys.exc_info()
+            )
+            raise
+
+    assert exc_info.value is primary
+    assert str(exc_info.value) == str(primary)
+
+
+@pytest.mark.parametrize(
+    "finalizer_control",
+    [KeyboardInterrupt(), SystemExit(17)],
+)
+def test_release_finalizer_process_control_preserves_primary_and_lock_order(
+    tmp_path, monkeypatch, finalizer_control
+):
+    from hermes_cli import update_cmd
+    import sys
+
+    context = _finalization_context(tmp_path)
+    monkeypatch.setattr(
+        update_cmd,
+        "_finalize_release_upgrade",
+        Mock(side_effect=finalizer_control),
+    )
+    primary = RuntimeError("primary remains authoritative")
+
+    with pytest.raises(RuntimeError) as exc_info:
+        try:
+            raise primary
+        except BaseException:
+            update_cmd._finalize_release_upgrade_for_orchestration(
+                ["git"], tmp_path, context, primary_exc_info=sys.exc_info()
+            )
+            raise
+
+    assert exc_info.value is primary
+
+
+@pytest.mark.parametrize(
+    "finalizer_control",
+    [KeyboardInterrupt(), SystemExit(23)],
+)
+def test_release_finalizer_process_control_propagates_without_primary(
+    tmp_path, monkeypatch, finalizer_control
+):
+    from hermes_cli import update_cmd
+
+    context = _finalization_context(tmp_path)
+    monkeypatch.setattr(
+        update_cmd,
+        "_finalize_release_upgrade",
+        Mock(side_effect=finalizer_control),
+    )
+
+    with pytest.raises(type(finalizer_control)) as exc_info:
+        update_cmd._finalize_release_upgrade_for_orchestration(
+            ["git"], tmp_path, context
+        )
+
+    assert exc_info.value is finalizer_control
+
+
+def test_release_finalization_true_remains_successful(tmp_path, monkeypatch):
+    from hermes_cli import update_cmd
+
+    context = _finalization_context(tmp_path)
+    finalizer = Mock(return_value=True)
+    monkeypatch.setattr(update_cmd, "_finalize_release_upgrade", finalizer)
+
+    assert (
+        update_cmd._finalize_release_upgrade_for_orchestration(
+            ["git"], tmp_path, context
+        )
+        is True
+    )
+    finalizer.assert_called_once()
+
+
+def _run_mocked_top_level_release_update(
+    tmp_path,
+    monkeypatch,
+    *,
+    finalizer_result=True,
+    post_success_exception=None,
+    state_sink=None,
+):
+    """Run the real update owner with every unrelated update operation inert."""
+    from hermes_cli import backup, config, gateway, model_catalog, profiles, update_cmd
+    from hermes_cli import managed_uv
+    from tools import skills_sync
+
+    repo = tmp_path / "release-owner-repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    args = SimpleNamespace(
+        release_tag="v1.2.3",
+        yes=True,
+        force=False,
+        force_venv=False,
+    )
+    target = update_cmd.ReleaseTarget(
+        tag=args.release_tag,
+        target_sha="3" * 40,
+        ref="refs/hermes-upgrade/tags/v1.2.3",
+    )
+    maintenance_sha = "4" * 40
+    context = SimpleNamespace(journal_path=tmp_path / "release-finalization.json")
+    events = []
+    lock_instances = []
+
+    class FakeRepositoryUpdateLock:
+        def __init__(self, repo_root, git_cmd):
+            self.repo_root = repo_root
+            self.git_cmd = git_cmd
+            self.acquire_calls = 0
+            self.release_calls = 0
+            lock_instances.append(self)
+
+        def acquire(self):
+            self.acquire_calls += 1
+            return self
+
+        def release(self):
+            self.release_calls += 1
+            events.append("lock-release")
+
+    def fake_run(cmd, **kwargs):
+        if "--abbrev-ref" in cmd:
+            return _git_completed(cmd, stdout="hermes-release\n")
+        if "merge-base" in cmd:
+            return _git_completed(cmd, returncode=1)
+        raise AssertionError(f"unexpected subprocess call: {cmd!r}")
+
+    transaction = Mock(
+        return_value=SimpleNamespace(target_sha=target.target_sha, context=context)
+    )
+    def finalize_release(*args, **kwargs):
+        events.append("finalize")
+        return finalizer_result
+
+    finalizer = Mock(side_effect=finalize_release)
+    clear_bytecode = Mock(return_value=0)
+    if post_success_exception is not None:
+        clear_bytecode.side_effect = post_success_exception
+
+    monkeypatch.setattr(hm, "PROJECT_ROOT", repo)
+    monkeypatch.setattr(hm, "_is_windows", lambda: False)
+    monkeypatch.setattr(hm, "_run_pre_update_backup", lambda _args: None)
+    monkeypatch.setattr(hm, "_pause_windows_gateways_for_update", lambda: None)
+    monkeypatch.setattr(hm, "_resume_windows_gateways_after_update", lambda _state: None)
+    monkeypatch.setattr(
+        hm,
+        "_get_origin_url",
+        lambda _git_cmd, _repo: "https://github.com/NousResearch/hermes-agent.git",
+    )
+    monkeypatch.setattr(hm, "_clear_bytecode_cache", clear_bytecode)
+    monkeypatch.setattr(hm, "_record_bytecode_fingerprint", lambda: None)
+    monkeypatch.setattr(hm, "_reload_updated_runtime_modules", lambda: None)
+    monkeypatch.setattr(hm, "_clear_update_incomplete_marker", lambda: None)
+    monkeypatch.setattr(hm, "_clear_lazy_refresh_incomplete_marker", lambda: None)
+    monkeypatch.setattr(hm, "_upgrade_pip_before_lazy_refresh", lambda *args, **kwargs: None)
+    monkeypatch.setattr(hm, "_refresh_active_lazy_features", lambda *args, **kwargs: True)
+    monkeypatch.setattr(hm, "_refresh_active_memory_provider_dependencies", lambda: None)
+    monkeypatch.setattr(hm, "_is_termux_env", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(hm, "_install_python_dependencies_with_optional_fallback", lambda *args, **kwargs: None)
+    monkeypatch.setattr(hm, "_build_web_ui", lambda *args, **kwargs: True)
+    monkeypatch.setattr(hm, "_desktop_packaged_executable", lambda *_args: None)
+    monkeypatch.setattr(hm, "_desktop_dist_exists", lambda *_args: False)
+    monkeypatch.setattr(hm, "_resolve_node_runtime_npm", lambda: None)
+    monkeypatch.setattr(managed_uv, "ensure_uv", lambda: "/fake/uv")
+    monkeypatch.setattr(managed_uv, "update_managed_uv", lambda: None)
+
+    monkeypatch.setattr(update_cmd, "_is_fork", lambda _origin: False)
+    monkeypatch.setattr(update_cmd, "_resolve_release_target", Mock(return_value=target))
+    monkeypatch.setattr(update_cmd, "_git_resolve_commit", lambda *_args: maintenance_sha)
+    monkeypatch.setattr(update_cmd, "_capture_head_sha", lambda *_args: maintenance_sha)
+    monkeypatch.setattr(update_cmd, "_prepare_and_promote_release", transaction)
+    monkeypatch.setattr(update_cmd, "_invalidate_update_cache", lambda: None)
+    monkeypatch.setattr(update_cmd, "_finalize_release_upgrade", finalizer)
+    monkeypatch.setattr(update_cmd, "_write_update_incomplete_marker", lambda: None)
+    monkeypatch.setattr(update_cmd, "_write_lazy_refresh_incomplete_marker", lambda: None)
+    monkeypatch.setattr(update_cmd, "_upgrade_pip_before_lazy_refresh", lambda *args, **kwargs: None)
+    monkeypatch.setattr(update_cmd, "_refresh_active_lazy_features", lambda *args, **kwargs: True)
+    monkeypatch.setattr(update_cmd, "_refresh_active_memory_provider_dependencies", lambda: None)
+    monkeypatch.setattr(update_cmd, "_validate_critical_modules_import", lambda *_args: (True, None, None))
+    monkeypatch.setattr(update_cmd, "_update_node_dependencies", lambda: [])
+    monkeypatch.setattr(update_cmd, "_print_fts_optimize_available_notice", lambda: None)
+    monkeypatch.setattr(update_cmd, "_print_curator_first_run_notice", lambda: None)
+    monkeypatch.setattr(update_cmd, "_print_curator_recent_run_notice", lambda: None)
+    monkeypatch.setattr(update_cmd, "_ensure_fhs_path_guard", lambda: None)
+    monkeypatch.setattr(update_cmd, "_ensure_acp_launcher", lambda: None)
+    monkeypatch.setattr(update_cmd, "_finish_dashboard_update_cleanup", lambda *_args: None)
+    monkeypatch.setattr(update_cmd.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(update_cmd, "_warn_incomplete_gateway_fleet_restart", lambda *_args: None)
+    monkeypatch.setattr(update_cmd, "_ensure_uv_for_termux", lambda *_args: None)
+
+    monkeypatch.setattr(config, "load_config", lambda: {})
+    monkeypatch.setattr(config, "get_missing_env_vars", lambda **_kwargs: [])
+    monkeypatch.setattr(config, "get_missing_config_fields", lambda: [])
+    monkeypatch.setattr(config, "check_config_version", lambda: (1, 1))
+    monkeypatch.setattr(config, "migrate_config", lambda **_kwargs: None)
+    monkeypatch.setattr(backup, "restore_cron_jobs_if_emptied", lambda *_args: None)
+    monkeypatch.setattr(model_catalog, "seed_cache_from_checkout", lambda *_args: False)
+    monkeypatch.setattr(skills_sync, "sync_skills", lambda **_kwargs: {
+        "copied": [],
+        "updated": [],
+        "user_modified": [],
+        "cleaned": [],
+        "relocated": [],
+    })
+    monkeypatch.setattr(profiles, "list_profiles", lambda: [])
+    monkeypatch.setattr(profiles, "backfill_profile_envs", lambda **_kwargs: [])
+    monkeypatch.setattr(gateway, "supports_systemd_services", lambda: False)
+    monkeypatch.setattr(gateway, "is_macos", lambda: False)
+    monkeypatch.setattr(gateway, "_get_service_pids", lambda: set())
+    monkeypatch.setattr(gateway, "find_gateway_pids", lambda **_kwargs: [])
+    monkeypatch.setattr(gateway, "find_profile_gateway_processes", lambda **_kwargs: [])
+    monkeypatch.setattr("subprocess.run", fake_run)
+    monkeypatch.setattr(update_cmd, "RepositoryUpdateLock", FakeRepositoryUpdateLock)
+
+    state = {
+        "repo": repo,
+        "context": context,
+        "events": events,
+        "finalizer": finalizer,
+        "lock": None,
+        "clear_bytecode": clear_bytecode,
+    }
+    if state_sink is not None:
+        state_sink.update(state)
+    try:
+        update_cmd._cmd_update_impl(args, gateway_mode=False)
+    finally:
+        assert len(lock_instances) == 1
+        state["lock"] = lock_instances[0]
+        if state_sink is not None:
+            state_sink["lock"] = lock_instances[0]
+    return state
+
+
+def test_cmd_update_impl_finalization_false_fails_without_release_banners(
+    tmp_path, monkeypatch, capsys
+):
+    from hermes_cli import update_cmd
+
+    state = {}
+    with pytest.raises(update_cmd.ReleaseFinalizationIncompleteError) as exc_info:
+        _run_mocked_top_level_release_update(
+            tmp_path, monkeypatch, finalizer_result=False, state_sink=state
+        )
+
+    assert str(exc_info.value).endswith(str(state["context"].journal_path) + ".")
+    output = capsys.readouterr().out
+    assert "✓ Code updated!" not in output
+    assert "✓ Update complete!" not in output
+    assert state["finalizer"].call_count == 1
+    assert state["events"] == ["finalize", "lock-release"]
+    assert state["lock"].release_calls == 1
+
+
+def test_cmd_update_impl_finalization_true_emits_each_release_banner_once(
+    tmp_path, monkeypatch, capsys
+):
+    state = _run_mocked_top_level_release_update(
+        tmp_path, monkeypatch, finalizer_result=True
+    )
+
+    output = capsys.readouterr().out
+    assert output.count("✓ Code updated!") == 1
+    assert output.count("✓ Update complete!") == 1
+    assert state["finalizer"].call_count == 1
+    assert state["events"] == ["finalize", "lock-release"]
+    assert state["lock"].release_calls == 1
+
+
+@pytest.mark.parametrize(
+    "primary",
+    [RuntimeError("top-level update failed"), KeyboardInterrupt()],
+)
+def test_cmd_update_impl_primary_exception_wins_finalization_false(
+    tmp_path, monkeypatch, capsys, primary
+):
+    state = {}
+    with pytest.raises(type(primary)) as exc_info:
+        _run_mocked_top_level_release_update(
+            tmp_path,
+            monkeypatch,
+            finalizer_result=False,
+            post_success_exception=primary,
+            state_sink=state,
+        )
+
+    assert exc_info.value is primary
+    output = capsys.readouterr().out
+    assert "✓ Code updated!" not in output
+    assert "✓ Update complete!" not in output
+    assert state["finalizer"].call_count == 1
+    assert state["events"] == ["finalize", "lock-release"]
+    assert state["lock"].release_calls == 1
