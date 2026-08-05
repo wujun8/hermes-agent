@@ -10,7 +10,10 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from hermes_cli.cli_commands_mixin import CLICommandsMixin
-from hermes_cli.micro_command import execute_micro_command
+from hermes_cli.micro_command import (
+    execute_micro_command,
+    hydrate_micro_compact_policy_for_session,
+)
 from hermes_cli.micro_compaction import MICRO_COMPACT_OVERRIDE_KEY
 from hermes_state import SessionDB
 
@@ -56,6 +59,24 @@ def _run(db, agent, raw_args, *, global_value=False, ensure_session=None):
         session_id=agent.session_id,
         raw_args=raw_args,
         ensure_session=ensure_session or (lambda: None),
+        config_loader=lambda: {"compression": {"micro_compact": global_value}},
+    )
+
+
+def _run_cold(
+    db,
+    session_id,
+    raw_args,
+    *,
+    global_value=False,
+    ensure_session=None,
+):
+    return execute_micro_command(
+        agent=None,
+        session_db=db,
+        session_id=session_id,
+        raw_args=raw_args,
+        ensure_session=ensure_session,
         config_loader=lambda: {"compression": {"micro_compact": global_value}},
     )
 
@@ -165,6 +186,187 @@ def test_config_failure_and_db_setter_failure_do_not_apply_live_policy(db, monke
     assert "database" in result.lower() or "locked" in result.lower()
     assert agent.context_compressor.calls == []
     assert agent.context_compressor.enabled is False
+
+
+def test_cold_on_off_inherit_persist_without_live_policy_application(db):
+    session_id = "micro-cold-policy"
+    db.create_session(
+        session_id,
+        source="gateway",
+        model_config={"keep": "cold"},
+    )
+    ensure_calls: list[str] = []
+
+    def ensure_session():
+        ensure_calls.append("ensure")
+
+    with patch("hermes_cli.micro_command._apply_live_policy") as apply_live:
+        result = _run_cold(
+            db,
+            session_id,
+            "on",
+            ensure_session=ensure_session,
+        )
+        assert "Micro-compaction override saved: ON" in result
+        assert "Micro-compaction: ON" in result
+        assert db.session_micro_compact_override(db.get_session(session_id)) is True
+
+        result = _run_cold(
+            db,
+            session_id,
+            "off",
+            ensure_session=ensure_session,
+        )
+        assert "Micro-compaction override saved: OFF" in result
+        assert db.session_micro_compact_override(db.get_session(session_id)) is False
+
+        result = _run_cold(
+            db,
+            session_id,
+            "inherit",
+            global_value=True,
+            ensure_session=ensure_session,
+        )
+        assert "Micro-compaction override saved: ON" in result
+        assert "global (inherited)" in result
+        assert db.session_micro_compact_override(db.get_session(session_id)) is None
+
+    assert ensure_calls == ["ensure", "ensure", "ensure"]
+    apply_live.assert_not_called()
+    assert _config(db, session_id) == {"keep": "cold"}
+
+
+def test_cold_status_is_read_only_and_does_not_need_ensure(db):
+    session_id = "micro-cold-status"
+    db.create_session(
+        session_id,
+        source="gateway",
+        model_config={MICRO_COMPACT_OVERRIDE_KEY: True},
+    )
+    ensure_session = MagicMock()
+
+    with patch("hermes_cli.micro_command._apply_live_policy") as apply_live:
+        result = _run_cold(
+            db,
+            session_id,
+            "status",
+            ensure_session=ensure_session,
+        )
+
+    assert "Micro-compaction: ON" in result
+    assert "Source: session" in result
+    ensure_session.assert_not_called()
+    apply_live.assert_not_called()
+    assert _config(db, session_id) == {MICRO_COMPACT_OVERRIDE_KEY: True}
+
+
+def test_cold_invalid_command_and_missing_ensure_do_not_mutate(db):
+    session_id = "micro-cold-invalid"
+    db.create_session(session_id, source="gateway", model_config={"keep": 1})
+    ensure_session = MagicMock()
+
+    with patch("hermes_cli.micro_command._apply_live_policy") as apply_live:
+        result = _run_cold(
+            db,
+            session_id,
+            "maybe",
+            ensure_session=ensure_session,
+        )
+        assert "Usage: /micro on|off|inherit|status" in result
+        ensure_session.assert_not_called()
+
+        result = _run_cold(db, session_id, "on")
+        assert "canonical session ensure callback" in result
+
+        result = _run_cold(
+            db,
+            " ",
+            "on",
+            ensure_session=ensure_session,
+        )
+        assert "non-empty exact session ID" in result
+
+    apply_live.assert_not_called()
+    assert _config(db, session_id) == {"keep": 1}
+
+
+def test_cold_database_failures_do_not_apply_live_policy(db, monkeypatch):
+    session_id = "micro-cold-db-failure"
+    db.create_session(session_id, source="gateway", model_config={"keep": 1})
+    ensure_session = MagicMock()
+
+    def fail_setter(*_args, **_kwargs):
+        raise RuntimeError("database locked")
+
+    monkeypatch.setattr(db, "set_session_micro_compact_override", fail_setter)
+    with patch("hermes_cli.micro_command._apply_live_policy") as apply_live:
+        result = _run_cold(
+            db,
+            session_id,
+            "on",
+            ensure_session=ensure_session,
+        )
+
+    assert "database" in result.lower() or "locked" in result.lower()
+    ensure_session.assert_called_once()
+    apply_live.assert_not_called()
+    assert _config(db, session_id) == {"keep": 1}
+
+
+def test_cold_config_and_ensure_failures_do_not_persist_or_apply(db):
+    session_id = "micro-cold-early-failure"
+    db.create_session(session_id, source="gateway", model_config={"keep": 1})
+    ensure_session = MagicMock(side_effect=RuntimeError("ensure failed"))
+
+    def fail_config():
+        raise RuntimeError("config unavailable")
+
+    with patch("hermes_cli.micro_command._apply_live_policy") as apply_live:
+        result = execute_micro_command(
+            agent=None,
+            session_db=db,
+            session_id=session_id,
+            raw_args="on",
+            ensure_session=MagicMock(),
+            config_loader=fail_config,
+        )
+        assert "config" in result.lower()
+
+        result = _run_cold(
+            db,
+            session_id,
+            "on",
+            ensure_session=ensure_session,
+        )
+        assert "ensure failed" in result
+
+    ensure_session.assert_called_once()
+    apply_live.assert_not_called()
+    assert _config(db, session_id) == {"keep": 1}
+
+
+def test_cold_policy_row_hydrates_when_a_live_agent_starts(db):
+    session_id = "micro-cold-hydration"
+    db.create_session(session_id, source="gateway", model_config={"keep": "row"})
+
+    result = _run_cold(db, session_id, "on", ensure_session=lambda: None)
+    assert "Micro-compaction: ON" in result
+
+    live_agent = _agent(session_id)
+    assert live_agent.context_compressor.calls == []
+    supported = hydrate_micro_compact_policy_for_session(
+        agent=live_agent,
+        session_db=db,
+        session_id=session_id,
+        config_loader=lambda: {"compression": {"micro_compact": False}},
+    )
+
+    assert supported is True
+    assert live_agent.micro_compact_override is True
+    assert live_agent.micro_compact_enabled is True
+    assert live_agent.micro_compact_source == "session"
+    assert live_agent.context_compressor.calls == [True]
+    assert live_agent._session_init_model_config == {"keep": "live", MICRO_COMPACT_OVERRIDE_KEY: True}
 
 
 def test_missing_row_mutation_calls_canonical_ensure_then_persists(db):

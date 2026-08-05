@@ -175,7 +175,7 @@ def reset_micro_compact_policy_for_new_session(
 
 def execute_micro_command(
     *,
-    agent: Any,
+    agent: Any | None,
     session_db: Any,
     session_id: str,
     raw_args: str,
@@ -186,8 +186,11 @@ def execute_micro_command(
 
     ``status`` is strictly read-only.  Mutating commands perform all validation
     and config loading first, call the canonical lazy-row callback, verify the
-    exact row, persist via ``SessionDB.set_session_micro_compact_override``, and
-    only then apply the live policy to ``agent``.
+    exact row, persist via ``SessionDB.set_session_micro_compact_override``,
+    and only then apply the live policy to ``agent``.  When ``agent`` is
+    ``None`` (a cold, agent-less session), the durable write is the complete
+    mutation: the policy is hydrated when the session's agent starts or
+    resumes.
     """
     try:
         command = parse_micro_compact_command(_command_args(raw_args))
@@ -216,7 +219,7 @@ def execute_micro_command(
             return _error(_DB_ERROR, exc)
         return _status(global_value, session_override)
 
-    if ensure_session is None:
+    if ensure_session is None and agent is not None:
         ensure_session = getattr(agent, "_ensure_db_session", None)
     if not callable(ensure_session):
         return "Micro-compaction error: canonical session ensure callback is not available"
@@ -247,6 +250,14 @@ def execute_micro_command(
         setter(session_id, session_override)
     except Exception as exc:
         return _error(_DB_ERROR, exc)
+
+    if agent is None:
+        state = "ON" if effective_micro_compact(global_value, session_override)[0] else "OFF"
+        result = f"Micro-compaction override saved: {state}\n{_status(global_value, session_override)}"
+        return (
+            f"{result}\n"
+            "Policy saved; it will apply when this session's agent starts or resumes."
+        )
 
     try:
         supported = _apply_live_policy(
