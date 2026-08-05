@@ -43,6 +43,14 @@ def _commit(repo: Path, message: str) -> str:
 
 
 
+def _test_candidate_validator(git_cmd, candidate):
+    """Explicit seam for non-Hermes-shaped temporary repositories."""
+    resolved = update_cmd._git_resolve_commit(git_cmd, candidate, "HEAD")
+    assert resolved is not None
+    return resolved
+
+
+
 def _release_repo(
     tmp_path: Path,
     *,
@@ -162,7 +170,8 @@ def test_keyboard_interrupt_after_stash_restores_exact_branch_and_bytes(
 
     with pytest.raises(KeyboardInterrupt):
         update_cmd._prepare_and_promote_release(
-            ["git"], repo, "v2.0.0", target_sha
+            ["git"], repo, "v2.0.0", target_sha,
+            candidate_validator=_test_candidate_validator,
         )
 
     _assert_exact_checkout(repo, "main", original_sha)
@@ -200,7 +209,8 @@ def test_keyboard_interrupt_after_promotion_keeps_candidate_and_restores_once(
 
     with pytest.raises(KeyboardInterrupt):
         update_cmd._prepare_and_promote_release(
-            ["git"], repo, "v2.0.0", target_sha
+            ["git"], repo, "v2.0.0", target_sha,
+            candidate_validator=_test_candidate_validator,
         )
 
     _assert_exact_checkout(repo, "main", original_sha)
@@ -235,7 +245,8 @@ def test_durable_journal_records_payload_and_stash_identity_at_interrupt(
 
     with pytest.raises(KeyboardInterrupt):
         update_cmd._prepare_and_promote_release(
-            ["git"], repo, "v2.0.0", target_sha
+            ["git"], repo, "v2.0.0", target_sha,
+            candidate_validator=_test_candidate_validator,
         )
 
     _path, journal = _latest_journal(repo)
@@ -260,7 +271,10 @@ def test_durable_journal_records_payload_and_stash_identity_at_interrupt(
 
 def test_upgrade_transaction_leaves_journal_for_outer_finalizer(tmp_path):
     repo, _base_sha, _maintenance_sha, target_sha = _release_repo(tmp_path)
-    result = update_cmd._upgrade_release_transaction(["git"], repo, "v2.0.0", target_sha)
+    result = update_cmd._upgrade_release_transaction(
+        ["git"], repo, "v2.0.0", target_sha,
+        candidate_validator=_test_candidate_validator,
+    )
 
     path, journal = _latest_journal(repo)
     assert path.exists()
@@ -284,7 +298,8 @@ def test_delayed_restore_hides_intentional_files_from_pipeline_and_restores_afte
     user_file.write_bytes(user_bytes)
 
     result = update_cmd._prepare_and_promote_release(
-        ["git"], repo, "v2.0.0", target_sha
+        ["git"], repo, "v2.0.0", target_sha,
+        candidate_validator=_test_candidate_validator,
     )
     assert not lockfile.exists() or lockfile.read_bytes() != lock_bytes
     assert not user_file.exists()
@@ -326,7 +341,8 @@ def test_detached_failure_restores_exact_sha_and_status(tmp_path):
 
     with pytest.raises(RuntimeError, match="candidate"):
         update_cmd._prepare_and_promote_release(
-            ["git"], repo, "v2.0.0", target_sha
+            ["git"], repo, "v2.0.0", target_sha,
+            candidate_validator=_test_candidate_validator,
         )
 
     _assert_exact_checkout(repo, None, base_sha)
@@ -344,7 +360,8 @@ def test_stash_restore_conflict_keeps_immutable_stash_and_journal(tmp_path):
     original_sha = _git(repo, "rev-parse", "HEAD").stdout.decode().strip()
 
     result = update_cmd._prepare_and_promote_release(
-        ["git"], repo, "v2.0.0", target_sha
+        ["git"], repo, "v2.0.0", target_sha,
+        candidate_validator=_test_candidate_validator,
     )
     _path, before = _latest_journal(repo)
     assert before["stash_pending"] is True

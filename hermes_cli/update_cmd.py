@@ -53,7 +53,11 @@ except ImportError:  # pragma: no cover - POSIX
     msvcrt = None
 
 from hermes_cli.config import get_hermes_home
-from hermes_constants import venv_python_path
+from hermes_constants import (
+    FIRST_PARTY_MODULE_ROOTS,
+    is_first_party_module,
+    venv_python_path,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -866,7 +870,61 @@ def _apply_payload_to_candidate(
             pass
 
 
-def _validate_candidate_tree(git_cmd: list[str], candidate: Path) -> str:
+def _validate_candidate_gitlinks(git_cmd: list[str], candidate: Path) -> None:
+    """Reject submodule-like index entries before a candidate is applied."""
+
+    staged = subprocess.run(
+        git_cmd + ["ls-files", "--stage", "-z"],
+        cwd=candidate,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if staged.returncode != 0:
+        detail = (staged.stderr or staged.stdout or "").strip()
+        raise RuntimeError(
+            "Could not inspect candidate index for gitlinks"
+            + (f": {detail.splitlines()[0]}" if detail else "")
+        )
+    for record in staged.stdout.split("\x00"):
+        if not record:
+            continue
+        metadata, separator, path = record.partition("\t")
+        if not separator:
+            raise RuntimeError("Candidate index contained an invalid staged entry.")
+        mode = metadata.split(maxsplit=1)[0]
+        if mode == "160000":
+            raise RuntimeError(
+                f"Candidate validation rejected gitlink/submodule entry {path!r}; "
+                "release candidates must contain ordinary files."
+            )
+
+
+def _validate_candidate_self_hosting(candidate: Path) -> None:
+    """Run the production release-candidate self-hosting checks."""
+
+    syntax_ok, failing_path, syntax_error = _validate_critical_files_syntax(candidate)
+    if not syntax_ok:
+        raise RuntimeError(
+            f"Candidate validation failed at {failing_path}: "
+            f"{syntax_error or 'syntax error'}"
+        )
+    imports_ok, failing_module, import_error = _validate_critical_modules_import(candidate)
+    if not imports_ok:
+        raise RuntimeError(
+            f"Candidate import validation failed at {failing_module}: "
+            f"{import_error or 'import error'}"
+        )
+
+
+def _validate_candidate_tree(
+    git_cmd: list[str],
+    candidate: Path,
+    *,
+    candidate_validator=None,
+) -> str:
+    _validate_candidate_gitlinks(git_cmd, candidate)
     status = subprocess.run(
         git_cmd + ["status", "--porcelain"],
         cwd=candidate,
@@ -885,18 +943,13 @@ def _validate_candidate_tree(git_cmd: list[str], candidate: Path) -> str:
     )
     if status.returncode != 0 or status.stdout.strip() or unmerged.stdout.strip():
         raise RuntimeError("Candidate worktree is not clean after replay.")
-    syntax_ok, failing_path, syntax_error = _validate_critical_files_syntax(candidate)
-    if not syntax_ok:
-        raise RuntimeError(
-            f"Candidate validation failed at {failing_path}: {syntax_error or 'syntax error'}"
-        )
-    if (Path(candidate) / "hermes_cli" / "main.py").is_file():
-        imports_ok, failing_module, import_error = _validate_critical_modules_import(candidate)
-        if not imports_ok:
-            raise RuntimeError(
-                f"Candidate import validation failed at {failing_module}: "
-                f"{import_error or 'import error'}"
-            )
+    # This private seam is used only by real-Git tests whose temporary
+    # repositories intentionally are not Hermes-shaped. The production path
+    # never supplies it and therefore always runs strict self-hosting checks.
+    if candidate_validator is None:
+        _validate_candidate_self_hosting(candidate)
+    else:
+        candidate_validator(git_cmd, candidate)
     resolved = _git_resolve_commit(git_cmd, candidate, "HEAD")
     if resolved is None:
         raise RuntimeError("Candidate HEAD did not resolve to an immutable commit.")
@@ -910,6 +963,7 @@ def _upgrade_release_transaction(
     target_sha: str,
     *,
     transaction_context: ReleaseUpgradeContext | None = None,
+    candidate_validator=None,
 ) -> ReleaseUpgradeResult:
     """Replay maintenance changes in isolation, then CAS-promote the candidate."""
 
@@ -1001,6 +1055,7 @@ def _upgrade_release_transaction(
                 f"{detail.splitlines()[0] if detail else 'git worktree add failed'}"
             )
         _journal_update(context, "candidate-created", candidate_created=True)
+        _validate_candidate_gitlinks(git_cmd, candidate_path)
         _apply_payload_to_candidate(git_cmd, candidate_path, payload, label=release_tag)
         _commit_candidate_changes(
             git_cmd, candidate_path, f"local: replay maintenance payload onto {release_tag}"
@@ -1045,7 +1100,9 @@ def _upgrade_release_transaction(
         _commit_candidate_changes(
             git_cmd, candidate_path, f"local: refresh maintenance artifacts for {release_tag}"
         )
-        candidate_sha = _validate_candidate_tree(git_cmd, candidate_path)
+        candidate_sha = _validate_candidate_tree(
+            git_cmd, candidate_path, candidate_validator=candidate_validator
+        )
         _journal_update(context, "candidate-validated", candidate_sha=candidate_sha)
 
         live_sha = _git_resolve_commit(git_cmd, root, "HEAD")
@@ -1134,6 +1191,7 @@ def _prepare_and_promote_release(
     target_sha: str,
     *,
     input_fn=None,
+    candidate_validator=None,
 ) -> ReleaseUpgradeResult:
     """Capture user state, promote a release, and defer restore to finalization."""
 
@@ -1198,6 +1256,7 @@ def _prepare_and_promote_release(
             release_tag,
             target_sha,
             transaction_context=context,
+            candidate_validator=candidate_validator,
         )
         return result
     except BaseException:
@@ -1552,6 +1611,7 @@ def _reload_updated_runtime_modules() -> None:
 # validates these and auto-rolls-back on failure.
 _UPDATE_CRITICAL_FILES = (
     "hermes_cli/main.py",
+    "hermes_cli/update_cmd.py",
     "hermes_cli/config.py",
     "hermes_cli/__init__.py",
     "hermes_cli/web_server.py",
@@ -1944,44 +2004,48 @@ def _upgrade_release_with_local_patches(git_cmd, cwd, release_tag: str) -> subpr
 
 
 def _validate_critical_files_syntax(root) -> tuple[bool, str | None, str | None]:
-    """Compile each file in ``_UPDATE_CRITICAL_FILES`` to catch SyntaxErrors.
-
-    These are the files imported on every ``hermes`` startup; if any of them
-    has a syntax error (orphan merge-conflict markers, bad ref to a name
-    that no longer exists, etc.) the CLI can't bootstrap at all. We validate
-    them after a successful ``git pull`` so we can auto-roll-back instead of
-    leaving the user with a bricked install.
-
-    The compiled ``.pyc`` is written to a temp directory rather than the
-    source tree's ``__pycache__/`` so we don't race with concurrent test
-    workers that walk the same dir, and so we don't leave a stale pyc
-    behind in production if the next interpreter run picks a different
-    Python version. The pyc is discarded on function return either way —
-    we only care about the compile-or-not signal.
-
-    Returns ``(ok, failing_path, error_message)``. ``ok=True`` means every
-    file parsed cleanly.
-    """
+    """Compile every required production file in a candidate, fail closed."""
     import py_compile
-    import tempfile
 
     root = Path(root)
+    try:
+        candidate_root = root.resolve(strict=True)
+    except OSError as exc:
+        return False, str(root), f"candidate root is not accessible: {exc}"
+
     with tempfile.TemporaryDirectory(prefix="hermes-syntax-check-") as tmpdir:
         for relpath in _UPDATE_CRITICAL_FILES:
-            path = root / relpath
-            if not path.exists():
-                # Missing file is suspicious but not necessarily fatal — a future
-                # refactor may legitimately remove one of these. Skip and move on.
-                continue
-            # Mirror the relative path under the tmpdir so two different
-            # files with the same basename don't collide on the cfile name.
-            cfile = Path(tmpdir) / (relpath.replace("/", "__") + "c")
+            relative = Path(relpath)
+            path = root / relative
+            if relative.is_absolute() or ".." in relative.parts:
+                return False, str(path), "critical path escapes candidate root"
+            try:
+                info = path.lstat()
+            except FileNotFoundError:
+                return False, str(path), "required critical file is missing"
+            except OSError as exc:
+                return False, str(path), f"could not inspect required file: {exc}"
+            if stat.S_ISLNK(info.st_mode):
+                return False, str(path), "required critical file is a symlink"
+            if not stat.S_ISREG(info.st_mode):
+                return False, str(path), "required critical file is not a regular file"
+            try:
+                resolved = path.resolve(strict=True)
+                resolved.relative_to(candidate_root)
+            except ValueError:
+                return False, str(path), "required critical file resolves outside candidate root"
+            except OSError as exc:
+                return False, str(path), f"could not resolve required file: {exc}"
+
+            # Mirror the relative path under the temp directory so different
+            # source files cannot collide in the compile output.
+            cfile = Path(tmpdir) / (str(relative).replace("/", "__") + "c")
             try:
                 py_compile.compile(str(path), cfile=str(cfile), doraise=True)
             except py_compile.PyCompileError as exc:
                 return False, str(path), str(exc)
             except OSError as exc:
-                return False, str(path), f"could not read: {exc}"
+                return False, str(path), f"could not compile: {exc}"
     return True, None, None
 
 
@@ -1990,6 +2054,7 @@ def _validate_critical_files_syntax(root) -> tuple[bool, str | None, str | None]
 # is caught — a file can be syntactically perfect and still fail to import
 # because a name it pulls from a sibling module no longer exists.
 _UPDATE_CRITICAL_MODULES = (
+    "hermes_cli.update_cmd",
     "hermes_cli.main",
     "run_agent",
     "model_tools",
@@ -1998,82 +2063,116 @@ _UPDATE_CRITICAL_MODULES = (
 
 
 def _validate_critical_modules_import(root) -> tuple[bool, str | None, str | None]:
-    """Import each module in ``_UPDATE_CRITICAL_MODULES`` in a subprocess.
+    """Import every critical module from the candidate in an isolated process.
 
-    ``_validate_critical_files_syntax`` only *parses* files, so it cannot see
-    cross-module breakage: a partially-updated tree where ``agent/`` is new but
-    ``tools/`` is old parses perfectly and still dies at startup with
-    ``ImportError: cannot import name 'TODO_INJECTION_HEADER' from
-    'tools.todo_tool'``. Every file is valid Python; the *combination* is not.
-
-    That skew is reachable on the Windows ZIP-update path, whose copy loop
-    walks top-level entries in ``os.listdir`` order and replaces each one
-    independently — ``agent/`` lands long before ``tools/``, so a failure or
-    interruption between them leaves exactly that mismatch on disk.
-
-    Runs in a subprocess because importing these modules into the running
-    updater would pollute ``sys.modules`` and execute import-time side effects
-    against the half-updated tree. Costs ~0.4s.
-
-    Uses the project venv's interpreter when there is one (matching
-    ``_venv_core_imports_healthy``): ``hermes update`` can be driven by a
-    different Python than the install's own, and probing the wrong
-    interpreter would test a tree the user never runs.
-
-    Returns ``(ok, failing_module, error_message)``.
+    A missing dependency is deferred to the existing dependency-sync stage only
+    when it is an explicitly named, non-first-party module. Every other import
+    or probe failure remains fatal before candidate promotion.
     """
-    from hermes_constants import FIRST_PARTY_MODULE_ROOTS
 
+    root = Path(root)
+    try:
+        candidate_root = root.resolve(strict=True)
+    except OSError as exc:
+        return False, "candidate import probe", f"candidate root is not accessible: {exc}"
+
+    # Inject the canonical root set into the child probe. The parent still uses
+    # is_first_party_module() for names such as hermes_constants, whose
+    # first-party family is represented by that canonical helper as well.
+    first_party_roots = tuple(sorted(FIRST_PARTY_MODULE_ROOTS))
     probe = (
-        "import importlib, sys\n"
-        "for name in %r:\n"
+        "import importlib, sys, traceback\n"
+        "from pathlib import Path\n"
+        f"_root = Path({str(candidate_root)!r})\n"
+        "_root = _root.resolve(strict=True)\n"
+        "sys.path.insert(0, str(_root))\n"
+        "_FIRST_PARTY_MODULE_ROOTS = frozenset(%r)\n"
+        "for _name in %r:\n"
         "    try:\n"
-        "        importlib.import_module(name)\n"
-        "    except ModuleNotFoundError as exc:\n"
-        # A missing *third-party* module means dependencies aren't installed
-        # yet, not a skewed checkout. Only our own packages count as breakage.
-        # The root set is injected from hermes_constants so this can't drift
-        # from the hint the user is shown (they disagreed once already).
-        "        missing = (getattr(exc, 'name', '') or '').split('.')[0]\n"
-        "        if missing in %r or missing.startswith('hermes_'):\n"
-        "            sys.stdout.write(name + '\\n' + str(exc))\n"
-        "            raise SystemExit(3)\n"
-        "    except ImportError as exc:\n"
-        "        sys.stdout.write(name + '\\n' + str(exc))\n"
-        "        raise SystemExit(3)\n"
-        "    except Exception:\n"
-        "        pass\n"  # non-import errors (config/env) aren't update breakage
-        "raise SystemExit(0)\n"
-        % (_UPDATE_CRITICAL_MODULES, tuple(sorted(FIRST_PARTY_MODULE_ROOTS)))
+        "        _module = importlib.import_module(_name)\n"
+        "        _origin = getattr(_module, '__file__', None)\n"
+        "        if not _origin:\n"
+        "            raise RuntimeError('critical module has no __file__')\n"
+        "        _resolved = Path(_origin).resolve(strict=True)\n"
+        "        try:\n"
+        "            _resolved.relative_to(_root)\n"
+        "        except ValueError as _exc:\n"
+        "            raise RuntimeError(\n"
+        "                f'critical module imported from outside candidate: {_resolved}'\n"
+        "            ) from _exc\n"
+        "    except ModuleNotFoundError as _exc:\n"
+        "        _missing = getattr(_exc, 'name', None) or ''\n"
+        "        _missing_root = _missing.split('.', 1)[0]\n"
+        "        if _missing_root in _FIRST_PARTY_MODULE_ROOTS:\n"
+        "            _marker = 'HERMES_FIRST_PARTY_MISSING:'\n"
+        "        else:\n"
+        "            _marker = 'HERMES_MODULE_NOT_FOUND:'\n"
+        "        print(_marker + _name + ':' + _missing)\n"
+        "        traceback.print_exc()\n"
+        "        continue\n"
+        "    except BaseException:\n"
+        "        print('HERMES_IMPORT_FAILURE:' + _name)\n"
+        "        traceback.print_exc()\n"
+        "        raise\n"
+        "print('HERMES_IMPORT_OK')\n"
+        % (first_party_roots, _UPDATE_CRITICAL_MODULES)
     )
     try:
         interpreter = sys.executable
         try:
             venv_python = venv_python_path(
-                Path(root) / "venv", windows=_m()._is_windows()
+                root / "venv", windows=_m()._is_windows()
             )
             if venv_python.exists():
                 interpreter = str(venv_python)
         except Exception:
             pass  # fall back to the running interpreter
         result = subprocess.run(
-            [interpreter, "-c", probe],
-            cwd=str(root),
+            [interpreter, "-I", "-c", probe],
+            cwd=str(candidate_root),
             capture_output=True,
             text=True,
             encoding="utf-8",
             errors="replace",
             timeout=120,
         )
-    except (OSError, subprocess.SubprocessError):
-        # Can't run the probe — don't block the update on our own tooling.
-        return True, None, None
-    if result.returncode == 3:
-        parts = (result.stdout or "").split("\n", 1)
-        module = parts[0].strip() or "unknown"
-        detail = parts[1].strip() if len(parts) > 1 else ""
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, "candidate import probe", f"could not execute import probe: {exc}"
+
+    stdout_lines = (result.stdout or "").splitlines()
+    output = "\n".join(
+        part for part in ((result.stdout or "").strip(), (result.stderr or "").strip()) if part
+    )
+    if result.returncode != 0 or "HERMES_IMPORT_OK" not in stdout_lines:
+        module = "candidate import probe"
+        for line in stdout_lines:
+            if line.startswith("HERMES_IMPORT_FAILURE:"):
+                module = line.partition(":")[2].strip() or module
+                break
+        detail = output or f"import probe exited with status {result.returncode}"
         return False, module, detail
+
+    missing: list[tuple[str, str, bool]] = []
+    for line in stdout_lines:
+        if line.startswith("HERMES_FIRST_PARTY_MISSING:"):
+            payload = line.partition(":")[2]
+            module, _, missing_name = payload.partition(":")
+            missing.append((module, missing_name, True))
+        elif line.startswith("HERMES_MODULE_NOT_FOUND:"):
+            payload = line.partition(":")[2]
+            module, _, missing_name = payload.partition(":")
+            missing.append((module, missing_name, False))
+
+    for module, missing_name, marked_first_party in missing:
+        if marked_first_party or not missing_name or is_first_party_module(missing_name):
+            return False, module or "candidate import probe", output or missing_name
+
+    # A clearly third-party ModuleNotFoundError is deferred, but retain the
+    # child traceback so callers that expose diagnostics can report it.
+    if missing:
+        return True, None, output or None
     return True, None, None
+
 
 def _gateway_prompt(prompt_text: str, default: str = "", timeout: float = 300.0) -> str:
     """File-based IPC prompt for gateway mode.

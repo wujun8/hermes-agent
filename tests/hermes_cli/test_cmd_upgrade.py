@@ -13,6 +13,15 @@ def _git_completed(cmd, stdout="", returncode=0, stderr=""):
     return subprocess.CompletedProcess(cmd, returncode, stdout=stdout, stderr=stderr)
 
 
+def _test_candidate_validator(git_cmd, candidate):
+    """Explicit seam for the non-Hermes-shaped release fixture."""
+    from hermes_cli import update_cmd
+
+    resolved = update_cmd._git_resolve_commit(git_cmd, candidate, "HEAD")
+    assert resolved is not None
+    return resolved
+
+
 def test_cmd_upgrade_resolves_latest_release_and_delegates_to_update_impl():
     args = SimpleNamespace(check=False, gateway=False)
 
@@ -394,7 +403,8 @@ def test_cmd_upgrade_replays_release_through_isolated_transaction(tmp_path):
 
     with patch.object(update_cmd, "_upgrade_release_with_local_patches", side_effect=AssertionError("legacy release replay must not run")):
         result = update_cmd._prepare_and_promote_release(
-            ["git"], repo, "v1.2.3", target_sha
+            ["git"], repo, "v1.2.3", target_sha,
+            candidate_validator=_test_candidate_validator,
         )
 
     assert result.target_sha == target_sha

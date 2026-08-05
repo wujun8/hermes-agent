@@ -60,6 +60,13 @@ def _commit(repo: Path, message: str) -> str:
     return _git(repo, "rev-parse", "HEAD").stdout.decode().strip()
 
 
+def _test_candidate_validator(git_cmd, candidate):
+    """Explicit seam for non-Hermes-shaped temporary repositories."""
+    resolved = update_cmd._git_resolve_commit(git_cmd, candidate, "HEAD")
+    assert resolved is not None
+    return resolved
+
+
 
 def _write_base_metadata(
     repo: Path,
@@ -401,7 +408,10 @@ def test_conflict_leaves_live_head_index_and_status_untouched(tmp_path):
     before_status = _git(repo, "status", "--porcelain=v1", check=True).stdout
 
     with pytest.raises(RuntimeError, match="candidate"):
-        update_cmd._upgrade_release_transaction(["git"], repo, "v2.0.0", target_sha)
+        update_cmd._upgrade_release_transaction(
+            ["git"], repo, "v2.0.0", target_sha,
+            candidate_validator=_test_candidate_validator,
+        )
 
     assert _git(repo, "rev-parse", "HEAD").stdout.decode().strip() == maintenance_sha
     assert _git(repo, "status", "--porcelain=v1", check=True).stdout == before_status
@@ -450,7 +460,10 @@ def test_binary_mode_symlink_and_rename_payload_survive_two_releases(tmp_path):
     _git(repo, "tag", "-a", "v2.0.0", "-m", "v2.0.0")
     _git(repo, "switch", "hermes-release")
 
-    result = update_cmd._upgrade_release_transaction(["git"], repo, "v2.0.0", r2)
+    result = update_cmd._upgrade_release_transaction(
+        ["git"], repo, "v2.0.0", r2,
+        candidate_validator=_test_candidate_validator,
+    )
 
     assert result.candidate_sha == _git(repo, "rev-parse", "HEAD").stdout.decode().strip()
     assert (repo / "tracked.txt").read_text(encoding="utf-8") == "upstream one\nlocal addition\n"
@@ -470,7 +483,10 @@ def test_binary_mode_symlink_and_rename_payload_survive_two_releases(tmp_path):
     r3 = _commit(repo, "release three")
     _git(repo, "tag", "-a", "v3.0.0", "-m", "v3.0.0")
     _git(repo, "switch", "hermes-release")
-    update_cmd._upgrade_release_transaction(["git"], repo, "v3.0.0", r3)
+    update_cmd._upgrade_release_transaction(
+        ["git"], repo, "v3.0.0", r3,
+        candidate_validator=_test_candidate_validator,
+    )
 
     assert "upstream release three" in (repo / "upstream-release.txt").read_text(encoding="utf-8")
     assert (repo / "blob.bin").read_bytes() == b"local\\x00binary\\x00\\xff"
