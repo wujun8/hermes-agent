@@ -36,7 +36,7 @@ import sys
 import tempfile
 import time as _time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -96,6 +96,67 @@ class ReleaseBaseMetadata:
 
 
 @dataclass(frozen=True)
+class ReleaseGitSnapshot:
+    """Exact live-checkout identity used to guard release mutations."""
+
+    root: Path
+    common_dir: Path
+    symbolic_head: str | None
+    head_sha: str
+    head_tree_sha: str
+    maintenance_ref: str
+    maintenance_ref_sha: str
+    index_tree_sha: str
+    tracked_diff_sha256: str
+    status_v2_sha256: str
+    # The status digest already commits to the exact untracked names and
+    # bytes.  Keep only a bounded count here so transaction journals do not
+    # persist a potentially sensitive path list.
+    untracked_count: int
+
+    def to_journal(self) -> dict:
+        value = {
+            "root": str(self.root),
+            "common_dir": str(self.common_dir),
+            "symbolic_head": self.symbolic_head,
+            "head_sha": self.head_sha,
+            "head_tree_sha": self.head_tree_sha,
+            "maintenance_ref": self.maintenance_ref,
+            "maintenance_ref_sha": self.maintenance_ref_sha,
+            "index_tree_sha": self.index_tree_sha,
+            "tracked_diff_sha256": self.tracked_diff_sha256,
+            "status_v2_sha256": self.status_v2_sha256,
+            "untracked_count": self.untracked_count,
+        }
+        _validate_release_snapshot_value(value)
+        return dict(value)
+
+    @classmethod
+    def from_journal(cls, value: object) -> "ReleaseGitSnapshot":
+        _validate_release_snapshot_value(value)
+        assert isinstance(value, dict)
+        root = value["root"]
+        common_dir = value["common_dir"]
+        symbolic_head = value["symbolic_head"]
+        assert isinstance(root, str)
+        assert isinstance(common_dir, str)
+        assert symbolic_head is None or isinstance(symbolic_head, str)
+        return cls(
+            root=Path(root),
+            common_dir=Path(common_dir),
+            symbolic_head=symbolic_head,
+            head_sha=value["head_sha"].lower(),
+            head_tree_sha=value["head_tree_sha"].lower(),
+            maintenance_ref=value["maintenance_ref"],
+            maintenance_ref_sha=value["maintenance_ref_sha"].lower(),
+            index_tree_sha=value["index_tree_sha"].lower(),
+            tracked_diff_sha256=value["tracked_diff_sha256"].lower(),
+            status_v2_sha256=value["status_v2_sha256"].lower(),
+            untracked_count=value["untracked_count"],
+        )
+
+
+@dataclass(frozen=True)
 class ReleaseUpgradeResult:
     """The durable result of a promoted candidate."""
 
@@ -119,6 +180,7 @@ class ReleaseUpgradeContext:
     final_marker_write_uncertain: bool = False
     final_marker_candidate: Optional[dict] = None
     final_marker_prior_digest: str | None = None
+    snapshots: dict[str, ReleaseGitSnapshot] = field(default_factory=dict)
 
 
 def _git_common_dir(git_cmd: list[str], cwd: Path | str) -> Path:
@@ -366,6 +428,501 @@ class RepositoryUpdateLock:
 
 
 _SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
+_RELEASE_SNAPSHOT_FIELDS = frozenset(
+    {
+        "root",
+        "common_dir",
+        "symbolic_head",
+        "head_sha",
+        "head_tree_sha",
+        "maintenance_ref",
+        "maintenance_ref_sha",
+        "index_tree_sha",
+        "tracked_diff_sha256",
+        "status_v2_sha256",
+        "untracked_count",
+    }
+)
+_RELEASE_SNAPSHOT_MAX_PATH = 4096
+_RELEASE_SNAPSHOT_MAX_REF = 1024
+_RELEASE_SNAPSHOT_MAX_UNTRACKED = 100_000
+_RELEASE_EMPTY_DIGEST = hashlib.sha256(b"").hexdigest()
+_RELEASE_MAINTENANCE_REF = "refs/heads/hermes-release"
+
+
+class ReleaseGitStateError(RuntimeError):
+    """The live checkout no longer matches a durable release snapshot."""
+
+
+def _release_snapshot_text(value: object, *, label: str, limit: int) -> str:
+    if not isinstance(value, str) or not value or len(value) > limit:
+        raise ReleaseGitStateError(f"Release transaction snapshot has an invalid {label}.")
+    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in value):
+        raise ReleaseGitStateError(f"Release transaction snapshot has an invalid {label}.")
+    return value
+
+
+def _release_snapshot_path(value: object, *, label: str) -> str:
+    path = _release_snapshot_text(value, label=label, limit=_RELEASE_SNAPSHOT_MAX_PATH)
+    if not os.path.isabs(path) or os.path.normpath(path) != path:
+        raise ReleaseGitStateError(f"Release transaction snapshot has an invalid {label}.")
+    return path
+
+
+def _release_snapshot_ref(value: object, *, label: str) -> str:
+    ref = _release_snapshot_text(value, label=label, limit=_RELEASE_SNAPSHOT_MAX_REF)
+    if (
+        not ref.startswith("refs/")
+        or ref.endswith("/")
+        or "//" in ref
+        or ".." in ref
+        or "@{" in ref
+        or any(char in ref for char in " ~^:?*[\\")
+    ):
+        raise ReleaseGitStateError(f"Release transaction snapshot has an invalid {label}.")
+    components = ref.split("/")
+    if len(components) < 2 or any(
+        not component
+        or component in {".", ".."}
+        or component.startswith(".")
+        or component.endswith(".")
+        or component.endswith(".lock")
+        for component in components
+    ):
+        raise ReleaseGitStateError(f"Release transaction snapshot has an invalid {label}.")
+    return ref
+
+
+def _validate_release_snapshot_value(value: object) -> None:
+    """Validate the bounded, exact journal representation of a Git snapshot."""
+    if type(value) is not dict:
+        raise ReleaseGitStateError("Release transaction snapshot is not an object.")
+    if set(value) != _RELEASE_SNAPSHOT_FIELDS:
+        missing = _RELEASE_SNAPSHOT_FIELDS.difference(value)
+        extra = set(value).difference(_RELEASE_SNAPSHOT_FIELDS)
+        details = []
+        if missing:
+            details.append("missing " + ", ".join(sorted(missing)))
+        if extra:
+            details.append("unexpected " + ", ".join(sorted(extra)))
+        raise ReleaseGitStateError(
+            "Release transaction snapshot schema is invalid" +
+            (": " + "; ".join(details) if details else ".")
+        )
+    _release_snapshot_path(value["root"], label="root path")
+    _release_snapshot_path(value["common_dir"], label="common directory")
+    symbolic_head = value["symbolic_head"]
+    if symbolic_head is not None:
+        symbolic_head = _release_snapshot_ref(symbolic_head, label="symbolic HEAD")
+        if not symbolic_head.startswith("refs/heads/"):
+            raise ReleaseGitStateError(
+                "Release transaction snapshot symbolic HEAD is not a local branch."
+            )
+    _release_snapshot_ref(value["maintenance_ref"], label="maintenance ref")
+    for name in (
+        "head_sha",
+        "head_tree_sha",
+        "maintenance_ref_sha",
+        "index_tree_sha",
+    ):
+        if not isinstance(value[name], str) or _SHA_RE.fullmatch(value[name]) is None:
+            raise ReleaseGitStateError(f"Release transaction snapshot has an invalid {name}.")
+    for name in ("tracked_diff_sha256", "status_v2_sha256"):
+        if (
+            not isinstance(value[name], str)
+            or re.fullmatch(r"[0-9a-fA-F]{64}", value[name]) is None
+        ):
+            raise ReleaseGitStateError(f"Release transaction snapshot has an invalid {name}.")
+    count = value["untracked_count"]
+    if (
+        not isinstance(count, int)
+        or isinstance(count, bool)
+        or count < 0
+        or count > _RELEASE_SNAPSHOT_MAX_UNTRACKED
+    ):
+        raise ReleaseGitStateError(
+            "Release transaction snapshot has an invalid untracked count."
+        )
+
+
+def _release_git_detail(result: subprocess.CompletedProcess) -> str:
+    value = result.stderr or result.stdout or b""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace").strip()
+    return str(value).strip()
+
+
+def _release_git_bytes(
+    git_cmd: list[str], root: Path, args: list[str], *, label: str
+) -> bytes:
+    result = subprocess.run(git_cmd + args, cwd=root, capture_output=True)
+    if result.returncode != 0:
+        detail = _release_git_detail(result)
+        raise ReleaseGitStateError(
+            f"Could not inspect release checkout {label}"
+            + (f": {detail.splitlines()[0]}" if detail else "")
+        )
+    output = result.stdout
+    if isinstance(output, str):
+        output = output.encode("utf-8", errors="surrogateescape")
+    if not isinstance(output, bytes):
+        raise ReleaseGitStateError(f"Git returned malformed release checkout output for {label}.")
+    return output
+
+
+def _release_git_text(
+    git_cmd: list[str], root: Path, args: list[str], *, label: str
+) -> str:
+    output = _release_git_bytes(git_cmd, root, args, label=label)
+    try:
+        text = output.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ReleaseGitStateError(f"Git returned malformed text for release checkout {label}.") from exc
+    text = text.rstrip("\n")
+    if not text or "\n" in text or "\r" in text:
+        raise ReleaseGitStateError(f"Git returned malformed release checkout {label}.")
+    return text
+
+
+def _release_git_sha(
+    git_cmd: list[str], root: Path, args: list[str], *, label: str
+) -> str:
+    value = _release_git_text(git_cmd, root, args, label=label).strip()
+    if _SHA_RE.fullmatch(value) is None:
+        raise ReleaseGitStateError(f"Git returned a malformed SHA for release checkout {label}.")
+    return value.lower()
+
+
+def _release_symbolic_head(git_cmd: list[str], root: Path) -> str | None:
+    result = subprocess.run(
+        git_cmd + ["symbolic-ref", "-q", "HEAD"],
+        cwd=root,
+        capture_output=True,
+    )
+    output = result.stdout or b""
+    error = result.stderr or b""
+    if isinstance(output, str):
+        output = output.encode("utf-8", errors="surrogateescape")
+    if isinstance(error, str):
+        error = error.encode("utf-8", errors="surrogateescape")
+    if result.returncode == 1:
+        if output or error:
+            raise ReleaseGitStateError("Git returned malformed detached-HEAD identity.")
+        return None
+    if result.returncode != 0:
+        detail = _release_git_detail(result)
+        raise ReleaseGitStateError(
+            "Could not inspect symbolic HEAD"
+            + (f": {detail.splitlines()[0]}" if detail else "")
+        )
+    try:
+        symbolic = output.decode("utf-8").rstrip("\n")
+    except UnicodeDecodeError as exc:
+        raise ReleaseGitStateError("Git returned malformed symbolic HEAD output.") from exc
+    if (
+        not symbolic
+        or "\n" in symbolic
+        or "\r" in symbolic
+        or not symbolic.startswith("refs/heads/")
+    ):
+        raise ReleaseGitStateError("Git returned an unsupported symbolic HEAD identity.")
+    return symbolic
+
+
+def _capture_release_git_snapshot(
+    git_cmd: list[str],
+    cwd: Path | str,
+    *,
+    maintenance_ref: str = _RELEASE_MAINTENANCE_REF,
+    expected_root: Path | None = None,
+    expected_common_dir: Path | None = None,
+) -> ReleaseGitSnapshot:
+    """Capture every Git identity relevant to a live release mutation."""
+    root = Path(cwd).resolve()
+    expected_root = expected_root.resolve() if expected_root is not None else root
+    if root != expected_root:
+        raise ReleaseGitStateError("Release checkout root changed from its pinned absolute path.")
+    shown_root = Path(
+        _release_git_text(git_cmd, root, ["rev-parse", "--show-toplevel"], label="repository root")
+    ).resolve()
+    if shown_root != expected_root:
+        raise ReleaseGitStateError(
+            f"Release checkout root mismatch: expected {expected_root}, got {shown_root}."
+        )
+    common_dir = _git_common_dir(git_cmd, root)
+    if expected_common_dir is not None and common_dir != expected_common_dir.resolve():
+        raise ReleaseGitStateError(
+            f"Release Git common directory changed: expected {expected_common_dir}, got {common_dir}."
+        )
+    symbolic_head = _release_symbolic_head(git_cmd, root)
+    head_sha = _release_git_sha(
+        git_cmd, root, ["rev-parse", "--verify", "HEAD^{commit}"], label="HEAD"
+    )
+    head_tree_sha = _release_git_sha(
+        git_cmd,
+        root,
+        ["rev-parse", "--verify", f"{head_sha}^{{tree}}"],
+        label="HEAD tree",
+    )
+    maintenance_ref_sha = _release_git_sha(
+        git_cmd,
+        root,
+        ["rev-parse", "--verify", f"{maintenance_ref}^{{commit}}"],
+        label="maintenance ref",
+    )
+    index_tree_sha = _release_git_sha(
+        git_cmd, root, ["write-tree"], label="index tree"
+    )
+    tracked_diff = _release_git_bytes(
+        git_cmd,
+        root,
+        ["diff", "--no-ext-diff", "--binary", "--"],
+        label="tracked worktree diff",
+    )
+    status_v2 = _release_git_bytes(
+        git_cmd,
+        root,
+        ["status", "--porcelain=v2", "--untracked-files=all", "--no-renames", "-z"],
+        label="porcelain-v2 status",
+    )
+    untracked_count = sum(
+        1 for record in status_v2.split(b"\0") if record.startswith(b"? ")
+    )
+    if untracked_count > _RELEASE_SNAPSHOT_MAX_UNTRACKED:
+        raise ReleaseGitStateError(
+            "Release checkout has too many untracked paths to snapshot safely."
+        )
+    return ReleaseGitSnapshot(
+        root=expected_root,
+        common_dir=common_dir,
+        symbolic_head=symbolic_head,
+        head_sha=head_sha,
+        head_tree_sha=head_tree_sha,
+        maintenance_ref=maintenance_ref,
+        maintenance_ref_sha=maintenance_ref_sha,
+        index_tree_sha=index_tree_sha,
+        tracked_diff_sha256=hashlib.sha256(tracked_diff).hexdigest(),
+        status_v2_sha256=hashlib.sha256(status_v2).hexdigest(),
+        untracked_count=untracked_count,
+    )
+
+
+def _release_snapshot_is_clean(snapshot: ReleaseGitSnapshot) -> bool:
+    return (
+        snapshot.index_tree_sha == snapshot.head_tree_sha
+        and snapshot.tracked_diff_sha256 == _RELEASE_EMPTY_DIGEST
+        and snapshot.status_v2_sha256 == _RELEASE_EMPTY_DIGEST
+        and snapshot.untracked_count == 0
+    )
+
+
+def _release_snapshot_branch(snapshot: ReleaseGitSnapshot) -> str | None:
+    if snapshot.symbolic_head is None:
+        return None
+    if not snapshot.symbolic_head.startswith("refs/heads/"):
+        raise ReleaseGitStateError("Release checkout symbolic HEAD is not a local branch.")
+    branch = snapshot.symbolic_head.removeprefix("refs/heads/")
+    if not branch or ".." in branch or "\x00" in branch:
+        raise ReleaseGitStateError("Release checkout branch identity is malformed.")
+    return branch
+
+
+def _validate_release_git_snapshot(
+    git_cmd: list[str], root: Path, expected: ReleaseGitSnapshot, *, label: str
+) -> ReleaseGitSnapshot:
+    """Fail closed unless the live checkout exactly equals ``expected``."""
+    actual = _capture_release_git_snapshot(
+        git_cmd,
+        root,
+        maintenance_ref=expected.maintenance_ref,
+        expected_root=expected.root,
+        expected_common_dir=expected.common_dir,
+    )
+    if actual != expected:
+        differences = [
+            name
+            for name in (
+                "root",
+                "common_dir",
+                "symbolic_head",
+                "head_sha",
+                "head_tree_sha",
+                "maintenance_ref_sha",
+                "index_tree_sha",
+                "tracked_diff_sha256",
+                "status_v2_sha256",
+                "untracked_count",
+            )
+            if getattr(actual, name) != getattr(expected, name)
+        ]
+        raise ReleaseGitStateError(
+            f"Release checkout manual interference at {label}: "
+            + ", ".join(differences or ["snapshot mismatch"])
+        )
+    return actual
+
+
+def _release_validate_no_unmerged_index(git_cmd: list[str], root: Path) -> None:
+    """Require a well-formed, fully merged index before user-state validation."""
+    result = subprocess.run(
+        git_cmd + ["ls-files", "-u", "-z"],
+        cwd=root,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        detail = _release_git_detail(result)
+        raise ReleaseGitStateError(
+            "Could not inspect release checkout unmerged index entries"
+            + (f": {detail.splitlines()[0]}" if detail else "")
+        )
+    output = result.stdout
+    if not isinstance(output, bytes):
+        raise ReleaseGitStateError(
+            "Git returned malformed release checkout unmerged index output."
+        )
+    if output:
+        raise ReleaseGitStateError("Release checkout has unmerged index entries.")
+
+
+def _validate_release_restored_snapshot_identity(
+    git_cmd: list[str],
+    root: Path,
+    expected: ReleaseGitSnapshot,
+    *,
+    label: str,
+) -> ReleaseGitSnapshot:
+    """Capture live user state and compare only immutable checkout identity."""
+    _release_validate_no_unmerged_index(git_cmd, root)
+    actual = _capture_release_git_snapshot(
+        git_cmd,
+        root,
+        maintenance_ref=expected.maintenance_ref,
+        expected_root=expected.root,
+        expected_common_dir=expected.common_dir,
+    )
+    differences = [
+        name
+        for name in (
+            "root",
+            "common_dir",
+            "symbolic_head",
+            "head_sha",
+            "head_tree_sha",
+            "maintenance_ref",
+            "maintenance_ref_sha",
+        )
+        if getattr(actual, name) != getattr(expected, name)
+    ]
+    if differences:
+        raise ReleaseGitStateError(
+            f"Release checkout identity mismatch at {label}: "
+            + ", ".join(differences)
+        )
+    return actual
+
+
+def _release_clean_snapshot(
+    snapshot: ReleaseGitSnapshot,
+    *,
+    symbolic_head: str | None,
+    head_sha: str,
+    maintenance_ref_sha: str,
+    head_tree_sha: str | None = None,
+) -> ReleaseGitSnapshot:
+    tree = head_tree_sha or snapshot.head_tree_sha
+    return replace(
+        snapshot,
+        symbolic_head=symbolic_head,
+        head_sha=head_sha,
+        head_tree_sha=tree,
+        maintenance_ref_sha=maintenance_ref_sha,
+        index_tree_sha=tree,
+        tracked_diff_sha256=_RELEASE_EMPTY_DIGEST,
+        status_v2_sha256=_RELEASE_EMPTY_DIGEST,
+        untracked_count=0,
+    )
+
+
+def _release_snapshot_with_journal(
+    context: ReleaseUpgradeContext,
+    key: str,
+    snapshot: ReleaseGitSnapshot,
+    *,
+    phase: str | None = None,
+    **updates,
+) -> None:
+    context.snapshots[key] = snapshot
+    updates[key] = snapshot.to_journal()
+    _journal_update(context, phase, **updates)
+
+
+def _release_context_snapshot(
+    context: ReleaseUpgradeContext, key: str
+) -> ReleaseGitSnapshot:
+    # The durable journal is the binding record.  Do not let a mutable in-memory
+    # cache silently replace a malformed or tampered on-disk snapshot during
+    # recovery/finalization.
+    snapshot = ReleaseGitSnapshot.from_journal(context.journal.get(key))
+    expected_root = context.root.resolve()
+    expected_common = context.common_dir.resolve()
+    if snapshot.root != expected_root or snapshot.common_dir != expected_common:
+        raise ReleaseGitStateError(
+            f"Release transaction snapshot {key} is bound to a different Git checkout."
+        )
+    return snapshot
+
+
+def _release_mark_manual_interference(
+    context: ReleaseUpgradeContext, reason: object
+) -> None:
+    try:
+        message = str(reason)
+    except BaseException:
+        message = "unexpected live Git state"
+    message = " ".join(
+        " " if (ord(char) < 0x20 or ord(char) == 0x7F) else char
+        for char in message
+    ).strip()[:512] or "unexpected live Git state"
+    context.journal["manual_interference"] = True
+    context.journal["interference_reason"] = message
+    try:
+        _journal_update(
+            context,
+            "manual-interference",
+            manual_interference=True,
+            interference_reason=message,
+        )
+    except BaseException:
+        # The in-memory latch still prevents a finalizer in this process from
+        # issuing a destructive Git command; the original evidence remains on disk.
+        logger.warning("Could not durably mark manual release interference", exc_info=True)
+
+
+def _release_has_manual_interference(context: ReleaseUpgradeContext) -> bool:
+    """Return whether this transaction has latched a live-checkout race."""
+    return bool(
+        context.journal.get("manual_interference")
+        or context.journal.get("phase") == "manual-interference"
+    )
+
+
+def _release_assert_identity(
+    snapshot: ReleaseGitSnapshot,
+    *,
+    symbolic_head: str | None,
+    head_sha: str,
+    maintenance_ref_sha: str,
+    label: str,
+    clean: bool = False,
+) -> None:
+    if (
+        snapshot.symbolic_head != symbolic_head
+        or snapshot.head_sha != head_sha
+        or snapshot.maintenance_ref_sha != maintenance_ref_sha
+    ):
+        raise ReleaseGitStateError(f"Release checkout identity failed at {label}.")
+    if clean and not _release_snapshot_is_clean(snapshot):
+        raise ReleaseGitStateError(f"Release checkout is not clean at {label}.")
 
 
 def _is_official_origin_url(url: str | None) -> bool:
@@ -916,7 +1473,9 @@ _RECOVERY_PHASES = frozenset(
         "candidate-validated",
         "promoting",
         "promotion-needs-recovery",
+        "promotion-cas-failed",
         "promotion-uncertain",
+        "manual-interference",
         "promoted",
         "candidate-cleanup",
         "candidate-cleanup-failed",
@@ -1575,7 +2134,7 @@ def _upgrade_release_transaction(
 ) -> ReleaseUpgradeResult:
     """Replay maintenance changes in isolation, then CAS-promote the candidate."""
 
-    root = Path(cwd)
+    root = Path(cwd).resolve()
     _validate_release_tag_name(git_cmd, root, release_tag)
     if not _SHA_RE.fullmatch(target_sha):
         raise RuntimeError("Release target is not an immutable commit SHA.")
@@ -1589,19 +2148,40 @@ def _upgrade_release_transaction(
         )
 
     branch = "hermes-release"
-    old_sha = _git_resolve_commit(git_cmd, root, f"refs/heads/{branch}")
-    if old_sha is None:
-        raise RuntimeError(
-            "Local maintenance branch 'hermes-release' is missing; create it from "
-            "an official release and initialize local-patches/.release_base before upgrading."
-        )
-    current_branch, current_head = _capture_release_checkout_identity(git_cmd, root)
-    if current_branch != branch or current_head != old_sha:
-        raise RuntimeError(
-            "Release transaction requires the explicit hermes-release branch at its recorded HEAD."
-        )
-    if _git_working_tree_dirty(git_cmd, root):
-        raise RuntimeError("Live maintenance worktree must be clean after user changes are stashed.")
+    maintenance_ref = f"refs/heads/{branch}"
+    current_snapshot = _capture_release_git_snapshot(
+        git_cmd, root, maintenance_ref=maintenance_ref
+    )
+    if (
+        transaction_context is not None
+        and "post_stash_snapshot" in transaction_context.journal
+    ):
+        try:
+            current_snapshot = _validate_release_git_snapshot(
+                git_cmd,
+                root,
+                _release_context_snapshot(
+                    transaction_context,
+                    "maintenance_snapshot"
+                    if "maintenance_snapshot" in transaction_context.journal
+                    else "post_stash_snapshot",
+                ),
+                label="release transaction post-stash entry",
+            )
+        except Exception as exc:
+            _release_mark_manual_interference(transaction_context, exc)
+            raise
+    old_sha = current_snapshot.maintenance_ref_sha
+    if current_snapshot.symbolic_head != maintenance_ref or current_snapshot.head_sha != old_sha:
+        message = "Release transaction requires the explicit hermes-release branch at its recorded HEAD."
+        if transaction_context is not None:
+            _release_mark_manual_interference(transaction_context, message)
+        raise ReleaseGitStateError(message)
+    if not _release_snapshot_is_clean(current_snapshot):
+        message = "Live maintenance worktree must be clean after user changes are stashed."
+        if transaction_context is not None:
+            _release_mark_manual_interference(transaction_context, message)
+        raise ReleaseGitStateError(message)
 
     context = transaction_context
     if context is None:
@@ -1610,17 +2190,35 @@ def _upgrade_release_transaction(
         context = _create_release_upgrade_context(
             git_cmd,
             root,
-            original_branch=current_branch,
-            original_head_sha=current_head,
+            original_branch=branch,
+            original_head_sha=current_snapshot.head_sha,
             maintenance_old_sha=old_sha,
             release_tag=release_tag,
             base_sha=metadata.base_sha,
             target_sha=target_sha,
             payload=payload,
         )
+        _release_snapshot_with_journal(context, "original_snapshot", current_snapshot)
+        _release_snapshot_with_journal(context, "original_clean_snapshot", current_snapshot)
     journal = context.journal
-    if journal.get("maintenance_old_sha") != old_sha:
-        raise RuntimeError("Live maintenance HEAD changed before promotion; retry the upgrade.")
+    recorded_old_sha = journal.get("maintenance_old_sha")
+    if recorded_old_sha != old_sha:
+        message = "Live maintenance ref changed before promotion; candidate and backup were preserved."
+        _release_mark_manual_interference(context, message)
+        raise ReleaseGitStateError(message)
+    if "pre_cas_snapshot" in journal:
+        try:
+            current_snapshot = _validate_release_git_snapshot(
+                git_cmd,
+                root,
+                _release_context_snapshot(context, "pre_cas_snapshot"),
+                label="release transaction entry",
+            )
+        except Exception as exc:
+            _release_mark_manual_interference(context, exc)
+            raise
+    else:
+        _release_snapshot_with_journal(context, "pre_cas_snapshot", current_snapshot)
     payload_path = Path(journal["payload_path"])
     payload = payload_path.read_bytes()
     if (
@@ -1713,9 +2311,14 @@ def _upgrade_release_transaction(
         )
         _journal_update(context, "candidate-validated", candidate_sha=candidate_sha)
 
-        live_sha = _git_resolve_commit(git_cmd, root, "HEAD")
-        if live_sha != old_sha or _git_working_tree_dirty(git_cmd, root):
-            raise RuntimeError("Live checkout changed while candidate was being validated.")
+        pre_cas_snapshot = _release_context_snapshot(context, "pre_cas_snapshot")
+        try:
+            _validate_release_git_snapshot(
+                git_cmd, root, pre_cas_snapshot, label="promotion CAS precondition"
+            )
+        except Exception as exc:
+            _release_mark_manual_interference(context, exc)
+            raise
         _journal_update(context, "promoting")
         promote = subprocess.run(
             git_cmd + ["update-ref", f"refs/heads/{branch}", candidate_sha, old_sha],
@@ -1726,9 +2329,63 @@ def _upgrade_release_transaction(
             errors="replace",
         )
         if promote.returncode != 0:
+            try:
+                _validate_release_git_snapshot(
+                    git_cmd, root, pre_cas_snapshot, label="failed promotion CAS"
+                )
+            except Exception as exc:
+                _release_mark_manual_interference(context, exc)
+                raise
+            _journal_update(context, "promotion-cas-failed")
             raise RuntimeError(
                 "Live maintenance branch changed before promotion; candidate and backup were preserved."
             )
+
+        candidate_tree_sha = _release_git_sha(
+            git_cmd,
+            root,
+            ["rev-parse", "--verify", f"{candidate_sha}^{{tree}}"],
+            label="candidate tree",
+        )
+        post_cas = _capture_release_git_snapshot(
+            git_cmd, root, maintenance_ref=maintenance_ref
+        )
+        try:
+            _release_assert_identity(
+                post_cas,
+                symbolic_head=maintenance_ref,
+                head_sha=candidate_sha,
+                maintenance_ref_sha=candidate_sha,
+                label="promotion CAS postcondition",
+            )
+            if (
+                post_cas.index_tree_sha != pre_cas_snapshot.index_tree_sha
+                or post_cas.tracked_diff_sha256 != pre_cas_snapshot.tracked_diff_sha256
+                or post_cas.untracked_count != pre_cas_snapshot.untracked_count
+                or post_cas.head_tree_sha != candidate_tree_sha
+            ):
+                raise ReleaseGitStateError(
+                    "Live checkout differs from the expected temporary ref/worktree skew."
+                )
+        except Exception as exc:
+            _release_mark_manual_interference(context, exc)
+            raise
+        _release_snapshot_with_journal(context, "post_cas_snapshot", post_cas)
+
+        candidate_expected = _release_clean_snapshot(
+            post_cas,
+            symbolic_head=maintenance_ref,
+            head_sha=candidate_sha,
+            maintenance_ref_sha=candidate_sha,
+            head_tree_sha=candidate_tree_sha,
+        )
+        try:
+            _validate_release_git_snapshot(
+                git_cmd, root, post_cas, label="live synchronization precondition"
+            )
+        except Exception as exc:
+            _release_mark_manual_interference(context, exc)
+            raise
         reset = subprocess.run(
             git_cmd + ["reset", "--hard", candidate_sha],
             cwd=root,
@@ -1737,8 +2394,18 @@ def _upgrade_release_transaction(
             encoding="utf-8",
             errors="replace",
         )
-        final_sha = _git_resolve_commit(git_cmd, root, "HEAD")
-        if reset.returncode != 0 or final_sha != candidate_sha or _git_working_tree_dirty(git_cmd, root):
+        if reset.returncode != 0:
+            try:
+                current_after_reset_failure = _capture_release_git_snapshot(
+                    git_cmd, root, maintenance_ref=maintenance_ref
+                )
+                if current_after_reset_failure != post_cas:
+                    raise ReleaseGitStateError(
+                        "Live checkout changed while candidate synchronization failed."
+                    )
+            except Exception as exc:
+                _release_mark_manual_interference(context, exc)
+                raise
             _journal_update(context, "promotion-needs-recovery")
             raise RuntimeError(
                 f"Promotion did not verify. Recover with backup ref {backup_ref} "
@@ -1749,44 +2416,50 @@ def _upgrade_release_transaction(
                 f"{journal.get('stash_sha') or '<none>'} "
                 f"(stash_pending={journal.get('stash_pending')})."
             )
-        _journal_update(context, "promoted")
+        try:
+            _validate_release_git_snapshot(
+                git_cmd, root, candidate_expected, label="live synchronization postcondition"
+            )
+        except Exception as exc:
+            _release_mark_manual_interference(context, exc)
+            raise RuntimeError(
+                f"Promotion did not verify. Recover with backup ref {backup_ref} "
+                f"and candidate {candidate_path}. Journal: {context.journal_path}."
+            ) from exc
+        _release_snapshot_with_journal(
+            context,
+            "candidate_snapshot",
+            candidate_expected,
+            phase="promoted",
+            candidate_sha=candidate_sha,
+        )
+        # The candidate is isolated transaction evidence, not live user state.
+        # Once promotion and the live synchronization postcondition have both
+        # been verified, clean it at the end of this transaction so callers
+        # that defer outer finalization do not strand a successful candidate.
+        # A failed cleanup remains recoverable through the outer finalizer.
+        if journal.get("candidate_created") and not journal.get("candidate_cleanup"):
+            try:
+                candidate_cleaned = _release_cleanup_candidate(git_cmd, root, context)
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except BaseException as exc:
+                logger.warning(
+                    "Release candidate cleanup could not be completed; recovery journal kept at %s: %s",
+                    context.journal_path,
+                    exc,
+                )
+                candidate_cleaned = False
+            if candidate_cleaned:
+                _journal_update(context, "candidate-cleanup", candidate_cleanup=True)
+            else:
+                _journal_update(context, "candidate-cleanup-failed", candidate_cleanup=False)
     except BaseException:
         # Candidate and journal are recovery evidence across every exception,
         # including KeyboardInterrupt/SystemExit.  The outer finalizer decides
         # whether it is safe to return user state or must leave guidance.
         raise
 
-    cleanup = subprocess.run(
-        git_cmd + ["worktree", "remove", "--force", str(candidate_path)],
-        cwd=root,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
-    branch_cleanup_ok = False
-    if cleanup.returncode == 0:
-        branch_cleanup = subprocess.run(
-            git_cmd + ["branch", "-D", candidate_branch],
-            cwd=root,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
-        branch_cleanup_ok = (
-            branch_cleanup.returncode == 0
-            and _git_resolve_commit(git_cmd, root, f"refs/heads/{candidate_branch}") is None
-            and not candidate_path.exists()
-        )
-    if branch_cleanup_ok:
-        _journal_update(context, "candidate-cleanup", candidate_cleanup=True)
-    else:
-        _journal_update(context, "candidate-cleanup-failed", candidate_cleanup=False)
-        logger.warning(
-            "Upgrade promoted successfully but candidate cleanup failed; recovery journal kept at %s",
-            context.journal_path,
-        )
     return ReleaseUpgradeResult(
         old_sha,
         target_sha,
@@ -1808,16 +2481,17 @@ def _prepare_and_promote_release(
 ) -> ReleaseUpgradeResult:
     """Capture user state, promote a release, and defer restore to finalization."""
 
-    root = Path(cwd)
+    root = Path(cwd).resolve()
     branch = "hermes-release"
+    maintenance_ref = f"refs/heads/{branch}"
     _validate_release_tag_name(git_cmd, root, release_tag)
     _reject_unfinished_release_transaction(git_cmd, root)
-    original_branch, original_head_sha = _capture_release_checkout_identity(git_cmd, root)
-    maintenance_sha = _git_resolve_commit(git_cmd, root, f"refs/heads/{branch}")
-    if maintenance_sha is None:
-        raise RuntimeError(
-            "Local maintenance branch 'hermes-release' is missing; refusing to create it from an arbitrary branch."
-        )
+    original_snapshot = _capture_release_git_snapshot(
+        git_cmd, root, maintenance_ref=maintenance_ref
+    )
+    original_branch = _release_snapshot_branch(original_snapshot)
+    original_head_sha = original_snapshot.head_sha
+    maintenance_sha = original_snapshot.maintenance_ref_sha
     metadata = _read_release_base_metadata_at_commit(git_cmd, root, maintenance_sha)
     _validate_release_base_metadata(git_cmd, root, metadata, maintenance_sha)
     payload = _git_diff_bytes(git_cmd, root, metadata.base_sha, maintenance_sha)
@@ -1832,7 +2506,25 @@ def _prepare_and_promote_release(
         target_sha=target_sha.lower(),
         payload=payload,
     )
+    _release_snapshot_with_journal(context, "original_snapshot", original_snapshot)
+    original_clean_snapshot = _release_clean_snapshot(
+        original_snapshot,
+        symbolic_head=original_snapshot.symbolic_head,
+        head_sha=original_snapshot.head_sha,
+        maintenance_ref_sha=maintenance_sha,
+        head_tree_sha=original_snapshot.head_tree_sha,
+    )
+    _release_snapshot_with_journal(
+        context, "original_clean_snapshot", original_clean_snapshot
+    )
     try:
+        try:
+            _validate_release_git_snapshot(
+                git_cmd, root, original_snapshot, label="stash capture precondition"
+            )
+        except Exception as exc:
+            _release_mark_manual_interference(context, exc)
+            raise
         pre_capture_status = subprocess.run(
             git_cmd + ["status", "--porcelain"],
             cwd=root,
@@ -1863,6 +2555,13 @@ def _prepare_and_promote_release(
                 "Could not inspect local state before stash capture"
                 + (f": {detail.splitlines()[0]}" if detail else "")
             )
+        try:
+            _validate_release_git_snapshot(
+                git_cmd, root, original_snapshot, label="stash mutation precondition"
+            )
+        except Exception as exc:
+            _release_mark_manual_interference(context, exc)
+            raise
         _journal_update(context, "stash-capture-started")
         stash_ref = _stash_local_changes_if_needed(
             git_cmd, root, marker=context.journal["stash_marker"]
@@ -1914,6 +2613,34 @@ def _prepare_and_promote_release(
                 stash_capture_confirmed=False,
                 stash_capture_uncertain=False,
             )
+        post_stash_expected = _release_clean_snapshot(
+            original_snapshot,
+            symbolic_head=original_snapshot.symbolic_head,
+            head_sha=original_snapshot.head_sha,
+            maintenance_ref_sha=maintenance_sha,
+            head_tree_sha=original_snapshot.head_tree_sha,
+        )
+        try:
+            post_stash_snapshot = _validate_release_git_snapshot(
+                git_cmd,
+                root,
+                post_stash_expected,
+                label="post-stash clean checkout",
+            )
+        except Exception as exc:
+            _release_mark_manual_interference(context, exc)
+            raise
+        _release_snapshot_with_journal(
+            context,
+            "post_stash_snapshot",
+            post_stash_snapshot,
+        )
+        maintenance_tree_sha = _release_git_sha(
+            git_cmd,
+            root,
+            ["rev-parse", "--verify", f"{maintenance_sha}^{{tree}}"],
+            label="maintenance tree before checkout",
+        )
         if original_branch != branch:
             checkout = subprocess.run(
                 git_cmd + ["checkout", branch],
@@ -1929,9 +2656,28 @@ def _prepare_and_promote_release(
                     f"Could not switch to local maintenance branch '{branch}': "
                     f"{detail.splitlines()[0] if detail else 'git checkout failed'}"
                 )
-        current_branch, current_head = _capture_release_checkout_identity(git_cmd, root)
-        if current_branch != branch or current_head != maintenance_sha:
-            raise RuntimeError("Maintenance branch checkout did not verify before promotion.")
+            maintenance_expected = _release_clean_snapshot(
+                post_stash_snapshot,
+                symbolic_head=maintenance_ref,
+                head_sha=maintenance_sha,
+                maintenance_ref_sha=maintenance_sha,
+                head_tree_sha=maintenance_tree_sha,
+            )
+            try:
+                _validate_release_git_snapshot(
+                    git_cmd,
+                    root,
+                    maintenance_expected,
+                    label="maintenance branch checkout",
+                )
+            except Exception as exc:
+                _release_mark_manual_interference(context, exc)
+                raise
+            _release_snapshot_with_journal(
+                context,
+                "maintenance_snapshot",
+                maintenance_expected,
+            )
         result = _upgrade_release_transaction(
             git_cmd,
             root,
@@ -1966,6 +2712,28 @@ def _prepare_and_promote_release(
                         stash_capture_confirmed=True,
                         stash_capture_uncertain=False,
                     )
+                    if "post_stash_snapshot" not in context.journal:
+                        recovered_original = _release_context_snapshot(
+                            context, "original_snapshot"
+                        )
+                        recovered_expected = _release_clean_snapshot(
+                            recovered_original,
+                            symbolic_head=recovered_original.symbolic_head,
+                            head_sha=recovered_original.head_sha,
+                            maintenance_ref_sha=recovered_original.maintenance_ref_sha,
+                            head_tree_sha=recovered_original.head_tree_sha,
+                        )
+                        recovered_snapshot = _validate_release_git_snapshot(
+                            git_cmd,
+                            root,
+                            recovered_expected,
+                            label="recovered post-stash clean checkout",
+                        )
+                        _release_snapshot_with_journal(
+                            context,
+                            "post_stash_snapshot",
+                            recovered_snapshot,
+                        )
                 except BaseException as exc:
                     logger.warning("Could not durably confirm recovered stash: %s", exc)
             else:
@@ -1985,6 +2753,24 @@ def _prepare_and_promote_release(
                 _refresh_transaction_stash_identity(git_cmd, root, context)
             except BaseException as exc:
                 logger.warning("Could not refresh stash identity during finalization: %s", exc)
+        if (
+            context.journal.get("local_state_present") is False
+            and not _release_has_manual_interference(context)
+        ):
+            # Preserve the ordinary update contract for a checkout that was
+            # proven to contain no user state.  This fallback runs before the
+            # transactional release finalizer; the finalizer itself never
+            # resets or cleans the live checkout.
+            subprocess.run(
+                git_cmd + ["reset", "--hard", "HEAD"],
+                cwd=root,
+                capture_output=True,
+            )
+            subprocess.run(
+                git_cmd + ["clean", "-fd"],
+                cwd=root,
+                capture_output=True,
+            )
         _finalize_release_upgrade(git_cmd, root, context, input_fn=input_fn)
         raise
 
@@ -2101,60 +2887,13 @@ def _transaction_is_promoted(
     return live_sha == candidate_sha and journal.get("phase") in {
         "promoting",
         "promoted",
+        "promotion-needs-recovery",
         "candidate-cleanup",
         "candidate-cleanup-failed",
         "finalizing",
         "stash-restore-conflict",
         "finalized",
     }
-
-
-def _prepare_worktree_for_release_restore(
-    git_cmd: list[str],
-    root: Path,
-    *,
-    stash_pending: bool,
-    stash_capture_required: bool = False,
-    stash_capture_confirmed: bool = False,
-) -> None:
-    """Discard update output only after local-state capture is authorized."""
-
-    if stash_capture_required and not stash_capture_confirmed:
-        raise RuntimeError(
-            "Refusing destructive release restore preparation before stash capture "
-            "is durably confirmed."
-        )
-    reset = subprocess.run(
-        git_cmd + ["reset", "--hard", "HEAD"],
-        cwd=root,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
-    if reset.returncode != 0:
-        detail = (reset.stderr or reset.stdout or "").strip()
-        raise RuntimeError(
-            "Could not clear generated tracked files before release recovery"
-            + (f": {detail.splitlines()[0]}" if detail else "")
-        )
-    # A pending autostash owns every ordinary untracked path captured before
-    # promotion.  Removing generated untracked files is therefore safe here;
-    # ignored paths (venvs/node_modules) are intentionally untouched.
-    clean = subprocess.run(
-        git_cmd + ["clean", "-fd"],
-        cwd=root,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
-    if clean.returncode != 0:
-        detail = (clean.stderr or clean.stdout or "").strip()
-        raise RuntimeError(
-            "Could not clear generated untracked files before release recovery"
-            + (f": {detail.splitlines()[0]}" if detail else "")
-        )
 
 
 def _restore_original_release_checkout(
@@ -2635,6 +3374,96 @@ def _mark_release_finalized(context: ReleaseUpgradeContext) -> None:
     context.final_marker_prior_digest = None
 
 
+def _release_expected_original_clean_snapshot(
+    original: ReleaseGitSnapshot,
+    candidate: ReleaseGitSnapshot | None,
+) -> ReleaseGitSnapshot:
+    """Build the clean checkout expected immediately before stash apply."""
+    if candidate is not None and original.symbolic_head == candidate.maintenance_ref:
+        head_sha = candidate.head_sha
+        head_tree_sha = candidate.head_tree_sha
+    else:
+        head_sha = original.head_sha
+        head_tree_sha = original.head_tree_sha
+    maintenance_ref_sha = candidate.maintenance_ref_sha if candidate else original.maintenance_ref_sha
+    return _release_clean_snapshot(
+        original,
+        symbolic_head=original.symbolic_head,
+        head_sha=head_sha,
+        maintenance_ref_sha=maintenance_ref_sha,
+        head_tree_sha=head_tree_sha,
+    )
+
+
+def _release_cleanup_candidate(
+    git_cmd: list[str], root: Path, context: ReleaseUpgradeContext
+) -> bool:
+    journal = context.journal
+    transaction_id = journal.get("transaction_id")
+    transactions = context.common_dir / "hermes-upgrade-transactions"
+    transaction_dir = Path(context.transaction_dir)
+    if (
+        not isinstance(transaction_id, str)
+        or not re.fullmatch(r"[0-9a-f]{32}", transaction_id)
+        or transaction_dir.parent != transactions
+        or transaction_dir.name != transaction_id
+    ):
+        logger.warning(
+            "Refusing release candidate cleanup for an untrusted transaction topology: %s",
+            context.journal_path,
+        )
+        return False
+
+    expected_candidate_path = context.common_dir.parent.parent / (
+        f"hermes-upgrade-candidate-{transaction_id}"
+    )
+    candidate_path_value = journal.get("candidate_path")
+    candidate_branch = journal.get("candidate_branch")
+    if (
+        not isinstance(candidate_path_value, str)
+        or Path(candidate_path_value) != expected_candidate_path
+        or not isinstance(candidate_branch, str)
+        or candidate_branch != f"hermes-upgrade-candidate/{transaction_id}"
+    ):
+        logger.warning(
+            "Refusing release candidate cleanup for an escaped candidate path or branch: %s",
+            context.journal_path,
+        )
+        return False
+    candidate_path = expected_candidate_path
+    try:
+        candidate_info = candidate_path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return False
+    if stat.S_ISLNK(candidate_info.st_mode) or not stat.S_ISDIR(candidate_info.st_mode):
+        logger.warning("Refusing non-directory release candidate cleanup path: %s", candidate_path)
+        return False
+    cleanup = subprocess.run(
+        git_cmd + ["worktree", "remove", "--force", str(candidate_path)],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if cleanup.returncode != 0:
+        return False
+    branch_cleanup = subprocess.run(
+        git_cmd + ["branch", "-D", candidate_branch],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    return (
+        branch_cleanup.returncode == 0
+        and _git_resolve_commit(git_cmd, root, f"refs/heads/{candidate_branch}") is None
+        and not candidate_path.exists()
+    )
+
 
 def _finalize_release_upgrade(
     git_cmd: list[str],
@@ -2645,7 +3474,7 @@ def _finalize_release_upgrade(
 ) -> bool:
     """Restore the original checkout and apply/drop the immutable stash once."""
 
-    root = Path(cwd)
+    root = Path(cwd).resolve()
     if context.final_marker_write_uncertain is True:
         # A terminal marker write may have replaced the file before its
         # required child-directory fsync failed.  Reconcile only the journal;
@@ -2711,12 +3540,22 @@ def _finalize_release_upgrade(
             print(f"⚠ Release user-state recovery is incomplete; journal: {context.journal_path}")
             return False
 
+        if _release_has_manual_interference(context):
+            print(
+                "✗ Release finalization detected manual Git interference; "
+                "refusing destructive recovery."
+            )
+            print(f"  Recovery journal retained at {context.journal_path}")
+            return False
+
         if journal.get("stash_capture_uncertain") and not journal.get(
             "stash_capture_confirmed"
         ):
             stash_sha = None
-        else:
+        elif journal.get("stash_pending"):
             stash_sha = _refresh_transaction_stash_identity(git_cmd, root, context)
+        else:
+            stash_sha = journal.get("stash_sha") if journal.get("stash_capture_confirmed") else None
         stash_pending = bool(journal.get("stash_pending"))
         stash_capture_required = journal.get("stash_capture_required")
         stash_capture_confirmed = bool(journal.get("stash_capture_confirmed"))
@@ -2764,18 +3603,167 @@ def _finalize_release_upgrade(
             _print_stash_cleanup_guidance(stash_sha)
             return False
 
-        _journal_update(context, "finalizing")
-        _prepare_worktree_for_release_restore(
-            git_cmd,
-            root,
-            stash_pending=stash_pending,
-            stash_capture_required=stash_capture_required is not False,
-            stash_capture_confirmed=stash_capture_confirmed,
-        )
-        if not journal.get("checkout_restored"):
-            _restore_original_release_checkout(git_cmd, root, context)
-            _journal_update(context, checkout_restored=True)
+        # The exact snapshot is the preparation step.  Never reset or clean a
+        # release checkout to make it fit an expectation: any mismatch is
+        # manual interference and therefore a zero-mutator failure.
+        candidate_snapshot: ReleaseGitSnapshot | None = None
+        try:
+            guard_identity_only = False
+            if journal.get("checkout_restored"):
+                guard_key = (
+                    "restored_snapshot" if journal.get("stash_applied")
+                    else "restore_clean_snapshot"
+                )
+                guard_snapshot = _release_context_snapshot(context, guard_key)
+                guard_identity_only = bool(journal.get("stash_applied"))
+                if not guard_identity_only and not _release_snapshot_is_clean(guard_snapshot):
+                    raise ReleaseGitStateError(
+                        "Stored pre-apply release checkout is not clean."
+                    )
+            elif "candidate_snapshot" in journal:
+                candidate_snapshot = _release_context_snapshot(context, "candidate_snapshot")
+                if not _release_snapshot_is_clean(candidate_snapshot):
+                    raise ReleaseGitStateError(
+                        "Stored promoted release checkout is not clean."
+                    )
+                guard_snapshot = candidate_snapshot
+            elif "post_cas_snapshot" in journal:
+                # The CAS has moved the maintenance ref, but a failed live
+                # synchronization can leave the old index/worktree temporarily
+                # skewed from that ref.  This exact snapshot is the only
+                # authorized recovery entry for that phase; it is intentionally
+                # not classified as a clean checkout.
+                guard_snapshot = _release_context_snapshot(context, "post_cas_snapshot")
+            elif "maintenance_snapshot" in journal:
+                guard_snapshot = _release_context_snapshot(context, "maintenance_snapshot")
+                if not _release_snapshot_is_clean(guard_snapshot):
+                    raise ReleaseGitStateError(
+                        "Stored maintenance checkout is not clean."
+                    )
+            elif "post_stash_snapshot" in journal:
+                guard_snapshot = _release_context_snapshot(context, "post_stash_snapshot")
+                if not _release_snapshot_is_clean(guard_snapshot):
+                    raise ReleaseGitStateError(
+                        "Stored post-stash checkout is not clean."
+                    )
+            else:
+                raise ReleaseGitStateError(
+                    "No bound clean release snapshot is available for finalization."
+                )
+            if guard_identity_only:
+                _validate_release_restored_snapshot_identity(
+                    git_cmd,
+                    root,
+                    guard_snapshot,
+                    label="finalization entry",
+                )
+            else:
+                _validate_release_git_snapshot(
+                    git_cmd,
+                    root,
+                    guard_snapshot,
+                    label="finalization entry",
+                )
+        except Exception as exc:
+            _release_mark_manual_interference(context, f"finalization incomplete: {exc}")
+            print(
+                "✗ Release finalization detected live checkout interference; "
+                "no reset, clean, checkout, stash apply, or stash drop was run."
+            )
+            print(f"  Recovery journal retained at {context.journal_path}")
+            return False
 
+        prior_phase = journal.get("phase")
+        prior_stash_applied = bool(journal.get("stash_applied"))
+        _journal_update(context, "finalizing")
+        original_snapshot = _release_context_snapshot(context, "original_snapshot")
+        original_branch = journal.get("original_branch")
+        maintenance_branch = journal.get("maintenance_branch", "hermes-release")
+        was_checkout_restored = bool(journal.get("checkout_restored"))
+        candidate_promotion_incomplete = False
+        if (
+            "post_cas_snapshot" in journal
+            and "candidate_snapshot" not in journal
+            and _transaction_is_promoted(git_cmd, root, context)
+        ):
+            post_cas_snapshot = _release_context_snapshot(context, "post_cas_snapshot")
+            candidate_sha = journal.get("candidate_sha")
+            if not isinstance(candidate_sha, str) or _SHA_RE.fullmatch(candidate_sha) is None:
+                raise ReleaseGitStateError("Promotion recovery candidate SHA is malformed.")
+            candidate_tree_sha = _release_git_sha(
+                git_cmd,
+                root,
+                ["rev-parse", "--verify", f"{candidate_sha}^{{tree}}"],
+                label="promotion recovery candidate tree",
+            )
+            candidate_snapshot = _release_clean_snapshot(
+                post_cas_snapshot,
+                symbolic_head=maintenance_branch,
+                head_sha=candidate_sha,
+                maintenance_ref_sha=candidate_sha,
+                head_tree_sha=candidate_tree_sha,
+            )
+            candidate_promotion_incomplete = True
+        if not was_checkout_restored:
+            # A promoted checkout on the maintenance branch is already the
+            # correct clean state; do not replay even a same-branch checkout.
+            needs_checkout = (
+                candidate_promotion_incomplete
+                or (
+                    candidate_snapshot is not None
+                    and original_branch != maintenance_branch
+                )
+            ) or (
+                candidate_snapshot is None
+                and original_branch != maintenance_branch
+            ) or (
+                candidate_snapshot is None
+                and "maintenance_snapshot" in journal
+            )
+            if needs_checkout:
+                if guard_identity_only:
+                    _validate_release_restored_snapshot_identity(
+                        git_cmd,
+                        root,
+                        guard_snapshot,
+                        label="immediate pre-original-checkout restoration",
+                    )
+                else:
+                    _validate_release_git_snapshot(
+                        git_cmd,
+                        root,
+                        guard_snapshot,
+                        label="immediate pre-original-checkout restoration",
+                    )
+                _restore_original_release_checkout(git_cmd, root, context)
+            restore_clean_snapshot = _release_expected_original_clean_snapshot(
+                original_snapshot,
+                candidate_snapshot,
+            )
+            try:
+                _validate_release_git_snapshot(
+                    git_cmd,
+                    root,
+                    restore_clean_snapshot,
+                    label="pre-stash-apply checkout",
+                )
+            except Exception as exc:
+                _release_mark_manual_interference(context, f"finalization incomplete: {exc}")
+                print(f"  Recovery journal retained at {context.journal_path}")
+                return False
+            _release_snapshot_with_journal(
+                context,
+                "restore_clean_snapshot",
+                restore_clean_snapshot,
+                checkout_restored=True,
+            )
+            was_checkout_restored = True
+        else:
+            restore_clean_snapshot = _release_context_snapshot(
+                context, "restore_clean_snapshot"
+            )
+
+        final_snapshot: ReleaseGitSnapshot = restore_clean_snapshot
         if stash_pending:
             assert stash_sha is not None
             if not journal.get("stash_apply_attempted"):
@@ -2791,6 +3779,15 @@ def _finalize_release_upgrade(
                         f"Immutable stash {stash_sha} is no longer reachable; "
                         f"journal: {context.journal_path}"
                     )
+                # This is the last read-only guard before the first necessary
+                # live mutator, stash apply.  The preceding checkout was
+                # separately verified against the clean restore snapshot.
+                _validate_release_git_snapshot(
+                    git_cmd,
+                    root,
+                    restore_clean_snapshot,
+                    label="immediate pre-stash-apply checkout",
+                )
                 _journal_update(context, stash_apply_attempted=True)
                 restored = _restore_stashed_changes(
                     git_cmd,
@@ -2799,6 +3796,8 @@ def _finalize_release_upgrade(
                     prompt_user=False,
                     input_fn=input_fn,
                     restore_index=True,
+                    drop_stash=False,
+                    preserve_conflict_state=True,
                 )
                 if not restored:
                     _journal_update(context, "stash-restore-conflict")
@@ -2807,9 +3806,51 @@ def _finalize_release_upgrade(
                         stash_sha, _resolve_stash_selector(git_cmd, root, stash_sha)
                     )
                     return False
-                _journal_update(context, stash_applied=True)
+                try:
+                    restored_snapshot = _validate_release_restored_snapshot_identity(
+                        git_cmd,
+                        root,
+                        restore_clean_snapshot,
+                        label="post-stash-apply restoration",
+                    )
+                except Exception as exc:
+                    _release_mark_manual_interference(
+                        context, f"finalization incomplete: {exc}"
+                    )
+                    print(f"  Recovery journal retained at {context.journal_path}")
+                    return False
+                _release_snapshot_with_journal(
+                    context,
+                    "restored_snapshot",
+                    restored_snapshot,
+                    stash_applied=True,
+                )
+                final_snapshot = restored_snapshot
+            else:
+                final_snapshot = _release_context_snapshot(context, "restored_snapshot")
+                try:
+                    _validate_release_restored_snapshot_identity(
+                        git_cmd,
+                        root,
+                        final_snapshot,
+                        label="pre-stash-drop restoration",
+                    )
+                except Exception as exc:
+                    _release_mark_manual_interference(
+                        context, f"finalization incomplete: {exc}"
+                    )
+                    print(f"  Recovery journal retained at {context.journal_path}")
+                    return False
 
+            # Stash deletion is allowed only after the captured user-state
+            # snapshot still has the same immutable checkout identity.
             selector = _resolve_stash_selector(git_cmd, root, stash_sha)
+            _validate_release_restored_snapshot_identity(
+                git_cmd,
+                root,
+                final_snapshot,
+                label="immediate pre-stash-drop restoration",
+            )
             if selector is not None:
                 drop = subprocess.run(
                     git_cmd + ["stash", "drop", selector],
@@ -2832,25 +3873,92 @@ def _finalize_release_upgrade(
                     return False
             _journal_update(context, stash_pending=False)
         else:
+            if journal.get("stash_applied"):
+                final_snapshot = _release_context_snapshot(context, "restored_snapshot")
+                _validate_release_restored_snapshot_identity(
+                    git_cmd,
+                    root,
+                    final_snapshot,
+                    label="final restored checkout",
+                )
+            else:
+                _validate_release_git_snapshot(
+                    git_cmd,
+                    root,
+                    final_snapshot,
+                    label="final restored checkout",
+                )
             _journal_update(context, stash_pending=False)
 
-        final_sha = _git_resolve_commit(git_cmd, root, "HEAD")
-        promoted = _transaction_is_promoted(git_cmd, root, context)
-        original_branch = journal.get("original_branch")
-        expected_sha = journal["original_head_sha"]
-        if promoted and original_branch == journal.get("maintenance_branch"):
-            expected_sha = journal.get("candidate_sha") or expected_sha
-        if final_sha != expected_sha:
-            raise RuntimeError(
-                f"Final release checkout verification failed: expected {expected_sha}, "
-                f"got {final_sha}"
+        # Candidate evidence is retained until user bytes/index/status are
+        # verified restored.  Manual interference returned above before this
+        # point, so cleanup cannot erase evidence after a mismatch.
+        if journal.get("stash_applied"):
+            _validate_release_restored_snapshot_identity(
+                git_cmd,
+                root,
+                final_snapshot,
+                label="pre-candidate-cleanup restored checkout",
             )
-        if journal.get("candidate_created") and not journal.get("candidate_cleanup"):
-            print(
-                "⚠ Release candidate cleanup is incomplete; keeping durable journal "
-                f"at {context.journal_path}"
+        else:
+            _validate_release_git_snapshot(
+                git_cmd,
+                root,
+                final_snapshot,
+                label="pre-candidate-cleanup checkout",
+            )
+        candidate_cleanup_failed_before_restore = (
+            prior_phase == "candidate-cleanup-failed"
+            and not prior_stash_applied
+        )
+        if candidate_promotion_incomplete or (
+            journal.get("candidate_created") and "candidate_snapshot" not in journal
+        ):
+            _journal_update(
+                context,
+                "promotion-incomplete",
+                candidate_cleanup=False,
+            )
+            logger.warning(
+                "Release promotion did not reach a verified candidate; recovery journal kept at %s",
+                context.journal_path,
             )
             return False
+        if candidate_cleanup_failed_before_restore:
+            _journal_update(
+                context,
+                "candidate-cleanup-failed",
+                candidate_cleanup=False,
+            )
+            logger.warning(
+                "Release candidate cleanup remains incomplete; recovery journal kept at %s",
+                context.journal_path,
+            )
+            return False
+        if journal.get("candidate_created") and not journal.get("candidate_cleanup"):
+            if not _release_cleanup_candidate(git_cmd, root, context):
+                _journal_update(context, "candidate-cleanup-failed", candidate_cleanup=False)
+                logger.warning(
+                    "Release candidate cleanup failed; recovery journal kept at %s",
+                    context.journal_path,
+                )
+                return False
+            _journal_update(context, "candidate-cleanup", candidate_cleanup=True)
+
+        if journal.get("stash_applied"):
+            _validate_release_restored_snapshot_identity(
+                git_cmd,
+                root,
+                final_snapshot,
+                label="terminal restored checkout",
+            )
+        else:
+            _validate_release_git_snapshot(
+                git_cmd,
+                root,
+                final_snapshot,
+                label="terminal restored checkout",
+            )
         _mark_release_finalized(context)
         # Mark the verified terminal state before acknowledging journal removal.
         # Any retry now takes the filesystem-only path above.
@@ -4493,6 +5601,8 @@ def _restore_stashed_changes(
     prompt_user: bool = False,
     input_fn=None,
     restore_index: bool = False,
+    drop_stash: bool = True,
+    preserve_conflict_state: bool = False,
 ) -> bool:
     if prompt_user:
         print()
@@ -4562,20 +5672,28 @@ def _restore_stashed_changes(
         print("\nYour stashed changes are preserved — nothing is lost.")
         print(f"  Stash ref: {stash_ref}")
 
-        # Always reset to clean state — leaving conflict markers in source
-        # files makes hermes completely unrunnable (SyntaxError on import).
-        # The user's changes are safe in the stash for manual recovery.
-        subprocess.run(
-            git_cmd + ["reset", "--hard", "HEAD"],
-            cwd=cwd,
-            capture_output=True,
-        )
-        print("Working tree reset to clean state.")
+        if not preserve_conflict_state:
+            # Ordinary update recovery retains its historical behavior.  The
+            # release transaction opts into preserving the conflict state so
+            # finalization never replays a destructive reset.
+            subprocess.run(
+                git_cmd + ["reset", "--hard", "HEAD"],
+                cwd=cwd,
+                capture_output=True,
+            )
+            print("Working tree reset to clean state.")
+        else:
+            print("  Conflict state is preserved for manual resolution.")
         print(f"Restore your changes later with: git stash apply {stash_ref}")
         # Don't sys.exit — the code update itself succeeded, only the stash
         # restore had conflicts.  Let cmd_update continue with pip install,
         # skill sync, and gateway restart.
         return False
+
+    if not drop_stash:
+        print("⚠ Local changes were restored on top of the updated codebase.")
+        print("  Review `git diff` / `git status` if Hermes behaves unexpectedly.")
+        return True
 
     stash_selector = _resolve_stash_selector(git_cmd, cwd, stash_ref)
     if stash_selector is None:

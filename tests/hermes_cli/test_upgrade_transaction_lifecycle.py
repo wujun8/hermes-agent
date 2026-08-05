@@ -1428,3 +1428,174 @@ def test_directory_fsync_windows_path_is_explicit_best_effort(tmp_path, monkeypa
     with caplog.at_level("WARNING"):
         update_cmd._fsync_directory(tmp_path, required=True)
     assert "best effort" in caplog.text.lower()
+
+
+def test_manual_branch_switch_after_promotion_cas_preserves_unrelated_branch(
+    tmp_path, monkeypatch
+):
+    """A checkout race after the ref CAS must be caught before live reset."""
+    repo, _base_sha, _maintenance_sha, target_sha = _release_repo(tmp_path)
+    _git(repo, "switch", "main")
+    main_sha = _git(repo, "rev-parse", "refs/heads/main").stdout.decode().strip()
+    main_bytes = (repo / "README.txt").read_bytes()
+    main_status = _git(repo, "status", "--porcelain=v2", check=True).stdout
+    main_index_tree = _git(repo, "write-tree").stdout
+
+    real_run = update_cmd.subprocess.run
+    calls: list[tuple[list[str], Path | None]] = []
+    injected = False
+    injection_index: int | None = None
+
+    def run(command, *args, **kwargs):
+        nonlocal injected, injection_index
+        normalized = [str(part) for part in command]
+        command_cwd = Path(kwargs["cwd"]).resolve() if kwargs.get("cwd") else None
+        calls.append((normalized, command_cwd))
+        result = real_run(command, *args, **kwargs)
+        if (
+            not injected
+            and command_cwd == repo.resolve()
+            and len(normalized) == 5
+            and normalized[1:2] == ["update-ref"]
+            and normalized[2] == "refs/heads/hermes-release"
+        ):
+            injected = True
+            # The command has completed at this point.  Record the boundary
+            # before the forced manual checkout so the oracle only inspects
+            # production commands issued after the race, not the legitimate
+            # live checkout into hermes-release before CAS or candidate
+            # worktree setup.
+            injection_index = len(calls)
+            switched = real_run(
+                ["git", "switch", "--force", "main"],
+                cwd=repo,
+                capture_output=True,
+            )
+            assert switched.returncode == 0, switched.stderr
+        return result
+
+    monkeypatch.setattr(update_cmd.subprocess, "run", run)
+    with pytest.raises(RuntimeError, match="interference|checkout changed|promotion"):
+        update_cmd._prepare_and_promote_release(
+            ["git"], repo, "v2.0.0", target_sha,
+            candidate_validator=_test_candidate_validator,
+        )
+
+    assert injected is True
+    assert _git(repo, "rev-parse", "refs/heads/main").stdout.decode().strip() == main_sha
+    assert (repo / "README.txt").read_bytes() == main_bytes
+    assert _git(repo, "status", "--porcelain=v2").stdout == main_status
+    assert _git(repo, "write-tree").stdout == main_index_tree
+    journal_path, journal = _latest_journal(repo)
+    assert journal["phase"] == "manual-interference"
+    assert journal["backup_created"] is True
+    assert _git(repo, "rev-parse", journal["backup_ref"]).stdout.decode().strip() == journal["old_sha"]
+    assert Path(journal["candidate_path"]).exists()
+    assert injection_index is not None
+    forbidden = [
+        (command, cwd)
+        for command, cwd in calls[injection_index:]
+        if cwd == repo.resolve()
+        and len(command) > 1
+        and (
+            command[1] in {"reset", "clean", "checkout"}
+            or command[1:3] in (["stash", "apply"], ["stash", "drop"])
+        )
+    ]
+    assert not forbidden, forbidden
+    assert journal_path.exists()
+
+
+def test_finalizer_branch_switch_and_manual_index_changes_fail_closed(
+    tmp_path, monkeypatch
+):
+    """Finalizer entry must not reset an unrelated branch with manual state."""
+    repo, _base_sha, _maintenance_sha, target_sha = _release_repo(tmp_path)
+    result = update_cmd._prepare_and_promote_release(
+        ["git"], repo, "v2.0.0", target_sha,
+        candidate_validator=_test_candidate_validator,
+    )
+    assert result.context is not None
+    _git(repo, "switch", "main")
+    (repo / "README.txt").write_bytes(b"manual main bytes\r\n")
+    _git(repo, "add", "--", "README.txt")
+    (repo / "new-main.bin").write_bytes(b"\x00manual\xff\r\n")
+    expected_bytes = (repo / "README.txt").read_bytes()
+    expected_status = _git(repo, "status", "--porcelain=v2").stdout
+    expected_index_tree = _git(repo, "write-tree").stdout
+    main_sha = _git(repo, "rev-parse", "refs/heads/main").stdout.decode().strip()
+
+    real_run = update_cmd.subprocess.run
+    calls: list[tuple[list[str], Path | None]] = []
+
+    def record(command, *args, **kwargs):
+        normalized = [str(part) for part in command]
+        command_cwd = Path(kwargs["cwd"]).resolve() if kwargs.get("cwd") else None
+        calls.append((normalized, command_cwd))
+        return real_run(command, *args, **kwargs)
+
+    monkeypatch.setattr(update_cmd.subprocess, "run", record)
+    assert update_cmd._finalize_release_upgrade(["git"], repo, result.context) is False
+
+    assert _git(repo, "rev-parse", "refs/heads/main").stdout.decode().strip() == main_sha
+    assert (repo / "README.txt").read_bytes() == expected_bytes
+    assert (repo / "new-main.bin").read_bytes() == b"\x00manual\xff\r\n"
+    assert _git(repo, "status", "--porcelain=v2").stdout == expected_status
+    assert _git(repo, "write-tree").stdout == expected_index_tree
+    assert not any(
+        cwd == repo.resolve()
+        and len(command) > 1
+        and command[1] in {"reset", "clean", "checkout", "stash"}
+        for command, cwd in calls
+    )
+    _journal_path, journal = _latest_journal(repo)
+    assert journal["phase"] == "manual-interference"
+    assert journal["candidate_sha"] == result.candidate_sha
+    assert _git(repo, "rev-parse", result.backup_ref).stdout.decode().strip() == result.old_sha
+
+
+def test_new_binary_and_crlf_file_after_promotion_is_preserved_without_broad_clean(
+    tmp_path, monkeypatch
+):
+    """An untracked file created after promotion is never broad-cleaned."""
+    repo, _base_sha, _maintenance_sha, target_sha = _release_repo(tmp_path)
+    result = update_cmd._prepare_and_promote_release(
+        ["git"], repo, "v2.0.0", target_sha,
+        candidate_validator=_test_candidate_validator,
+    )
+    assert result.context is not None
+    manual_path = repo / "manual-after-promotion.bin"
+    manual_bytes = b"\x00manual\xff\r\nintentional CRLF\r\n"
+    manual_path.write_bytes(manual_bytes)
+    before_head = _git(repo, "rev-parse", "HEAD").stdout
+    before_ref = _git(repo, "rev-parse", "refs/heads/hermes-release").stdout
+    before_status = _git(repo, "status", "--porcelain=v2").stdout
+    before_index_tree = _git(repo, "write-tree").stdout
+    real_run = update_cmd.subprocess.run
+    calls: list[list[str]] = []
+
+    def record(command, *args, **kwargs):
+        normalized = [str(part) for part in command]
+        calls.append(normalized)
+        return real_run(command, *args, **kwargs)
+
+    monkeypatch.setattr(update_cmd.subprocess, "run", record)
+    assert update_cmd._finalize_release_upgrade(["git"], repo, result.context) is False
+
+    assert manual_path.read_bytes() == manual_bytes
+    assert _git(repo, "rev-parse", "HEAD").stdout == before_head
+    assert _git(repo, "rev-parse", "refs/heads/hermes-release").stdout == before_ref
+    assert _git(repo, "status", "--porcelain=v2").stdout == before_status
+    assert _git(repo, "write-tree").stdout == before_index_tree
+    assert not any(
+        len(command) > 1
+        and (
+            command[1] in {"reset", "clean", "checkout"}
+            or command[1:3] in (["stash", "apply"], ["stash", "drop"])
+        )
+        for command in calls
+    )
+    journal_path, journal = _latest_journal(repo)
+    assert journal_path.exists()
+    assert journal["phase"] == "manual-interference"
+    assert journal["candidate_sha"] == result.candidate_sha
