@@ -1,1 +1,7 @@
-v1.2.3
+{
+  "base_sha": "3c27eb6234bf91b8ceee9e9071591b31e9b148cb",
+  "patch_bytes": 145537,
+  "patch_sha256": "f0d57866283613aebf40776bb79f7db388c9d133f3691bcf84442426b4920f8c",
+  "tag": "v2026.8.3",
+  "target_sha": "3c27eb6234bf91b8ceee9e9071591b31e9b148cb"
+}
