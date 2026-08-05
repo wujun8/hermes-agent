@@ -2426,6 +2426,14 @@ class ContextCompressor(ContextEngine):
         self._active_compression_telemetry: Optional[Dict[str, Any]] = None
         self._compression_telemetry_seed: Optional[Dict[str, Any]] = None
 
+    def set_micro_compact_enabled(self, enabled: bool) -> None:
+        """Set the micro-compaction capability flag without resetting state."""
+        self._micro_compact_enabled = bool(enabled)
+
+    def get_micro_compact_enabled(self) -> bool:
+        """Return whether micro-compaction is enabled for this engine."""
+        return self._micro_compact_enabled is True
+
     def update_from_response(self, usage: Dict[str, Any]):
         """Update tracked token usage from API response."""
         self.last_prompt_tokens = usage.get("prompt_tokens", 0)
