@@ -42,6 +42,20 @@ def _run_git(repo: Path, *args: str, check: bool = True) -> subprocess.Completed
     return result
 
 
+def _run_git_bytes(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+    result = subprocess.run(
+        ["git", *args],
+        cwd=repo,
+        capture_output=True,
+    )
+    if check:
+        assert result.returncode == 0, (
+            f"git {' '.join(args)} failed ({result.returncode}): "
+            f"{result.stderr or result.stdout}"
+        )
+    return result
+
+
 def _candidate_validator(git_cmd: list[str], candidate: Path) -> str:
     resolved = update_cmd._git_resolve_commit(git_cmd, candidate, "HEAD")
     assert resolved is not None
@@ -411,3 +425,263 @@ def test_fault_f6_stash_conflict_keeps_immutable_stash_and_does_not_double_apply
     assert sum(command[1:3] == ["stash", "apply"] for command in calls) == 1
     assert sum(command[1:3] == ["stash", "drop"] for command in calls) == 0
     assert "git stash apply" not in second_output
+
+
+@pytest.mark.parametrize("hide_immutable_verification", [False, True])
+def test_release_nonzero_stash_push_requires_independent_immutable_verification(
+    tmp_path, monkeypatch, hide_immutable_verification
+):
+    """A nonzero push is usable only after release-owned SHA verification."""
+    fixture = _prepare_fixture(tmp_path)
+    real_run = subprocess.run
+    calls: list[list[str]] = []
+
+    def run(command, *args, **kwargs):
+        normalized = [str(part) for part in command]
+        calls.append(normalized)
+        if (
+            hide_immutable_verification
+            and len(normalized) >= 2
+            and normalized[1] == "cat-file"
+        ):
+            stdout = "" if kwargs.get("text") is True else b""
+            stderr = "hidden immutable stash" if kwargs.get("text") is True else b"hidden immutable stash"
+            return subprocess.CompletedProcess(command, 1, stdout, stderr)
+        result = real_run(command, *args, **kwargs)
+        if len(normalized) >= 3 and normalized[1:3] == ["stash", "push"]:
+            return subprocess.CompletedProcess(command, 1, result.stdout, result.stderr)
+        return result
+
+    monkeypatch.setattr(update_cmd.subprocess, "run", run)
+
+    if hide_immutable_verification:
+        with pytest.raises(RuntimeError, match="immutable stash"):
+            _prepare(fixture)
+        journal = _assert_capture_uncertain_journal(fixture.repo)
+        stash_sha = _stash_sha_for_marker(fixture.repo, journal["stash_marker"])
+        assert stash_sha is not None
+        assert _show_ref(fixture.repo, stash_sha) == stash_sha
+        _assert_no_uncertain_capture_mutators(calls)
+    else:
+        result = _prepare(fixture)
+        assert result.context is not None
+        journal = result.context.journal
+        assert journal["stash_capture_confirmed"] is True
+        assert journal["stash_capture_uncertain"] is False
+        assert journal["stash_sha"] == _stash_sha_for_marker(
+            fixture.repo, journal["stash_marker"]
+        )
+        assert any(
+            len(command) >= 2 and command[1] == "cat-file" for command in calls
+        )
+
+
+def _capture_fixture(tmp_path: Path) -> SimpleNamespace:
+    fixture = _prepare_fixture(tmp_path)
+    repo = fixture.repo
+    _run_git(repo, "config", "core.autocrlf", "false")
+    staged_bytes = b"staged user bytes\r\nintentional CRLF\r\n"
+    working_bytes = b"working user bytes\r\nintentional CRLF\r\n"
+    (repo / fixture.user_path).write_bytes(staged_bytes)
+    _run_git(repo, "add", "--", fixture.user_path)
+    (repo / fixture.user_path).write_bytes(working_bytes)
+    fixture.untracked_bytes = b"\x00untracked binary\xff\r\n"
+    (repo / fixture.untracked_path).write_bytes(fixture.untracked_bytes)
+    untracked_text_path = "user-untracked.txt"
+    untracked_text_bytes = b"untracked text\r\nintentional CRLF\r\n"
+    (repo / untracked_text_path).write_bytes(untracked_text_bytes)
+    return SimpleNamespace(
+        fixture=fixture,
+        staged_bytes=staged_bytes,
+        working_bytes=working_bytes,
+        untracked_text_path=untracked_text_path,
+        untracked_text_bytes=untracked_text_bytes,
+        status_v2=_run_git_bytes(repo, "status", "--porcelain=v2").stdout,
+        cached_diff=_run_git_bytes(repo, "diff", "--cached", "--binary").stdout,
+        index_entries=_run_git_bytes(repo, "ls-files", "--stage", "-z").stdout,
+        index_tree=_run_git_bytes(repo, "write-tree").stdout.strip(),
+    )
+
+
+def _assert_capture_fixture_unchanged(snapshot: SimpleNamespace) -> None:
+    repo = snapshot.fixture.repo
+    assert (repo / snapshot.fixture.user_path).read_bytes() == snapshot.working_bytes
+    assert (repo / snapshot.fixture.untracked_path).read_bytes() == snapshot.fixture.untracked_bytes
+    assert (repo / snapshot.untracked_text_path).read_bytes() == snapshot.untracked_text_bytes
+    assert _run_git_bytes(repo, "status", "--porcelain=v2").stdout == snapshot.status_v2
+    assert _run_git_bytes(repo, "diff", "--cached", "--binary").stdout == snapshot.cached_diff
+    assert _run_git_bytes(repo, "ls-files", "--stage", "-z").stdout == snapshot.index_entries
+    assert _run_git_bytes(repo, "write-tree").stdout.strip() == snapshot.index_tree
+
+
+def _context_from_journal(repo: Path) -> update_cmd.ReleaseUpgradeContext:
+    journal_path = _journal_paths(repo)[0]
+    common_dir = update_cmd._git_common_dir(["git"], repo)
+    return update_cmd.ReleaseUpgradeContext(
+        root=repo,
+        common_dir=common_dir,
+        transaction_dir=journal_path.parent,
+        journal_path=journal_path,
+        journal=json.loads(journal_path.read_text(encoding="utf-8")),
+    )
+
+
+def _stash_sha_for_marker(repo: Path, marker: str) -> str | None:
+    listing = _run_git(repo, "stash", "list", "--format=%H%x00%gs").stdout
+    for line in listing.splitlines():
+        commit, separator, subject = line.partition("\x00")
+        if separator and marker in subject:
+            return commit.strip()
+    return None
+
+
+def _assert_no_uncertain_capture_mutators(calls: list[list[str]]) -> None:
+    assert not any(command[1:3] == ["reset", "--hard"] for command in calls)
+    assert not any(command[1:2] == ["clean"] for command in calls)
+    assert not any(command[1:2] == ["checkout"] for command in calls)
+    assert not any(command[1:3] in (["stash", "apply"], ["stash", "drop"]) for command in calls)
+
+
+def _assert_capture_uncertain_journal(repo: Path) -> dict:
+    journal = _read_one_journal(repo)
+    assert journal["local_state_present"] is True
+    assert journal["stash_capture_required"] is True
+    assert journal["stash_capture_confirmed"] is False
+    assert journal["stash_capture_uncertain"] is True
+    assert journal["stash_sha"] is None
+    assert journal["phase"] == "stash-capture-uncertain"
+    return journal
+
+
+def test_stash_helper_failure_before_git_mutation_preserves_bytes_index_and_journal(
+    tmp_path, monkeypatch
+):
+    snapshot = _capture_fixture(tmp_path)
+    calls = _install_git_recorder(monkeypatch)
+
+    def fail_before_git_mutation(*_args, **_kwargs):
+        raise RuntimeError("injected stash capture failure")
+
+    monkeypatch.setattr(update_cmd, "_stash_local_changes_if_needed", fail_before_git_mutation)
+    with pytest.raises(RuntimeError, match="injected stash capture failure"):
+        _prepare(snapshot.fixture)
+
+    _assert_capture_fixture_unchanged(snapshot)
+    _assert_capture_uncertain_journal(snapshot.fixture.repo)
+    _assert_no_uncertain_capture_mutators(calls)
+
+    before = (
+        snapshot.fixture.user_path,
+        snapshot.fixture.repo / snapshot.untracked_text_path,
+        _run_git_bytes(snapshot.fixture.repo, "status", "--porcelain=v2").stdout,
+        _run_git_bytes(snapshot.fixture.repo, "diff", "--cached", "--binary").stdout,
+    )
+    assert update_cmd._finalize_release_upgrade(
+        ["git"], snapshot.fixture.repo, _context_from_journal(snapshot.fixture.repo)
+    ) is False
+    _assert_capture_fixture_unchanged(snapshot)
+    assert (
+        snapshot.fixture.user_path,
+        snapshot.fixture.repo / snapshot.untracked_text_path,
+        _run_git_bytes(snapshot.fixture.repo, "status", "--porcelain=v2").stdout,
+        _run_git_bytes(snapshot.fixture.repo, "diff", "--cached", "--binary").stdout,
+    ) == before
+
+
+def test_nonzero_real_stash_push_fails_closed_without_reset_clean_or_journal_deletion(
+    tmp_path, monkeypatch
+):
+    snapshot = _capture_fixture(tmp_path)
+    calls = _install_git_fault(
+        monkeypatch,
+        lambda command, _cwd: command[1:3] == ["stash", "push"],
+        "injected nonzero stash push",
+    )
+
+    with pytest.raises(subprocess.CalledProcessError):
+        _prepare(snapshot.fixture)
+
+    _assert_capture_fixture_unchanged(snapshot)
+    _assert_capture_uncertain_journal(snapshot.fixture.repo)
+    _assert_no_uncertain_capture_mutators(calls)
+
+
+def test_successful_stash_with_unavailable_identity_keeps_stash_evidence_and_is_idempotent(
+    tmp_path, monkeypatch, capsys
+):
+    snapshot = _capture_fixture(tmp_path)
+    real_stash = update_cmd._stash_local_changes_if_needed
+
+    def stash_but_hide_identity(*args, **kwargs):
+        assert real_stash(*args, **kwargs)
+        return None
+
+    monkeypatch.setattr(update_cmd, "_stash_local_changes_if_needed", stash_but_hide_identity)
+    monkeypatch.setattr(update_cmd, "_refresh_transaction_stash_identity", lambda *_args: None)
+
+    with pytest.raises(RuntimeError, match="Stash capture"):
+        _prepare(snapshot.fixture)
+
+    repo = snapshot.fixture.repo
+    journal = _assert_capture_uncertain_journal(repo)
+    stash_sha = _stash_sha_for_marker(repo, journal["stash_marker"])
+    assert stash_sha is not None
+    assert _show_ref(repo, stash_sha) == stash_sha
+    assert _run_git(repo, "status", "--porcelain=v2").stdout == ""
+    assert _run_git_bytes(repo, "show", f"{stash_sha}:{snapshot.fixture.user_path}").stdout == snapshot.working_bytes
+    assert _run_git_bytes(repo, "show", f"{stash_sha}^3:{snapshot.fixture.untracked_path}").stdout == snapshot.fixture.untracked_bytes
+    assert "stash" in capsys.readouterr().out.lower()
+
+    before_stash = _show_ref(repo, stash_sha)
+    assert update_cmd._finalize_release_upgrade(
+        ["git"], repo, _context_from_journal(repo)
+    ) is False
+    assert _show_ref(repo, stash_sha) == before_stash
+    assert _read_one_journal(repo)["phase"] == "stash-capture-uncertain"
+
+
+def test_post_push_exception_refreshes_unique_stash_sha_and_restores_exact_state(
+    tmp_path, monkeypatch
+):
+    snapshot = _capture_fixture(tmp_path)
+    calls = _install_git_recorder(monkeypatch)
+    real_stash = update_cmd._stash_local_changes_if_needed
+
+    def stash_then_raise(*args, **kwargs):
+        assert real_stash(*args, **kwargs)
+        raise RuntimeError("injected post-push exception")
+
+    monkeypatch.setattr(update_cmd, "_stash_local_changes_if_needed", stash_then_raise)
+    with pytest.raises(RuntimeError, match="injected post-push exception"):
+        _prepare(snapshot.fixture)
+
+    _assert_capture_fixture_unchanged(snapshot)
+    assert not _journal_paths(snapshot.fixture.repo)
+    assert _run_git(snapshot.fixture.repo, "stash", "list").stdout == ""
+    assert sum(command[1:3] == ["stash", "apply"] for command in calls) == 1
+    assert sum(command[1:3] == ["stash", "drop"] for command in calls) == 1
+
+
+def test_no_local_state_failure_keeps_existing_safe_cleanup_contract(tmp_path, monkeypatch):
+    fixture = _prepare_fixture(tmp_path)
+    repo = fixture.repo
+    _run_git(repo, "switch", "main")
+    original_sha = _run_git(repo, "rev-parse", "HEAD").stdout.strip()
+    _run_git(repo, "clean", "-fd")
+    _run_git(repo, "reset", "--hard", "HEAD")
+    calls = _install_git_recorder(monkeypatch)
+    monkeypatch.setattr(
+        update_cmd,
+        "_upgrade_release_transaction",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("later candidate failure")),
+    )
+
+    with pytest.raises(RuntimeError, match="later candidate failure"):
+        _prepare(fixture)
+
+    assert _run_git(repo, "symbolic-ref", "--short", "HEAD").stdout.strip() == "main"
+    assert _run_git(repo, "rev-parse", "HEAD").stdout.strip() == original_sha
+    assert _run_git(repo, "status", "--porcelain=v2").stdout == ""
+    assert not _journal_paths(repo)
+    assert any(command[1:3] == ["reset", "--hard"] for command in calls)
+    assert any(command[1:2] == ["clean"] for command in calls)

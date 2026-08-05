@@ -818,6 +818,12 @@ def _create_release_upgrade_context(
         "payload_bytes": len(payload),
         "stash_marker": marker,
         "stash_sha": None,
+        # These fields are deliberately tri-state/explicit: a missing or
+        # unconfirmed capture must never be treated as an empty worktree.
+        "local_state_present": None,
+        "stash_capture_required": None,
+        "stash_capture_confirmed": False,
+        "stash_capture_uncertain": False,
         "stash_pending": False,
         "stash_apply_attempted": False,
         "stash_applied": False,
@@ -1292,19 +1298,87 @@ def _prepare_and_promote_release(
         payload=payload,
     )
     try:
-        _journal_update(context, "stash-pending")
+        pre_capture_status = subprocess.run(
+            git_cmd + ["status", "--porcelain"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        local_state_present = (
+            bool(pre_capture_status.stdout.strip())
+            if pre_capture_status.returncode == 0
+            else None
+        )
+        _journal_update(
+            context,
+            "stash-capture-started",
+            local_state_present=local_state_present,
+            stash_capture_required=(
+                local_state_present if local_state_present is not None else None
+            ),
+            stash_capture_confirmed=False,
+            stash_capture_uncertain=local_state_present is None,
+            stash_pending=False,
+        )
+        if local_state_present is None:
+            detail = (pre_capture_status.stderr or pre_capture_status.stdout or "").strip()
+            raise RuntimeError(
+                "Could not inspect local state before stash capture"
+                + (f": {detail.splitlines()[0]}" if detail else "")
+            )
+        _journal_update(context, "stash-capture-started")
         stash_ref = _stash_local_changes_if_needed(
             git_cmd, root, marker=context.journal["stash_marker"]
         )
-        if stash_ref:
+        if local_state_present:
+            _journal_update(
+                context,
+                "stash-capture-verifying",
+                stash_sha=None,
+                stash_pending=False,
+                stash_capture_confirmed=False,
+                stash_capture_uncertain=True,
+            )
+            verified_stash_ref = _verify_release_stash_capture(
+                git_cmd, root, context, stash_ref
+            )
+            if verified_stash_ref is None:
+                _journal_update(
+                    context,
+                    "stash-capture-uncertain",
+                    stash_sha=None,
+                    stash_pending=False,
+                    stash_capture_confirmed=False,
+                    stash_capture_uncertain=True,
+                )
+                raise RuntimeError(
+                    "Stash capture could not independently verify one unique "
+                    "immutable stash SHA."
+                )
             _journal_update(
                 context,
                 "stashed",
-                stash_sha=stash_ref.lower(),
+                stash_sha=verified_stash_ref,
                 stash_pending=True,
+                stash_capture_confirmed=True,
+                stash_capture_uncertain=False,
             )
         else:
-            _journal_update(context, "no-stash", stash_pending=False)
+            if stash_ref is not None:
+                raise RuntimeError(
+                    "Stash capture returned an entry even though the pre-capture "
+                    "worktree was clean."
+                )
+            _journal_update(
+                context,
+                "no-stash",
+                stash_pending=False,
+                stash_capture_required=False,
+                stash_capture_confirmed=False,
+                stash_capture_uncertain=False,
+            )
         if original_branch != branch:
             checkout = subprocess.run(
                 git_cmd + ["checkout", branch],
@@ -1333,21 +1407,113 @@ def _prepare_and_promote_release(
         )
         return result
     except BaseException:
-        # Resolve a stash that may have been created just before an interrupt.
-        _refresh_transaction_stash_identity(git_cmd, root, context)
+        capture_required = context.journal.get("stash_capture_required")
+        capture_confirmed = bool(context.journal.get("stash_capture_confirmed"))
+        if capture_required is not False and not capture_confirmed:
+            recovered_stash = None
+            if not context.journal.get("stash_capture_uncertain"):
+                try:
+                    # A helper can raise after `git stash push` has created the
+                    # entry.  Only a unique marker match can promote this
+                    # uncertain state to a confirmed immutable capture.
+                    recovered_stash = _refresh_transaction_stash_identity(
+                        git_cmd, root, context
+                    )
+                except BaseException as exc:
+                    logger.warning("Could not refresh stash identity after capture fault: %s", exc)
+            if recovered_stash:
+                try:
+                    _journal_update(
+                        context,
+                        "stashed",
+                        stash_sha=recovered_stash,
+                        stash_pending=True,
+                        stash_capture_confirmed=True,
+                        stash_capture_uncertain=False,
+                    )
+                except BaseException as exc:
+                    logger.warning("Could not durably confirm recovered stash: %s", exc)
+            else:
+                try:
+                    _journal_update(
+                        context,
+                        "stash-capture-uncertain",
+                        stash_sha=None,
+                        stash_pending=False,
+                        stash_capture_confirmed=False,
+                        stash_capture_uncertain=True,
+                    )
+                except BaseException as exc:
+                    logger.warning("Could not durably mark stash capture uncertain: %s", exc)
+        else:
+            try:
+                _refresh_transaction_stash_identity(git_cmd, root, context)
+            except BaseException as exc:
+                logger.warning("Could not refresh stash identity during finalization: %s", exc)
         _finalize_release_upgrade(git_cmd, root, context, input_fn=input_fn)
         raise
+
+
+def _verify_release_stash_capture(
+    git_cmd: list[str],
+    root: Path,
+    context: ReleaseUpgradeContext,
+    stash_ref: object,
+) -> str | None:
+    """Independently verify the helper's stash SHA against this transaction marker."""
+
+    if not isinstance(stash_ref, str) or not _SHA_RE.fullmatch(stash_ref):
+        return None
+    marker = context.journal.get("stash_marker")
+    if not isinstance(marker, str) or not marker:
+        return None
+    listing = subprocess.run(
+        git_cmd + ["stash", "list", "--format=%H%x00%gs"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if listing.returncode != 0:
+        return None
+    matches: list[str] = []
+    for line in listing.stdout.splitlines():
+        commit, separator, subject = line.partition("\0")
+        commit = commit.strip()
+        if separator and marker in subject and _SHA_RE.fullmatch(commit):
+            matches.append(commit.lower())
+    if len(matches) != 1 or matches[0] != stash_ref.lower():
+        return None
+    verified = subprocess.run(
+        git_cmd + ["cat-file", "-e", f"{matches[0]}^{{commit}}"],
+        cwd=root,
+        capture_output=True,
+    )
+    if verified.returncode != 0:
+        return None
+    return matches[0]
 
 
 def _refresh_transaction_stash_identity(
     git_cmd: list[str], root: Path, context: ReleaseUpgradeContext
 ) -> str | None:
-    """Resolve the immutable stash commit from the durable transaction marker."""
+    """Resolve and durably confirm one immutable stash for this marker."""
 
-    current = context.journal.get("stash_sha")
-    if isinstance(current, str) and _SHA_RE.fullmatch(current):
-        return current
-    marker = context.journal.get("stash_marker")
+    journal = context.journal
+    current = journal.get("stash_sha")
+    if journal.get("stash_capture_confirmed") and isinstance(current, str):
+        if _SHA_RE.fullmatch(current):
+            verified = subprocess.run(
+                git_cmd + ["cat-file", "-e", f"{current}^{{commit}}"],
+                cwd=root,
+                capture_output=True,
+            )
+            if verified.returncode == 0:
+                return current.lower()
+        return None
+
+    marker = journal.get("stash_marker")
     if not marker:
         return None
     listing = subprocess.run(
@@ -1360,18 +1526,31 @@ def _refresh_transaction_stash_identity(
     )
     if listing.returncode != 0:
         return None
+    matches: list[str] = []
     for line in listing.stdout.splitlines():
         commit, separator, subject = line.partition("\0")
         commit = commit.strip()
         if separator and marker in subject and _SHA_RE.fullmatch(commit):
-            _journal_update(
-                context,
-                "stash-pending",
-                stash_sha=commit.lower(),
-                stash_pending=True,
-            )
-            return commit.lower()
-    return None
+            matches.append(commit.lower())
+    if len(matches) != 1:
+        return None
+    commit = matches[0]
+    verified = subprocess.run(
+        git_cmd + ["cat-file", "-e", f"{commit}^{{commit}}"],
+        cwd=root,
+        capture_output=True,
+    )
+    if verified.returncode != 0:
+        return None
+    _journal_update(
+        context,
+        "stash-pending",
+        stash_sha=commit,
+        stash_pending=True,
+        stash_capture_confirmed=True,
+        stash_capture_uncertain=False,
+    )
+    return commit
 
 
 def _transaction_is_promoted(
@@ -1396,10 +1575,20 @@ def _transaction_is_promoted(
 
 
 def _prepare_worktree_for_release_restore(
-    git_cmd: list[str], root: Path, *, stash_pending: bool
+    git_cmd: list[str],
+    root: Path,
+    *,
+    stash_pending: bool,
+    stash_capture_required: bool = False,
+    stash_capture_confirmed: bool = False,
 ) -> None:
-    """Discard only update-pipeline output before returning to the user checkout."""
+    """Discard update output only after local-state capture is authorized."""
 
+    if stash_capture_required and not stash_capture_confirmed:
+        raise RuntimeError(
+            "Refusing destructive release restore preparation before stash capture "
+            "is durably confirmed."
+        )
     reset = subprocess.run(
         git_cmd + ["reset", "--hard", "HEAD"],
         cwd=root,
@@ -1521,8 +1710,35 @@ def _finalize_release_upgrade(
     root = Path(cwd)
     journal = context.journal
     try:
-        stash_sha = _refresh_transaction_stash_identity(git_cmd, root, context)
+        if journal.get("stash_capture_uncertain") and not journal.get(
+            "stash_capture_confirmed"
+        ):
+            stash_sha = None
+        else:
+            stash_sha = _refresh_transaction_stash_identity(git_cmd, root, context)
         stash_pending = bool(journal.get("stash_pending"))
+        stash_capture_required = journal.get("stash_capture_required")
+        stash_capture_confirmed = bool(journal.get("stash_capture_confirmed"))
+        if stash_capture_required is not False and not stash_capture_confirmed:
+            _journal_update(
+                context,
+                "stash-capture-uncertain",
+                stash_sha=None,
+                stash_pending=False,
+                stash_capture_confirmed=False,
+                stash_capture_uncertain=True,
+            )
+            print(
+                "✗ Stash capture is unconfirmed; refusing reset, clean, checkout, "
+                "stash apply/drop, and journal deletion."
+            )
+            print(f"  Recovery journal retained at {context.journal_path}")
+            print(
+                f"  Inspect marker {journal.get('stash_marker')!r} with: "
+                "git stash list --format='%gd %H %s'"
+            )
+            print("  Do not retry destructive cleanup until one immutable SHA is confirmed.")
+            return False
         if stash_pending and not stash_sha:
             print(
                 "✗ Release update still has an unidentified pending stash; "
@@ -1549,7 +1765,11 @@ def _finalize_release_upgrade(
 
         _journal_update(context, "finalizing")
         _prepare_worktree_for_release_restore(
-            git_cmd, root, stash_pending=stash_pending
+            git_cmd,
+            root,
+            stash_pending=stash_pending,
+            stash_capture_required=stash_capture_required is not False,
+            stash_capture_confirmed=stash_capture_confirmed,
         )
         if not journal.get("checkout_restored"):
             _restore_original_release_checkout(git_cmd, root, context)
@@ -1577,6 +1797,7 @@ def _finalize_release_upgrade(
                     stash_sha,
                     prompt_user=False,
                     input_fn=input_fn,
+                    restore_index=True,
                 )
                 if not restored:
                     _journal_update(context, "stash-restore-conflict")
@@ -3130,7 +3351,7 @@ def _stash_local_changes_if_needed(
     )
     if push.stdout.strip():
         print(push.stdout.strip())
-    stash_ref = ""
+    stash_matches: list[str] = []
     stash_list = subprocess.run(
         git_cmd + ["stash", "list", "--format=%H%x00%gs"],
         cwd=cwd,
@@ -3140,48 +3361,48 @@ def _stash_local_changes_if_needed(
     if stash_list.returncode == 0:
         for line in stash_list.stdout.splitlines():
             commit, separator, subject = line.partition("\0")
-            if separator and stash_name in subject and _SHA_RE.fullmatch(commit.strip()):
-                stash_ref = commit.strip()
-                break
-    stash_created = bool(stash_ref)
+            commit = commit.strip()
+            if separator and stash_name in subject and _SHA_RE.fullmatch(commit):
+                stash_matches.append(commit.lower())
+    stash_created = len(stash_matches) == 1
 
     if push.returncode != 0:
+        if push.stderr.strip():
+            print(push.stderr.strip())
         if stash_created:
-            # git stash push can save the entry but fail to remove an
-            # undeletable untracked file.  The exact marker above proves this
-            # process owns the entry; never infer ownership from refs/stash
-            # merely changing underneath us.
-            if push.stderr.strip():
-                print(push.stderr.strip())
             print(
-                "  ⚠ Some untracked files could not be removed from the "
-                "working tree (permission denied); they remain preserved in "
-                f"stash {stash_ref}."
+                "  ⚠ The stash command failed after creating a uniquely marked "
+                f"entry; it remains preserved as immutable stash {stash_matches[0]}."
             )
-            subprocess.run(
-                git_cmd + ["reset", "--hard", "HEAD"],
-                cwd=cwd,
-                capture_output=True,
-            )
+            if marker is None:
+                # Preserve ordinary update behavior: Git may leave tracked
+                # edits in place after saving the stash while an untracked
+                # path cannot be removed.  The ordinary caller's existing
+                # restore path expects a clean checkout window here.
+                subprocess.run(
+                    git_cmd + ["reset", "--hard", "HEAD"],
+                    cwd=cwd,
+                    capture_output=True,
+                )
         else:
             print("✗ Could not stash local changes — update aborted.")
-            if push.stderr.strip():
-                print(f"  {push.stderr.strip().splitlines()[0]}")
             print(
                 "  Commit, stash, or clean up your local changes manually, "
                 "then re-run `hermes update`."
             )
+            # Never reset/clean here.  The transaction boundary will either
+            # durably confirm this exact SHA or retain an uncertain-capture journal.
             raise subprocess.CalledProcessError(
                 push.returncode, push.args, output=push.stdout, stderr=push.stderr
             )
 
     if not stash_created:
-        print("✗ Could not identify the exact autostash entry — update aborted.")
+        print("✗ Could not identify one exact autostash entry — update aborted.")
         raise RuntimeError(
             "The local changes may not be safely stashed; inspect `git stash list` "
             "and recover before retrying."
         )
-    return stash_ref
+    return stash_matches[0]
 
 def _resolve_stash_selector(
     git_cmd: list[str], cwd: Path, stash_ref: str
@@ -3248,6 +3469,7 @@ def _restore_stashed_changes(
     stash_ref: str,
     prompt_user: bool = False,
     input_fn=None,
+    restore_index: bool = False,
 ) -> bool:
     if prompt_user:
         print()
@@ -3268,8 +3490,12 @@ def _restore_stashed_changes(
             return False
 
     print("→ Restoring local changes...")
+    stash_apply = git_cmd + ["stash", "apply"]
+    if restore_index:
+        stash_apply.append("--index")
+    stash_apply.append(stash_ref)
     restore = subprocess.run(
-        git_cmd + ["stash", "apply", stash_ref],
+        stash_apply,
         cwd=cwd,
         capture_output=True,
         text=True, encoding="utf-8", errors="replace",
