@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import stat
 import subprocess
 from pathlib import Path
@@ -33,6 +34,31 @@ def _git(repo: Path, *args: str, check: bool = True):
             f"{result.stderr.decode(errors='replace')}"
         )
     return result
+
+
+def _install_fsync_probe(monkeypatch, *, failure_path: Path | None = None):
+    """Record real fsync paths and optionally fail one directory fsync."""
+
+    events: list[tuple[str, Path | None]] = []
+    fd_paths: dict[int, Path] = {}
+    real_open = update_cmd.os.open
+    real_fsync = update_cmd.os.fsync
+
+    def tracked_open(path, flags, *args):
+        fd = real_open(path, flags, *args)
+        fd_paths[fd] = Path(path)
+        return fd
+
+    def tracked_fsync(fd):
+        path = fd_paths.get(fd)
+        events.append(("fsync", path))
+        if failure_path is not None and path == failure_path:
+            raise OSError(f"injected directory fsync failure: {path}")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(update_cmd.os, "open", tracked_open)
+    monkeypatch.setattr(update_cmd.os, "fsync", tracked_fsync)
+    return events, fd_paths
 
 
 
@@ -572,3 +598,416 @@ def test_inconsistent_finalized_marker_fails_closed_without_git_or_state_mutatio
         assert "final_state_verified" not in journal
     else:
         assert journal["final_state_verified"] is False
+
+
+def test_existing_transaction_root_is_fsynced_after_child_mkdir_before_journal_and_stash(
+    tmp_path, monkeypatch
+):
+    repo, _base_sha, _maintenance_sha, target_sha = _release_repo(tmp_path)
+    common = update_cmd._git_common_dir(["git"], repo)
+    transactions = common / "hermes-upgrade-transactions"
+    transactions.mkdir()
+    events, _fd_paths = _install_fsync_probe(monkeypatch)
+    real_mkdir = Path.mkdir
+
+    def record_transaction_mkdir(path, *args, **kwargs):
+        if path.parent == transactions:
+            events.append(("mkdir", path))
+        return real_mkdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", record_transaction_mkdir)
+    real_stash = update_cmd._stash_local_changes_if_needed
+
+    def record_stash(*args, **kwargs):
+        events.append(("stash", None))
+        return real_stash(*args, **kwargs)
+
+    monkeypatch.setattr(update_cmd, "_stash_local_changes_if_needed", record_stash)
+
+    result = update_cmd._prepare_and_promote_release(
+        ["git"], repo, "v2.0.0", target_sha,
+        candidate_validator=_test_candidate_validator,
+    )
+    child = next(path for kind, path in events if kind == "mkdir")
+    child_mkdir_index = next(i for i, (kind, path) in enumerate(events) if kind == "mkdir" and path == child)
+    root_fsync_index = next(
+        i for i, (kind, path) in enumerate(events)
+        if kind == "fsync" and path == transactions
+    )
+    journal_temp_index = next(
+        i for i, (kind, path) in enumerate(events)
+        if kind == "fsync"
+        and path is not None
+        and path.parent == child
+        and path.name.startswith(".journal.json.")
+    )
+    stash_index = next(i for i, (kind, _path) in enumerate(events) if kind == "stash")
+
+    assert child.parent == transactions
+    assert child_mkdir_index < root_fsync_index < journal_temp_index < stash_index
+    assert update_cmd._finalize_release_upgrade(["git"], repo, result.context) is True
+
+
+def test_new_transaction_root_fsyncs_common_dir_before_child_and_root_entries(
+    tmp_path, monkeypatch
+):
+    repo, _base_sha, _maintenance_sha, target_sha = _release_repo(tmp_path)
+    common = update_cmd._git_common_dir(["git"], repo)
+    transactions = common / "hermes-upgrade-transactions"
+    assert not transactions.exists()
+    events, _fd_paths = _install_fsync_probe(monkeypatch)
+    real_mkdir = Path.mkdir
+
+    def record_transaction_mkdir(path, *args, **kwargs):
+        if path == transactions or path.parent == transactions:
+            events.append(("mkdir", path))
+        return real_mkdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", record_transaction_mkdir)
+    result = update_cmd._prepare_and_promote_release(
+        ["git"], repo, "v2.0.0", target_sha,
+        candidate_validator=_test_candidate_validator,
+    )
+    root_mkdir_index = next(
+        i for i, (kind, path) in enumerate(events)
+        if kind == "mkdir" and path == transactions
+    )
+    child = next(
+        path for kind, path in events
+        if kind == "mkdir" and path is not None and path.parent == transactions
+    )
+    child_mkdir_index = next(i for i, (kind, path) in enumerate(events) if kind == "mkdir" and path == child)
+    common_fsync_index = next(
+        i for i, (kind, path) in enumerate(events)
+        if kind == "fsync" and path == common
+    )
+    root_fsync_index = next(
+        i for i, (kind, path) in enumerate(events)
+        if kind == "fsync" and path == transactions
+    )
+
+    assert root_mkdir_index < common_fsync_index < child_mkdir_index < root_fsync_index
+    assert update_cmd._finalize_release_upgrade(["git"], repo, result.context) is True
+
+
+def test_transaction_atomic_replaces_fsync_each_temp_file_and_child_directory(
+    tmp_path, monkeypatch
+):
+    repo, _base_sha, _maintenance_sha, _target_sha = _release_repo(tmp_path)
+    common = update_cmd._git_common_dir(["git"], repo)
+    (common / "hermes-upgrade-transactions").mkdir()
+    events, _fd_paths = _install_fsync_probe(monkeypatch)
+
+    context = update_cmd._create_release_upgrade_context(
+        ["git"], repo,
+        original_branch="hermes-release",
+        original_head_sha="a" * 40,
+        maintenance_old_sha="b" * 40,
+        release_tag="v2.0.0",
+        base_sha="c" * 40,
+        target_sha="d" * 40,
+        payload=b"transaction payload\n",
+    )
+    child = context.transaction_dir
+    transaction_temp_paths = [
+        path
+        for kind, path in events
+        if kind == "fsync"
+        and path is not None
+        and path.parent == child
+        and path.name.startswith(".")
+    ]
+    journal_temps = [path for path in transaction_temp_paths if path.name.startswith(".journal.json.")]
+    payload_temps = [
+        path
+        for path in transaction_temp_paths
+        if path.name.startswith(".runtime-local-maintenance.patch.")
+    ]
+    child_fsync_indices = [
+        i for i, (kind, path) in enumerate(events) if kind == "fsync" and path == child
+    ]
+
+    assert len(journal_temps) == 2
+    assert len(payload_temps) == 1
+    assert len(child_fsync_indices) >= 3
+    for temp_path in journal_temps + payload_temps:
+        temp_index = next(
+            i for i, (kind, path) in enumerate(events)
+            if kind == "fsync" and path == temp_path
+        )
+        assert any(index > temp_index for index in child_fsync_indices)
+
+
+def test_transactions_root_fsync_failure_aborts_before_stash_and_preserves_real_git_state(
+    tmp_path, monkeypatch
+):
+    repo, _base_sha, _maintenance_sha, target_sha = _release_repo(tmp_path)
+    _git(repo, "switch", "main")
+    expected = _write_user_state(repo, "root-fsync-failure")
+    common = update_cmd._git_common_dir(["git"], repo)
+    transactions = common / "hermes-upgrade-transactions"
+    transactions.mkdir()
+    _events, _fd_paths = _install_fsync_probe(monkeypatch, failure_path=transactions)
+    stash_calls: list[object] = []
+    candidate_calls: list[object] = []
+
+    def unexpected_stash(*_args, **_kwargs):
+        stash_calls.append(True)
+        raise AssertionError("stash helper must not run before transaction root durability")
+
+    def unexpected_candidate(*_args, **_kwargs):
+        candidate_calls.append(True)
+        raise AssertionError("candidate mutator must not run before transaction root durability")
+
+    monkeypatch.setattr(update_cmd, "_stash_local_changes_if_needed", unexpected_stash)
+    monkeypatch.setattr(update_cmd, "_upgrade_release_transaction", unexpected_candidate)
+    git_commands: list[list[str]] = []
+    real_run = update_cmd.subprocess.run
+
+    def record_run(command, *args, **kwargs):
+        git_commands.append([str(part) for part in command])
+        return real_run(command, *args, **kwargs)
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(update_cmd.subprocess, "run", record_run)
+        with pytest.raises(OSError, match="directory fsync failure"):
+            update_cmd._prepare_and_promote_release(
+                ["git"], repo, "v2.0.0", target_sha,
+                candidate_validator=_test_candidate_validator,
+            )
+
+    assert stash_calls == []
+    assert candidate_calls == []
+    assert _capture_user_state(repo, tuple(expected["bytes"])) == expected
+    mutating_commands = {
+        "add", "apply", "branch", "checkout", "clean", "commit", "reset",
+        "stash", "switch", "update-ref", "worktree",
+    }
+    assert not any(len(command) > 1 and command[1] in mutating_commands for command in git_commands)
+    children = [path for path in transactions.iterdir() if path.is_dir()]
+    assert children
+    assert all(not any(child.iterdir()) for child in children)
+
+
+def test_transaction_child_fsync_failure_after_journal_replace_aborts_before_stash(
+    tmp_path, monkeypatch
+):
+    repo, _base_sha, _maintenance_sha, target_sha = _release_repo(tmp_path)
+    _git(repo, "switch", "main")
+    expected = _write_user_state(repo, "child-fsync-failure")
+    common = update_cmd._git_common_dir(["git"], repo)
+    transactions = common / "hermes-upgrade-transactions"
+    transactions.mkdir()
+    transaction_id = "child-fsync-failure"
+    child = transactions / transaction_id
+    monkeypatch.setattr(update_cmd.uuid, "uuid4", lambda: type("UUID", (), {"hex": transaction_id})())
+    _events, _fd_paths = _install_fsync_probe(monkeypatch, failure_path=child)
+    stash_calls: list[object] = []
+
+    def unexpected_stash(*_args, **_kwargs):
+        stash_calls.append(True)
+        raise AssertionError("stash helper must not run after child journal fsync failure")
+
+    monkeypatch.setattr(update_cmd, "_stash_local_changes_if_needed", unexpected_stash)
+
+    with pytest.raises(OSError, match="directory fsync failure"):
+        update_cmd._prepare_and_promote_release(
+            ["git"], repo, "v2.0.0", target_sha,
+            candidate_validator=_test_candidate_validator,
+        )
+
+    assert stash_calls == []
+    assert _capture_user_state(repo, tuple(expected["bytes"])) == expected
+    assert child.is_dir()
+    assert (child / "journal.json").is_file()
+    assert not (child / "runtime-local-maintenance.patch").exists()
+
+
+def test_final_ack_fsyncs_child_after_known_entries_then_root_after_rmdir(
+    tmp_path, monkeypatch
+):
+    repo, _base_sha, _maintenance_sha, target_sha = _release_repo(tmp_path)
+    result = update_cmd._prepare_and_promote_release(
+        ["git"], repo, "v2.0.0", target_sha,
+        candidate_validator=_test_candidate_validator,
+    )
+    assert result.context is not None
+    context = result.context
+    update_cmd._mark_release_finalized(context)
+    child = context.transaction_dir
+    transactions = child.parent
+    journal_path = context.journal_path
+    payload_path = child / "runtime-local-maintenance.patch"
+    events, _fd_paths = _install_fsync_probe(monkeypatch)
+    real_unlink = Path.unlink
+    real_rmdir = Path.rmdir
+
+    def record_unlink(path, *args, **kwargs):
+        if path in {journal_path, payload_path}:
+            events.append(("unlink", path))
+        return real_unlink(path, *args, **kwargs)
+
+    def record_rmdir(path, *args, **kwargs):
+        if path == child:
+            events.append(("rmdir", path))
+        return real_rmdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", record_unlink)
+    monkeypatch.setattr(Path, "rmdir", record_rmdir)
+
+    assert update_cmd._acknowledge_finalized_release(context) is True
+    unlink_indices = [i for i, (kind, _path) in enumerate(events) if kind == "unlink"]
+    child_fsync_index = next(
+        i for i, (kind, path) in enumerate(events) if kind == "fsync" and path == child
+    )
+    rmdir_index = next(i for i, (kind, _path) in enumerate(events) if kind == "rmdir")
+    root_fsync_index = next(
+        i for i, (kind, path) in enumerate(events)
+        if kind == "fsync" and path == transactions and i > rmdir_index
+    )
+
+    assert set(path for kind, path in events if kind == "unlink") == {journal_path, payload_path}
+    assert max(unlink_indices) < child_fsync_index < rmdir_index < root_fsync_index
+    assert not child.exists()
+
+
+def test_final_ack_does_not_delete_unknown_transaction_evidence(tmp_path):
+    repo, _base_sha, _maintenance_sha, target_sha = _release_repo(tmp_path)
+    result = update_cmd._prepare_and_promote_release(
+        ["git"], repo, "v2.0.0", target_sha,
+        candidate_validator=_test_candidate_validator,
+    )
+    assert result.context is not None
+    context = result.context
+    update_cmd._mark_release_finalized(context)
+    unknown = context.transaction_dir / "operator-evidence.txt"
+    unknown.write_text("keep this evidence\n", encoding="utf-8")
+
+    assert update_cmd._acknowledge_finalized_release(context) is False
+    assert unknown.read_text(encoding="utf-8") == "keep this evidence\n"
+    assert context.transaction_dir.is_dir()
+    assert not context.journal_path.exists()
+    assert not (context.transaction_dir / "runtime-local-maintenance.patch").exists()
+
+
+def test_final_ack_child_fsync_failure_retries_ack_only_and_preserves_post_finalize_state(
+    tmp_path, monkeypatch
+):
+    repo, _base_sha, _maintenance_sha, target_sha = _release_repo(tmp_path)
+    _git(repo, "switch", "main")
+    _write_user_state(repo, "ack-child-fsync")
+    result = update_cmd._prepare_and_promote_release(
+        ["git"], repo, "v2.0.0", target_sha,
+        candidate_validator=_test_candidate_validator,
+    )
+    assert result.context is not None
+    context = result.context
+    child = context.transaction_dir
+    fd_paths: dict[int, Path] = {}
+    events: list[tuple[str, Path | None]] = []
+    real_open = update_cmd.os.open
+    real_fsync = update_cmd.os.fsync
+    armed = False
+    failed = False
+
+    def tracked_open(path, flags, *args):
+        fd = real_open(path, flags, *args)
+        fd_paths[fd] = Path(path)
+        return fd
+
+    def tracked_fsync(fd):
+        nonlocal failed
+        path = fd_paths.get(fd)
+        events.append(("fsync", path))
+        if armed and not failed and path == child:
+            failed = True
+            raise OSError(f"injected final acknowledgment fsync failure: {path}")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(update_cmd.os, "open", tracked_open)
+    monkeypatch.setattr(update_cmd.os, "fsync", tracked_fsync)
+    real_mark = update_cmd._mark_release_finalized
+
+    def mark_and_arm(mark_context):
+        nonlocal armed
+        real_mark(mark_context)
+        armed = True
+
+    monkeypatch.setattr(update_cmd, "_mark_release_finalized", mark_and_arm)
+
+    assert update_cmd._finalize_release_upgrade(["git"], repo, context) is False
+    assert failed is True
+    assert context.journal["phase"] == "finalized"
+    assert context.journal["final_state_verified"] is True
+    assert not context.journal_path.exists()
+    post_finalize = _write_user_state(repo, "post-finalize")
+
+    with monkeypatch.context() as patcher:
+        real_run = subprocess.run
+        git_calls: list[list[str]] = []
+
+        def record_run(command, *args, **kwargs):
+            git_calls.append([str(part) for part in command])
+            return real_run(command, *args, **kwargs)
+
+        patcher.setattr(update_cmd.subprocess, "run", record_run)
+        assert update_cmd._finalize_release_upgrade(["git"], repo, context) is True
+        assert git_calls == []
+
+    assert not context.transaction_dir.exists()
+    assert _capture_user_state(repo, tuple(post_finalize["bytes"])) == post_finalize
+
+
+def test_directory_fsync_closes_fd_on_success_and_required_failure(tmp_path, monkeypatch):
+    if os.name != "posix":
+        pytest.skip("POSIX directory fsync semantics")
+    real_open = update_cmd.os.open
+    real_fsync = update_cmd.os.fsync
+    real_close = update_cmd.os.close
+
+    for fail in (False, True):
+        opened: list[int] = []
+        closed: list[int] = []
+
+        def tracked_open(path, flags, *args):
+            fd = real_open(path, flags, *args)
+            opened.append(fd)
+            return fd
+
+        def tracked_close(fd):
+            closed.append(fd)
+            return real_close(fd)
+
+        def tracked_fsync(fd):
+            if fail:
+                raise OSError("injected fsync failure")
+            return real_fsync(fd)
+
+        with monkeypatch.context() as patcher:
+            patcher.setattr(update_cmd.os, "open", tracked_open)
+            patcher.setattr(update_cmd.os, "close", tracked_close)
+            patcher.setattr(update_cmd.os, "fsync", tracked_fsync)
+            if fail:
+                with pytest.raises(OSError, match="injected fsync failure"):
+                    update_cmd._fsync_directory(tmp_path, required=True)
+            else:
+                update_cmd._fsync_directory(tmp_path, required=True)
+
+        assert opened == closed
+
+
+def test_directory_fsync_windows_path_is_explicit_best_effort(tmp_path, monkeypatch, caplog):
+    monkeypatch.setattr(
+        update_cmd,
+        "_directory_fsync_is_windows",
+        lambda: True,
+        raising=False,
+    )
+
+    def fail_open(*_args, **_kwargs):
+        raise OSError("directory handles unsupported")
+
+    monkeypatch.setattr(update_cmd.os, "open", fail_open)
+    with caplog.at_level("WARNING"):
+        update_cmd._fsync_directory(tmp_path, required=True)
+    assert "best effort" in caplog.text.lower()

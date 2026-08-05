@@ -141,7 +141,56 @@ def _git_common_dir(git_cmd: list[str], cwd: Path | str) -> Path:
     return common.resolve()
 
 
-def _atomic_write_bytes(path: Path, payload: bytes) -> None:
+def _directory_fsync_is_windows() -> bool:
+    """Return whether directory fsync must use the Windows best-effort path."""
+
+    return os.name == "nt" or sys.platform == "win32"
+
+
+def _fsync_directory(path: Path | str, *, required: bool) -> None:
+    """Fsync a directory entry, failing closed where POSIX requires it.
+
+    POSIX opens use ``O_DIRECTORY`` when the platform provides it, and a
+    required open/fsync failure is propagated.  Windows does not provide a
+    portable directory-fsync contract; it gets an explicit best-effort
+    attempt and a warning rather than a false claim of POSIX-equivalent
+    durability.
+    """
+
+    directory = Path(path)
+    windows = _directory_fsync_is_windows()
+    flags = os.O_RDONLY
+    if not windows:
+        flags |= getattr(os, "O_DIRECTORY", 0)
+    fd: int | None = None
+    try:
+        fd = os.open(str(directory), flags)
+        os.fsync(fd)
+    except (OSError, NotImplementedError) as exc:
+        if required and not windows:
+            raise
+        logger.warning(
+            "Directory fsync is best effort on this platform for %s: %s",
+            directory,
+            exc,
+        )
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError as exc:
+                if required and not windows:
+                    raise
+                logger.warning(
+                    "Could not close best-effort directory fsync handle for %s: %s",
+                    directory,
+                    exc,
+                )
+
+
+def _atomic_write_bytes(
+    path: Path, payload: bytes, *, required_parent_fsync: bool = False
+) -> None:
     """Write a regular file with fsync + replace, never following symlinks."""
 
     path = Path(path)
@@ -164,15 +213,18 @@ def _atomic_write_bytes(path: Path, payload: bytes) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(tmp_path, path)
-        try:
-            dir_fd = os.open(str(path.parent), os.O_RDONLY)
-        except OSError:
-            dir_fd = None
-        if dir_fd is not None:
+        if required_parent_fsync:
+            _fsync_directory(path.parent, required=True)
+        else:
             try:
-                os.fsync(dir_fd)
-            finally:
-                os.close(dir_fd)
+                dir_fd = os.open(str(path.parent), os.O_RDONLY)
+            except OSError:
+                dir_fd = None
+            if dir_fd is not None:
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
     finally:
         try:
             tmp_path.unlink()
@@ -683,7 +735,11 @@ def _write_transaction_journal(
     common_dir: Path, payload: dict, *, path: Path | None = None
 ) -> Path:
     path = Path(path) if path is not None else common_dir / "hermes-upgrade-transaction.json"
-    _atomic_write_bytes(path, (json.dumps(payload, sort_keys=True, indent=2) + "\n").encode())
+    _atomic_write_bytes(
+        path,
+        (json.dumps(payload, sort_keys=True, indent=2) + "\n").encode(),
+        required_parent_fsync=True,
+    )
     return path
 
 
@@ -1237,9 +1293,28 @@ def _create_release_upgrade_context(
 
     root = Path(cwd)
     common = _git_common_dir(git_cmd, root)
+    transactions = common / "hermes-upgrade-transactions"
+    try:
+        transactions_info = transactions.lstat()
+    except FileNotFoundError:
+        transactions.mkdir(exist_ok=False)
+        # Persist the newly-created transactions root before creating a child
+        # that may contain the first discoverable recovery journal.
+        _fsync_directory(common, required=True)
+    else:
+        if stat.S_ISLNK(transactions_info.st_mode) or not stat.S_ISDIR(
+            transactions_info.st_mode
+        ):
+            raise RuntimeError(
+                f"Refusing non-directory release transaction root: {transactions}"
+            )
+
     transaction_id = uuid.uuid4().hex
-    transaction_dir = common / "hermes-upgrade-transactions" / transaction_id
-    transaction_dir.mkdir(parents=True, exist_ok=False)
+    transaction_dir = transactions / transaction_id
+    transaction_dir.mkdir(exist_ok=False)
+    # The child directory entry must be durable before its journal/payload
+    # can become discoverable or any live Git state can be changed.
+    _fsync_directory(transactions, required=True)
     payload_path = transaction_dir / "runtime-local-maintenance.patch"
     backup_ref = f"refs/hermes-upgrade/backups/{transaction_id}"
     candidate_branch = f"hermes-upgrade-candidate/{transaction_id}"
@@ -1293,7 +1368,11 @@ def _create_release_upgrade_context(
     # The journal exists before payload capture; the payload itself is then
     # written as a regular fsynced file before any stash/checkout/reset.
     _write_transaction_journal(common, journal, path=journal_path)
-    _atomic_write_bytes(payload_path, payload)
+    _atomic_write_bytes(
+        payload_path,
+        payload,
+        required_parent_fsync=True,
+    )
     info = payload_path.lstat()
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
         raise RuntimeError(f"Durable release payload is not a regular file: {payload_path}")
@@ -2173,17 +2252,52 @@ def _release_finalization_marker_state(journal: dict) -> str:
 
 
 def _acknowledge_finalized_release(context: ReleaseUpgradeContext) -> bool:
-    """Remove terminal transaction evidence without touching the live checkout."""
+    """Remove known terminal evidence and durably acknowledge its directory entries."""
 
+    transaction_dir = context.transaction_dir
+    transactions = transaction_dir.parent
     try:
-        context.journal_path.lstat()
+        transaction_info = transaction_dir.lstat()
     except FileNotFoundError:
+        # A prior attempt may have removed the child before losing the root
+        # directory fsync.  Retrying this filesystem-only acknowledgment is
+        # safe and repairs that final durability step.
+        _fsync_directory(transactions, required=True)
         return True
-    context.journal_path.unlink()
+    if stat.S_ISLNK(transaction_info.st_mode) or not stat.S_ISDIR(
+        transaction_info.st_mode
+    ):
+        raise RuntimeError(f"Refusing non-directory release transaction: {transaction_dir}")
+
+    known_entries = (
+        context.journal_path,
+        transaction_dir / "runtime-local-maintenance.patch",
+    )
+    for entry in known_entries:
+        try:
+            entry_info = entry.lstat()
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(entry_info.st_mode) or not stat.S_ISREG(entry_info.st_mode):
+            raise RuntimeError(f"Refusing non-regular release transaction evidence: {entry}")
+        entry.unlink()
+
+    # The known evidence is gone, but unknown entries are deliberately not
+    # removed.  If one remains, rmdir fails closed and the terminal context is
+    # retained for a later acknowledgment retry.
+    _fsync_directory(transaction_dir, required=True)
     try:
-        context.transaction_dir.rmdir()
-    except OSError:
+        transaction_dir.rmdir()
+    except FileNotFoundError:
         pass
+    except OSError as exc:
+        logger.warning(
+            "Release transaction acknowledgment retained unknown evidence in %s: %s",
+            transaction_dir,
+            exc,
+        )
+        return False
+    _fsync_directory(transactions, required=True)
     return True
 
 
