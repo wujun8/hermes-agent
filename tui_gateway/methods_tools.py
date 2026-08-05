@@ -422,6 +422,9 @@ def _(rid, params: dict) -> dict:
                     "canonical": r.name,
                     "description": r.description,
                     "category": r.category,
+                    "args_hint": r.args_hint,
+                    "subcommands": list(r.subcommands),
+                    "busy_policy": r.busy_policy,
                 },
             )
         return _err(rid, 4011, f"unknown command: {params.get('name')}")
@@ -1090,9 +1093,43 @@ def _(rid, params: dict) -> dict:
     _cmd_base = (_cmd_parts[0] if _cmd_parts else "").lower()
     _cmd_arg = _cmd_parts[1] if len(_cmd_parts) > 1 else ""
 
-    live_output = _live_slash_command_output(
-        params.get("session_id", ""), session, _cmd_base, _cmd_arg
-    )
+    if _cmd_base == "micro":
+        # Reuse the central registry's busy policy rather than allowing a
+        # worker/live path to mutate a session during its active turn. Hold the
+        # session history lock across the direct call so a new turn cannot race
+        # in between the check and DB-first execution.
+        from hermes_cli.commands import resolve_command
+
+        _micro_def = resolve_command(_cmd_base)
+
+        def _run_micro_slash():
+            active = bool(session.get("running"))
+            if not active and session.get("agent") is None:
+                active = _child_run_active(str(session.get("session_key") or ""))
+            if _micro_def is not None and _micro_def.busy_policy == "reject" and active:
+                return _err(
+                    rid,
+                    4009,
+                    f"session busy — /{_micro_def.name} can't run mid-turn; "
+                    "interrupt the current turn first",
+                )
+            return _live_slash_command_output(
+                params.get("session_id", ""), session, _cmd_base, _cmd_arg
+            )
+
+        _micro_lock = session.get("history_lock")
+        if _micro_lock is None:
+            live_output = _run_micro_slash()
+        else:
+            with _micro_lock:
+                _micro_response = _run_micro_slash()
+            if isinstance(_micro_response, dict) and "error" in _micro_response:
+                return _micro_response
+            live_output = _micro_response
+    else:
+        live_output = _live_slash_command_output(
+            params.get("session_id", ""), session, _cmd_base, _cmd_arg
+        )
     if live_output is not None:
         return _ok(rid, {"output": live_output or "(no output)"})
 

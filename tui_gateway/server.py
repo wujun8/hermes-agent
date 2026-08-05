@@ -2806,6 +2806,31 @@ def _session_db(session: dict):
                 db.close()
 
 
+def _session_micro_config_loader(session: dict):
+    """Return the readonly micro policy config loader for this session.
+
+    A TUI gateway can host sessions from more than one profile.  The shared
+    micro command service intentionally accepts a loader so its global value
+    cannot accidentally come from the gateway launch profile.  Bind the
+    session's stored profile home only for the read; the ContextVar is restored
+    before the RPC thread handles another session.
+    """
+    from hermes_cli.config import load_config_readonly
+
+    profile_home = str(session.get("profile_home") or "").strip()
+    if not profile_home:
+        return load_config_readonly
+
+    def load_profile_config():
+        token = set_hermes_home_override(profile_home)
+        try:
+            return load_config_readonly()
+        finally:
+            reset_hermes_home_override(token)
+
+    return load_profile_config
+
+
 def _persist_session_git_meta(session: dict, cwd: str) -> None:
     """Resolve + persist a session's git branch / repo root WITHOUT blocking.
 
@@ -12244,6 +12269,7 @@ _LIVE_SESSION_DIRECT_COMMANDS = frozenset(
         "compress",
         "effort",
         "history",
+        "micro",
         "models",
         "prompt",
         "rename",
@@ -12433,6 +12459,37 @@ def _format_live_model_output(session: dict) -> str:
 def _live_slash_command_output(sid: str, session: Optional[dict], name: str, arg: str) -> Optional[str]:
     name = (name or "").lstrip("/").lower()
     arg = arg or ""
+    if name == "micro":
+        # A cold TUI session deliberately stays cold: slash.exec must use the
+        # normal profile-aware slash worker, whose classic CLI path persists
+        # the row for the later agent hydration.  Only an already-built main
+        # agent is eligible for direct live application.
+        if session is None or session.get("agent") is None:
+            return None
+        agent = session["agent"]
+        session_key = str(session.get("session_key") or "")
+        agent_key = str(getattr(agent, "session_id", "") or "")
+        if not session_key.strip() or not agent_key.strip():
+            return (
+                "Micro-compaction error: live session identity is incomplete; "
+                "refusing to mutate"
+            )
+        if session_key != agent_key:
+            return (
+                "Micro-compaction error: live session identity mismatch; "
+                "refusing to mutate"
+            )
+        from hermes_cli.micro_command import execute_micro_command
+
+        with _session_db(session) as db:
+            return execute_micro_command(
+                agent=agent,
+                session_db=db,
+                session_id=str(session.get("session_key") or ""),
+                raw_args=arg,
+                ensure_session=getattr(agent, "_ensure_db_session", None),
+                config_loader=_session_micro_config_loader(session),
+            )
     if name == "model" and not arg.strip():
         return _format_live_model_output(session or {})
     if name not in _LIVE_SESSION_DIRECT_COMMANDS:
