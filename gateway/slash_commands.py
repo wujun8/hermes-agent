@@ -378,6 +378,93 @@ class GatewaySlashCommandsMixin:
 
         return "\n".join(lines)
 
+    async def _handle_micro_command(self, event: MessageEvent) -> str:
+        """Handle the DB-first, session-scoped ``/micro`` policy command."""
+        from hermes_cli.micro_command import (
+            execute_micro_command,
+            load_config_readonly,
+        )
+
+        source = event.source
+        try:
+            entry = await self.async_session_store.get_or_create_session(source)
+        except Exception as exc:
+            logger.warning("Could not resolve gateway session for /micro: %s", exc)
+            return f"Micro-compaction error: session lookup failed: {exc}"
+
+        session_id = str(getattr(entry, "session_id", "") or "")
+        if not session_id.strip():
+            return "Micro-compaction error: a non-empty exact session ID is required"
+
+        runner_session_db = getattr(self, "_session_db", None)
+        cached_agent = None
+        cache = getattr(self, "_agent_cache", None)
+        if cache is not None:
+            cache_lock = getattr(self, "_agent_cache_lock", None)
+            if cache_lock is None:
+                return "Micro-compaction error: agent cache is not available"
+            try:
+                with cache_lock:
+                    cached = cache.get(self._session_key_for_source(source))
+            except Exception as exc:
+                logger.warning("Could not read cached gateway agent for /micro: %s", exc)
+                return f"Micro-compaction error: agent cache read failed: {exc}"
+            if isinstance(cached, tuple):
+                cached_agent = cached[0] if cached else None
+            else:
+                cached_agent = cached
+
+        if cached_agent is not None:
+            agent_session_id = str(getattr(cached_agent, "session_id", "") or "")
+            if not agent_session_id.strip():
+                return (
+                    "Micro-compaction error: live session identity is incomplete; "
+                    "refusing to mutate"
+                )
+            if agent_session_id != session_id:
+                return (
+                    "Micro-compaction error: live session identity mismatch; "
+                    "refusing to mutate"
+                )
+            raw_session_db = getattr(cached_agent, "_session_db", None)
+            if raw_session_db is None:
+                return "Micro-compaction error: session database is not available"
+            ensure_session = getattr(cached_agent, "_ensure_db_session", None)
+            agent = cached_agent
+        else:
+            if runner_session_db is None:
+                return "Micro-compaction error: session database is not available"
+            raw_session_db = getattr(runner_session_db, "_db", None)
+            if raw_session_db is None:
+                return "Micro-compaction error: session database is not available"
+            agent = None
+
+            def ensure_session():
+                if raw_session_db.get_session(session_id) is not None:
+                    return
+                raw_session_db.create_session(
+                    session_id=session_id,
+                    source=source.platform.value if source.platform else "unknown",
+                    user_id=source.user_id,
+                    chat_id=source.chat_id,
+                    chat_type=source.chat_type,
+                    thread_id=source.thread_id,
+                )
+
+        try:
+            return await asyncio.to_thread(
+                execute_micro_command,
+                agent=agent,
+                session_db=raw_session_db,
+                session_id=session_id,
+                raw_args=event.get_command_args(),
+                ensure_session=ensure_session,
+                config_loader=load_config_readonly,
+            )
+        except Exception as exc:
+            logger.exception("Gateway /micro execution failed")
+            return f"Micro-compaction error: command execution failed: {exc}"
+
     async def _handle_whoami_command(self, event: MessageEvent) -> str:
         """Handle /whoami — show the user's slash command access on this scope.
 

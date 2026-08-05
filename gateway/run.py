@@ -14974,6 +14974,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if canonical == "status":
             return await self._handle_status_command(event)
 
+        if canonical == "micro":
+            return await self._handle_micro_command(event)
+
         if canonical == "egress":
             from hermes_cli.proxy_cli import format_status_text
 
