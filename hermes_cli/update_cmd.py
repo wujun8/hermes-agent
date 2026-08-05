@@ -116,6 +116,9 @@ class ReleaseUpgradeContext:
     transaction_dir: Path
     journal_path: Path
     journal: dict
+    final_marker_write_uncertain: bool = False
+    final_marker_candidate: Optional[dict] = None
+    final_marker_prior_digest: str | None = None
 
 
 def _git_common_dir(git_cmd: list[str], cwd: Path | str) -> Path:
@@ -2250,6 +2253,304 @@ def _release_finalization_marker_state(journal: dict) -> str:
     return "unfinalized"
 
 
+_TERMINAL_RECONCILIATION_REQUIRED_FIELDS = frozenset(
+    {
+        "version",
+        "transaction_id",
+        "phase",
+        "state",
+        "original_branch",
+        "original_ref",
+        "original_head_sha",
+        "maintenance_branch",
+        "maintenance_old_sha",
+        "old_sha",
+        "release_tag",
+        "base_sha",
+        "target_sha",
+        "backup_ref",
+        "backup_created",
+        "candidate_branch",
+        "candidate_path",
+        "candidate_sha",
+        "candidate_cleanup",
+        "payload_path",
+        "payload_sha256",
+        "payload_bytes",
+        "stash_marker",
+        "stash_sha",
+        "local_state_present",
+        "stash_capture_required",
+        "stash_capture_confirmed",
+        "stash_capture_uncertain",
+        "stash_pending",
+        "stash_apply_attempted",
+        "stash_applied",
+        "checkout_restored",
+        "final_state_verified",
+    }
+)
+_TERMINAL_RECONCILIATION_BOOL_FIELDS = frozenset(
+    {
+        "backup_created",
+        "candidate_cleanup",
+        "stash_capture_confirmed",
+        "stash_capture_uncertain",
+        "stash_pending",
+        "stash_apply_attempted",
+        "stash_applied",
+        "checkout_restored",
+        "final_state_verified",
+        "candidate_created",
+        "finalized",
+    }
+)
+_TERMINAL_RECONCILIATION_SHA_FIELDS = (
+    "original_head_sha",
+    "maintenance_old_sha",
+    "old_sha",
+    "base_sha",
+    "target_sha",
+    "candidate_sha",
+)
+
+
+def _terminal_journal_digest(journal: dict) -> str:
+    """Return the digest of the exact in-memory pre-terminal journal."""
+
+    encoded = json.dumps(
+        journal,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _validate_terminal_reconciliation_paths(
+    context: ReleaseUpgradeContext,
+) -> tuple[Path, Path]:
+    """Validate the fixed transaction/journal path topology without Git."""
+
+    common = Path(context.common_dir)
+    transactions = common / "hermes-upgrade-transactions"
+    transaction_dir = Path(context.transaction_dir)
+    journal_path = Path(context.journal_path)
+    if not common.is_absolute() or not transaction_dir.is_absolute() or not journal_path.is_absolute():
+        raise RuntimeError("Uncertain terminal journal paths must be absolute.")
+    if transaction_dir.parent != transactions:
+        raise RuntimeError("Uncertain terminal journal transaction directory escaped its root.")
+    if journal_path != transaction_dir / "journal.json":
+        raise RuntimeError("Uncertain terminal journal path escaped its transaction directory.")
+
+    for directory, label in (
+        (common, "Git common directory"),
+        (transactions, "release transactions directory"),
+    ):
+        try:
+            info = directory.lstat()
+        except OSError as exc:
+            raise RuntimeError(f"Could not inspect {label}: {directory}") from exc
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise RuntimeError(f"Refusing non-directory {label}: {directory}")
+
+    try:
+        transaction_info = transaction_dir.lstat()
+    except FileNotFoundError:
+        return transactions, transaction_dir
+    except OSError as exc:
+        raise RuntimeError(
+            f"Could not inspect uncertain release transaction directory: {transaction_dir}"
+        ) from exc
+    if stat.S_ISLNK(transaction_info.st_mode) or not stat.S_ISDIR(transaction_info.st_mode):
+        raise RuntimeError(
+            f"Refusing non-directory uncertain release transaction: {transaction_dir}"
+        )
+    return transactions, transaction_dir
+
+
+def _validate_terminal_reconciliation_journal(
+    context: ReleaseUpgradeContext,
+    journal: object,
+    *,
+    terminal: bool,
+) -> dict:
+    """Validate the strict schema needed before filesystem-only reconciliation."""
+
+    if not isinstance(journal, dict):
+        raise RuntimeError("Uncertain terminal journal is not a JSON object.")
+    missing = _TERMINAL_RECONCILIATION_REQUIRED_FIELDS.difference(journal)
+    if missing:
+        raise RuntimeError(
+            "Uncertain terminal journal is missing control fields: "
+            + ", ".join(sorted(missing))
+        )
+    marker_state = _release_finalization_marker_state(journal)
+    expected_state = "verified" if terminal else "unfinalized"
+    if marker_state != expected_state:
+        raise RuntimeError(
+            f"Uncertain terminal journal has invalid marker state {marker_state!r}; "
+            f"expected {expected_state!r}."
+        )
+    if terminal:
+        if (
+            journal.get("phase") != "finalized"
+            or journal.get("state") != "finalized"
+            or journal.get("final_state_verified") is not True
+            or journal.get("finalized") is not True
+        ):
+            raise RuntimeError("Uncertain terminal journal terminal controls are not exact.")
+    elif journal.get("final_state_verified") is not False:
+        raise RuntimeError("Uncertain terminal journal prior marker is not explicitly nonterminal.")
+    if journal.get("version") != 2:
+        raise RuntimeError("Uncertain terminal journal has an unsupported version.")
+
+    transaction_dir = Path(context.transaction_dir)
+    transaction_id = journal.get("transaction_id")
+    if not isinstance(transaction_id, str) or transaction_id != transaction_dir.name:
+        raise RuntimeError("Uncertain terminal journal transaction identity mismatch.")
+
+    original_branch = journal.get("original_branch")
+    original_ref = journal.get("original_ref")
+    if original_branch is not None and (
+        not isinstance(original_branch, str)
+        or not original_branch
+        or original_ref != f"refs/heads/{original_branch}"
+    ):
+        raise RuntimeError("Uncertain terminal journal original branch/ref is invalid.")
+    if original_branch is None and original_ref is not None:
+        raise RuntimeError("Uncertain terminal journal has a ref without an original branch.")
+
+    for field in _TERMINAL_RECONCILIATION_SHA_FIELDS:
+        value = journal.get(field)
+        if not isinstance(value, str) or _SHA_RE.fullmatch(value) is None:
+            raise RuntimeError(f"Uncertain terminal journal has an invalid {field}.")
+    stash_sha = journal.get("stash_sha")
+    if stash_sha is not None and (
+        not isinstance(stash_sha, str) or _SHA_RE.fullmatch(stash_sha) is None
+    ):
+        raise RuntimeError("Uncertain terminal journal has an invalid stash SHA.")
+    payload_sha256 = journal.get("payload_sha256")
+    if not isinstance(payload_sha256, str) or re.fullmatch(r"[0-9a-fA-F]{64}", payload_sha256) is None:
+        raise RuntimeError("Uncertain terminal journal has an invalid payload digest.")
+    payload_bytes = journal.get("payload_bytes")
+    if not isinstance(payload_bytes, int) or isinstance(payload_bytes, bool) or payload_bytes < 0:
+        raise RuntimeError("Uncertain terminal journal has an invalid payload length.")
+
+    payload_path = journal.get("payload_path")
+    expected_payload = transaction_dir / "runtime-local-maintenance.patch"
+    if not isinstance(payload_path, str) or Path(payload_path) != expected_payload:
+        raise RuntimeError("Uncertain terminal journal payload path escaped its transaction directory.")
+    for field in (
+        "maintenance_branch",
+        "release_tag",
+        "stash_marker",
+        "backup_ref",
+        "candidate_branch",
+        "candidate_path",
+    ):
+        if not isinstance(journal.get(field), str) or not journal[field]:
+            raise RuntimeError(f"Uncertain terminal journal has an invalid {field}.")
+    if journal["backup_ref"] != f"refs/hermes-upgrade/backups/{transaction_id}":
+        raise RuntimeError("Uncertain terminal journal backup ref does not belong to this transaction.")
+    if journal["candidate_branch"] != f"hermes-upgrade-candidate/{transaction_id}":
+        raise RuntimeError("Uncertain terminal journal candidate branch does not belong to this transaction.")
+    if not Path(journal["candidate_path"]).is_absolute():
+        raise RuntimeError("Uncertain terminal journal candidate path is not absolute.")
+
+    if journal.get("local_state_present") not in (None, True, False):
+        raise RuntimeError("Uncertain terminal journal has an invalid local-state flag.")
+    if journal.get("stash_capture_required") not in (None, True, False):
+        raise RuntimeError("Uncertain terminal journal has an invalid stash-capture flag.")
+    for field in _TERMINAL_RECONCILIATION_BOOL_FIELDS:
+        if field in journal and not isinstance(journal[field], bool):
+            raise RuntimeError(f"Uncertain terminal journal has an invalid {field} flag.")
+    if journal.get("state") != journal.get("phase"):
+        raise RuntimeError("Uncertain terminal journal phase/state controls disagree.")
+    return journal
+
+
+def _read_uncertain_terminal_journal(context: ReleaseUpgradeContext) -> dict:
+    """Read the journal for reconciliation while rejecting unsafe entries."""
+
+    _transactions, transaction_dir = _validate_terminal_reconciliation_paths(context)
+    if not transaction_dir.exists():
+        raise RuntimeError(
+            "Uncertain terminal journal transaction directory is missing; refusing to infer completion."
+        )
+    journal_path = Path(context.journal_path)
+    try:
+        info = journal_path.lstat()
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            "Uncertain terminal journal is missing; refusing to infer completion."
+        ) from exc
+    except OSError as exc:
+        raise RuntimeError("Could not inspect uncertain terminal journal.") from exc
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise RuntimeError("Refusing non-regular or symlinked uncertain terminal journal.")
+    try:
+        value = json.loads(journal_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("Uncertain terminal journal is unreadable or invalid JSON.") from exc
+    if not isinstance(value, dict):
+        raise RuntimeError("Uncertain terminal journal is not a JSON object.")
+    return value
+
+
+def _reconcile_uncertain_final_marker(context: ReleaseUpgradeContext) -> bool:
+    """Reconcile a possibly-replaced terminal marker without touching Git."""
+
+    prior = context.journal
+    candidate = context.final_marker_candidate
+    if context.final_marker_write_uncertain is not True:
+        raise RuntimeError("Terminal marker reconciliation was requested without an uncertainty latch.")
+    if type(prior) is not dict or type(candidate) is not dict:
+        raise RuntimeError("Uncertain terminal marker state is incomplete; preserving evidence.")
+    _validate_terminal_reconciliation_journal(context, prior, terminal=False)
+    if not isinstance(context.final_marker_prior_digest, str):
+        raise RuntimeError("Uncertain terminal marker has no immutable prior-journal digest.")
+    if _terminal_journal_digest(prior) != context.final_marker_prior_digest:
+        raise RuntimeError("Uncertain terminal marker prior journal was mutated in memory.")
+
+    expected_candidate = dict(prior)
+    expected_candidate.update(
+        {
+            "phase": "finalized",
+            "state": "finalized",
+            "final_state_verified": True,
+            "finalized": True,
+        }
+    )
+    if candidate != expected_candidate:
+        raise RuntimeError("Uncertain terminal marker candidate no longer matches its prior journal.")
+    _validate_terminal_reconciliation_journal(context, candidate, terminal=True)
+
+    disk = _read_uncertain_terminal_journal(context)
+    if disk != prior and disk != candidate:
+        raise RuntimeError(
+            "Uncertain terminal journal does not match either the exact prior or terminal candidate; "
+            "preserving evidence."
+        )
+
+    try:
+        _write_transaction_journal(
+            context.common_dir, candidate, path=context.journal_path
+        )
+    except BaseException:
+        # The context must remain nonterminal and latched even if this retry
+        # reaches replace before the required child-directory fsync fails.
+        context.final_marker_write_uncertain = True
+        raise
+
+    context.journal.clear()
+    context.journal.update(candidate)
+    context.final_marker_write_uncertain = False
+    context.final_marker_candidate = None
+    context.final_marker_prior_digest = None
+    return _acknowledge_finalized_release(context)
+
+
 
 def _acknowledge_finalized_release(context: ReleaseUpgradeContext) -> bool:
     """Remove known terminal evidence and durably acknowledge its directory entries."""
@@ -2305,7 +2606,8 @@ def _acknowledge_finalized_release(context: ReleaseUpgradeContext) -> bool:
 def _mark_release_finalized(context: ReleaseUpgradeContext) -> None:
     """Persist the terminal marker before exposing it to retry logic."""
 
-    terminal_journal = dict(context.journal)
+    prior_journal = dict(context.journal)
+    terminal_journal = dict(prior_journal)
     terminal_journal.update(
         {
             "phase": "finalized",
@@ -2314,11 +2616,23 @@ def _mark_release_finalized(context: ReleaseUpgradeContext) -> None:
             "finalized": True,
         }
     )
-    _write_transaction_journal(
-        context.common_dir, terminal_journal, path=context.journal_path
-    )
+    context.final_marker_candidate = dict(terminal_journal)
+    context.final_marker_prior_digest = _terminal_journal_digest(prior_journal)
+    try:
+        _write_transaction_journal(
+            context.common_dir, terminal_journal, path=context.journal_path
+        )
+    except BaseException:
+        # os.replace may already have made the terminal bytes visible when the
+        # required child-directory fsync fails.  Keep the live context
+        # nonterminal, but latch the exact candidate before propagating.
+        context.final_marker_write_uncertain = True
+        raise
     context.journal.clear()
     context.journal.update(terminal_journal)
+    context.final_marker_write_uncertain = False
+    context.final_marker_candidate = None
+    context.final_marker_prior_digest = None
 
 
 
@@ -2332,6 +2646,33 @@ def _finalize_release_upgrade(
     """Restore the original checkout and apply/drop the immutable stash once."""
 
     root = Path(cwd)
+    if context.final_marker_write_uncertain is True:
+        # A terminal marker write may have replaced the file before its
+        # required child-directory fsync failed.  Reconcile only the journal;
+        # never inspect or mutate the live Git checkout on this retry.
+        try:
+            return _reconcile_uncertain_final_marker(context)
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException as exc:
+            logger.warning(
+                "Uncertain terminal marker reconciliation did not complete; journal retained at %s: %s",
+                context.journal_path,
+                exc,
+            )
+            print(f"⚠ Release user-state recovery is incomplete; journal: {context.journal_path}")
+            return False
+    if (
+        context.final_marker_write_uncertain is not False
+        or context.final_marker_candidate is not None
+        or context.final_marker_prior_digest is not None
+    ):
+        logger.error(
+            "Refusing release finalization with invalid in-memory terminal marker state: %s",
+            context.journal_path,
+        )
+        print(f"✗ Release finalization marker state is invalid; journal: {context.journal_path}")
+        return False
     journal = context.journal
     try:
         marker_state = _release_finalization_marker_state(journal)
@@ -2514,6 +2855,10 @@ def _finalize_release_upgrade(
         # Mark the verified terminal state before acknowledging journal removal.
         # Any retry now takes the filesystem-only path above.
         return _acknowledge_finalized_release(context)
+    except (KeyboardInterrupt, SystemExit):
+        # Preserve process-control exceptions after the terminal write latch has
+        # captured the candidate and kept the journal as recovery evidence.
+        raise
     except BaseException as exc:
         # A second Ctrl-C must not erase the only recovery evidence.  Preserve
         # the journal and let an already-active exception continue propagating.

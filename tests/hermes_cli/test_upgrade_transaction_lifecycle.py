@@ -958,6 +958,423 @@ def test_final_ack_child_fsync_failure_retries_ack_only_and_preserves_post_final
     assert _capture_user_state(repo, tuple(post_finalize["bytes"])) == post_finalize
 
 
+def test_terminal_marker_fsync_failure_latches_without_exposing_terminal(
+    tmp_path, monkeypatch
+):
+    repo, _base_sha, _maintenance_sha, target_sha = _release_repo(tmp_path)
+    _git(repo, "switch", "main")
+    _write_user_state(repo, "terminal-marker-uncertain")
+    result = update_cmd._prepare_and_promote_release(
+        ["git"], repo, "v2.0.0", target_sha,
+        candidate_validator=_test_candidate_validator,
+    )
+    assert result.context is not None
+    context = result.context
+    child = context.transaction_dir
+    fd_paths: dict[int, Path] = {}
+    real_open = update_cmd.os.open
+    real_fsync = update_cmd.os.fsync
+    armed = False
+    failed = False
+
+    def tracked_open(path, flags, *args):
+        fd = real_open(path, flags, *args)
+        fd_paths[fd] = Path(path)
+        return fd
+
+    def tracked_fsync(fd):
+        nonlocal failed
+        path = fd_paths.get(fd)
+        if armed and not failed and path == child:
+            failed = True
+            raise OSError(f"injected terminal marker fsync failure: {path}")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(update_cmd.os, "open", tracked_open)
+    monkeypatch.setattr(update_cmd.os, "fsync", tracked_fsync)
+    real_mark = update_cmd._mark_release_finalized
+
+    def arm_before_mark(mark_context):
+        nonlocal armed
+        armed = True
+        return real_mark(mark_context)
+
+    monkeypatch.setattr(update_cmd, "_mark_release_finalized", arm_before_mark)
+
+    assert update_cmd._finalize_release_upgrade(["git"], repo, context) is False
+    assert failed is True
+    assert context.journal["phase"] == "finalizing"
+    assert context.final_marker_write_uncertain is True
+    assert context.final_marker_candidate["phase"] == "finalized"
+    persisted = json.loads(context.journal_path.read_text(encoding="utf-8"))
+    assert persisted["phase"] == "finalized"
+    assert persisted["final_state_verified"] is True
+
+    post_failure = _write_user_state(repo, "after-terminal-marker-failure")
+    with monkeypatch.context() as patcher:
+        real_run = subprocess.run
+        git_calls: list[list[str]] = []
+
+        def record_run(command, *args, **kwargs):
+            git_calls.append([str(part) for part in command])
+            return real_run(command, *args, **kwargs)
+
+        patcher.setattr(update_cmd.subprocess, "run", record_run)
+        assert update_cmd._finalize_release_upgrade(["git"], repo, context) is True
+        assert git_calls == []
+
+    _assert_captured_user_state(repo, post_failure)
+    assert context.journal["phase"] == "finalized"
+    assert context.journal["final_state_verified"] is True
+    assert not context.transaction_dir.exists()
+
+
+def test_uncertain_terminal_marker_retry_failure_stays_latched_and_git_free(
+    tmp_path, monkeypatch
+):
+    repo, _base_sha, _maintenance_sha, target_sha = _release_repo(tmp_path)
+    _git(repo, "switch", "main")
+    _write_user_state(repo, "uncertain-retry-failure")
+    result = update_cmd._prepare_and_promote_release(
+        ["git"], repo, "v2.0.0", target_sha,
+        candidate_validator=_test_candidate_validator,
+    )
+    assert result.context is not None
+    context = result.context
+    child = context.transaction_dir
+    fd_paths: dict[int, Path] = {}
+    real_open = update_cmd.os.open
+    real_fsync = update_cmd.os.fsync
+    armed = False
+    failures = 0
+
+    def tracked_open(path, flags, *args):
+        fd = real_open(path, flags, *args)
+        fd_paths[fd] = Path(path)
+        return fd
+
+    def tracked_fsync(fd):
+        nonlocal failures
+        path = fd_paths.get(fd)
+        if armed and path == child and failures < 2:
+            failures += 1
+            raise OSError(f"injected terminal marker fsync failure {failures}: {path}")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(update_cmd.os, "open", tracked_open)
+    monkeypatch.setattr(update_cmd.os, "fsync", tracked_fsync)
+    real_mark = update_cmd._mark_release_finalized
+
+    def arm_before_mark(mark_context):
+        nonlocal armed
+        armed = True
+        return real_mark(mark_context)
+
+    monkeypatch.setattr(update_cmd, "_mark_release_finalized", arm_before_mark)
+    assert update_cmd._finalize_release_upgrade(["git"], repo, context) is False
+    assert context.final_marker_write_uncertain is True
+    assert context.journal["phase"] == "finalizing"
+    post_failure = _write_user_state(repo, "after-persistent-retry-failure")
+
+    with monkeypatch.context() as patcher:
+        real_run = subprocess.run
+        git_calls: list[list[str]] = []
+
+        def record_run(command, *args, **kwargs):
+            git_calls.append([str(part) for part in command])
+            return real_run(command, *args, **kwargs)
+
+        patcher.setattr(update_cmd.subprocess, "run", record_run)
+        assert update_cmd._finalize_release_upgrade(["git"], repo, context) is False
+        assert git_calls == []
+        assert context.final_marker_write_uncertain is True
+        assert context.journal["phase"] == "finalizing"
+        assert context.journal_path.exists()
+        assert update_cmd._finalize_release_upgrade(["git"], repo, context) is True
+        assert git_calls == []
+
+    _assert_captured_user_state(repo, post_failure)
+    assert not context.transaction_dir.exists()
+
+
+def test_uncertain_terminal_marker_replace_failure_reconciles_prior_journal_git_free(
+    tmp_path, monkeypatch
+):
+    repo, _base_sha, _maintenance_sha, target_sha = _release_repo(tmp_path)
+    _git(repo, "switch", "main")
+    _write_user_state(repo, "replace-did-not-happen")
+    result = update_cmd._prepare_and_promote_release(
+        ["git"], repo, "v2.0.0", target_sha,
+        candidate_validator=_test_candidate_validator,
+    )
+    assert result.context is not None
+    context = result.context
+    real_replace = update_cmd.os.replace
+    armed = False
+    failed = False
+
+    def guarded_replace(source, destination):
+        nonlocal failed
+        if armed and Path(destination) == context.journal_path:
+            failed = True
+            raise OSError("injected terminal marker replace failure")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(update_cmd.os, "replace", guarded_replace)
+    real_mark = update_cmd._mark_release_finalized
+
+    def arm_before_mark(mark_context):
+        nonlocal armed
+        armed = True
+        return real_mark(mark_context)
+
+    monkeypatch.setattr(update_cmd, "_mark_release_finalized", arm_before_mark)
+    assert update_cmd._finalize_release_upgrade(["git"], repo, context) is False
+    assert failed is True
+    assert context.final_marker_write_uncertain is True
+    assert context.journal["phase"] == "finalizing"
+    persisted = json.loads(context.journal_path.read_text(encoding="utf-8"))
+    assert persisted == context.journal
+    armed = False
+
+    post_failure = _write_user_state(repo, "after-replace-failure")
+    with monkeypatch.context() as patcher:
+        real_run = subprocess.run
+        git_calls: list[list[str]] = []
+
+        def record_run(command, *args, **kwargs):
+            git_calls.append([str(part) for part in command])
+            return real_run(command, *args, **kwargs)
+
+        patcher.setattr(update_cmd.subprocess, "run", record_run)
+        assert update_cmd._finalize_release_upgrade(["git"], repo, context) is True
+        assert git_calls == []
+
+    assert context.journal["phase"] == "finalized"
+    assert context.journal["final_state_verified"] is True
+    _assert_captured_user_state(repo, post_failure)
+    assert not context.transaction_dir.exists()
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    ["missing", "tampered", "different-transaction", "invalid-finalized", "escape", "symlink"],
+)
+def test_uncertain_terminal_marker_tampering_fails_closed_without_ack_or_git(
+    tmp_path, monkeypatch, tamper
+):
+    repo, _base_sha, _maintenance_sha, target_sha = _release_repo(tmp_path)
+    _git(repo, "switch", "main")
+    _write_user_state(repo, f"tamper-{tamper}")
+    result = update_cmd._prepare_and_promote_release(
+        ["git"], repo, "v2.0.0", target_sha,
+        candidate_validator=_test_candidate_validator,
+    )
+    assert result.context is not None
+    context = result.context
+    child = context.transaction_dir
+    fd_paths: dict[int, Path] = {}
+    real_open = update_cmd.os.open
+    real_fsync = update_cmd.os.fsync
+    armed = False
+    failed = False
+
+    def tracked_open(path, flags, *args):
+        fd = real_open(path, flags, *args)
+        fd_paths[fd] = Path(path)
+        return fd
+
+    def tracked_fsync(fd):
+        nonlocal failed
+        path = fd_paths.get(fd)
+        if armed and not failed and path == child:
+            failed = True
+            raise OSError("injected terminal marker fsync failure")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(update_cmd.os, "open", tracked_open)
+    monkeypatch.setattr(update_cmd.os, "fsync", tracked_fsync)
+    real_mark = update_cmd._mark_release_finalized
+
+    def arm_before_mark(mark_context):
+        nonlocal armed
+        armed = True
+        return real_mark(mark_context)
+
+    monkeypatch.setattr(update_cmd, "_mark_release_finalized", arm_before_mark)
+    assert update_cmd._finalize_release_upgrade(["git"], repo, context) is False
+    assert failed is True
+    assert context.final_marker_write_uncertain is True
+    assert context.journal["phase"] == "finalizing"
+
+    if tamper == "missing":
+        context.journal_path.unlink()
+    elif tamper == "symlink":
+        evidence = context.transaction_dir / "journal-evidence.json"
+        context.journal_path.replace(evidence)
+        context.journal_path.symlink_to(evidence.name)
+    else:
+        disk = json.loads(context.journal_path.read_text(encoding="utf-8"))
+        if tamper == "tampered":
+            disk["payload_sha256"] = "0" * 64
+        elif tamper == "different-transaction":
+            disk["transaction_id"] = "attacker-controlled"
+        elif tamper == "invalid-finalized":
+            disk["phase"] = "finalized"
+            disk["state"] = "finalized"
+            disk["final_state_verified"] = False
+        elif tamper == "escape":
+            disk["payload_path"] = str(tmp_path / "outside-payload")
+        context.journal_path.write_text(
+            json.dumps(disk, sort_keys=True, indent=2) + "\n", encoding="utf-8"
+        )
+
+    with monkeypatch.context() as patcher:
+        git_calls: list[list[str]] = []
+
+        def forbidden_run(command, *args, **kwargs):
+            git_calls.append([str(part) for part in command])
+            raise AssertionError("uncertain reconciliation invoked Git/subprocess")
+
+        def forbidden_ack(*args, **kwargs):
+            raise AssertionError("uncertain reconciliation acknowledged tampered evidence")
+
+        patcher.setattr(update_cmd.subprocess, "run", forbidden_run)
+        patcher.setattr(update_cmd, "_acknowledge_finalized_release", forbidden_ack)
+        assert update_cmd._finalize_release_upgrade(["git"], repo, context) is False
+        assert git_calls == []
+
+    assert context.final_marker_write_uncertain is True
+    assert context.journal["phase"] == "finalizing"
+    assert child.exists()
+    if tamper == "missing":
+        assert not context.journal_path.exists()
+    elif tamper == "symlink":
+        assert context.journal_path.is_symlink()
+
+
+@pytest.mark.parametrize("write_exception", [BaseException, KeyboardInterrupt])
+def test_terminal_marker_write_baseexception_latches_before_propagation(
+    tmp_path, monkeypatch, write_exception
+):
+    repo, _base_sha, _maintenance_sha, target_sha = _release_repo(tmp_path)
+    _git(repo, "switch", "main")
+    _write_user_state(repo, "terminal-marker-baseexception")
+    result = update_cmd._prepare_and_promote_release(
+        ["git"], repo, "v2.0.0", target_sha,
+        candidate_validator=_test_candidate_validator,
+    )
+    assert result.context is not None
+    context = result.context
+    update_cmd._journal_update(context, "finalizing")
+    real_write = update_cmd._write_transaction_journal
+    armed = True
+
+    def fail_terminal_write(common_dir, payload, *, path=None):
+        if armed and payload.get("phase") == "finalized":
+            raise write_exception("injected terminal marker write exception")
+        return real_write(common_dir, payload, path=path)
+
+    monkeypatch.setattr(update_cmd, "_write_transaction_journal", fail_terminal_write)
+    with pytest.raises(write_exception):
+        update_cmd._mark_release_finalized(context)
+
+    assert context.final_marker_write_uncertain is True
+    assert context.final_marker_candidate["phase"] == "finalized"
+    assert context.journal["phase"] == "finalizing"
+    assert json.loads(context.journal_path.read_text(encoding="utf-8")) == context.journal
+
+    armed = False
+    with monkeypatch.context() as patcher:
+        real_run = subprocess.run
+        git_calls: list[list[str]] = []
+
+        def record_run(command, *args, **kwargs):
+            git_calls.append([str(part) for part in command])
+            return real_run(command, *args, **kwargs)
+
+        patcher.setattr(update_cmd.subprocess, "run", record_run)
+        assert update_cmd._finalize_release_upgrade(["git"], repo, context) is True
+        assert git_calls == []
+
+    assert not context.transaction_dir.exists()
+
+
+@pytest.mark.parametrize("candidate_tamper", ["transaction-id", "payload-escape", "marker", "prior"])
+def test_uncertain_terminal_marker_candidate_mismatch_fails_closed(
+    tmp_path, monkeypatch, candidate_tamper
+):
+    repo, _base_sha, _maintenance_sha, target_sha = _release_repo(tmp_path)
+    _git(repo, "switch", "main")
+    _write_user_state(repo, f"candidate-{candidate_tamper}")
+    result = update_cmd._prepare_and_promote_release(
+        ["git"], repo, "v2.0.0", target_sha,
+        candidate_validator=_test_candidate_validator,
+    )
+    assert result.context is not None
+    context = result.context
+    child = context.transaction_dir
+    fd_paths: dict[int, Path] = {}
+    real_open = update_cmd.os.open
+    real_fsync = update_cmd.os.fsync
+    armed = False
+    failed = False
+
+    def tracked_open(path, flags, *args):
+        fd = real_open(path, flags, *args)
+        fd_paths[fd] = Path(path)
+        return fd
+
+    def tracked_fsync(fd):
+        nonlocal failed
+        path = fd_paths.get(fd)
+        if armed and not failed and path == child:
+            failed = True
+            raise OSError("injected terminal marker fsync failure")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(update_cmd.os, "open", tracked_open)
+    monkeypatch.setattr(update_cmd.os, "fsync", tracked_fsync)
+    real_mark = update_cmd._mark_release_finalized
+
+    def arm_before_mark(mark_context):
+        nonlocal armed
+        armed = True
+        return real_mark(mark_context)
+
+    monkeypatch.setattr(update_cmd, "_mark_release_finalized", arm_before_mark)
+    assert update_cmd._finalize_release_upgrade(["git"], repo, context) is False
+    assert context.final_marker_write_uncertain is True
+
+    if candidate_tamper == "transaction-id":
+        context.final_marker_candidate["transaction_id"] = "attacker-controlled"
+    elif candidate_tamper == "payload-escape":
+        context.final_marker_candidate["payload_path"] = str(tmp_path / "outside-payload")
+    elif candidate_tamper == "marker":
+        context.final_marker_candidate["final_state_verified"] = False
+    else:
+        context.journal["target_sha"] = "0" * 40
+
+    with monkeypatch.context() as patcher:
+        git_calls: list[list[str]] = []
+
+        def forbidden_run(command, *args, **kwargs):
+            git_calls.append([str(part) for part in command])
+            raise AssertionError("candidate reconciliation invoked Git/subprocess")
+
+        def forbidden_ack(*args, **kwargs):
+            raise AssertionError("candidate reconciliation acknowledged mismatched evidence")
+
+        patcher.setattr(update_cmd.subprocess, "run", forbidden_run)
+        patcher.setattr(update_cmd, "_acknowledge_finalized_release", forbidden_ack)
+        assert update_cmd._finalize_release_upgrade(["git"], repo, context) is False
+        assert git_calls == []
+
+    assert context.final_marker_write_uncertain is True
+    assert context.journal_path.exists()
+    assert child.exists()
+
+
 def test_directory_fsync_closes_fd_on_success_and_required_failure(tmp_path, monkeypatch):
     if os.name != "posix":
         pytest.skip("POSIX directory fsync semantics")
