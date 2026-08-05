@@ -2311,7 +2311,33 @@ def _upgrade_release_with_local_patches(git_cmd, cwd, release_tag: str) -> subpr
 
 
 def _validate_critical_files_syntax(root) -> tuple[bool, str | None, str | None]:
-    """Compile every required production file in a candidate, fail closed."""
+    """Strictly compile every required production file in a candidate.
+
+    Release-candidate validation is fail-closed: every path in
+    ``_UPDATE_CRITICAL_FILES`` must exist, be a contained regular file, and
+    compile successfully.  Keep this strict entry point separate from the
+    compatibility guard used after an ordinary update.
+    """
+    return _validate_critical_files_syntax_impl(root, allow_missing=False)
+
+
+def _validate_post_pull_critical_files_syntax(
+    root,
+) -> tuple[bool, str | None, str | None]:
+    """Compile existing critical files after an ordinary post-pull update.
+
+    Older installations can legitimately predate one of the current critical
+    paths.  Missing files are therefore tolerated here, but every path that
+    does exist still receives the same regular-file, containment, and syntax
+    checks as strict candidate validation.
+    """
+    return _validate_critical_files_syntax_impl(root, allow_missing=True)
+
+
+def _validate_critical_files_syntax_impl(
+    root, *, allow_missing: bool
+) -> tuple[bool, str | None, str | None]:
+    """Shared syntax guard implementation with an explicit missing-file mode."""
     import py_compile
 
     root = Path(root)
@@ -2329,6 +2355,8 @@ def _validate_critical_files_syntax(root) -> tuple[bool, str | None, str | None]
             try:
                 info = path.lstat()
             except FileNotFoundError:
+                if allow_missing:
+                    continue
                 return False, str(path), "required critical file is missing"
             except OSError as exc:
                 return False, str(path), f"could not inspect required file: {exc}"
@@ -5816,9 +5844,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
     # lockfile churn) update with a clean tree.
     if not release_tag:
         _discard_lockfile_churn(git_cmd, _m().PROJECT_ROOT)
-    # Same rationale, different generator: line-ending churn is machine-made
-    # dirt on a managed checkout, so clear it (and stop generating it) before
-    # the stash/branch logic rather than autostashing the entire tree.
+    # Keep the compatibility seam, but never rewrite line endings before the
+    # stash boundary: a CRLF-only difference can be intentional user data.
+    # The ordinary stash captures it byte-for-byte before branch/update work.
     if not release_tag:
         _normalize_managed_eol(git_cmd, _m().PROJECT_ROOT)
 
@@ -6196,7 +6224,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 # against the already-promoted live checkout.
                 syntax_ok, failing_path, syntax_error = True, None, None
             else:
-                syntax_ok, failing_path, syntax_error = _validate_critical_files_syntax(
+                syntax_ok, failing_path, syntax_error = _validate_post_pull_critical_files_syntax(
                     _m().PROJECT_ROOT
                 )
             if not syntax_ok:
