@@ -39,7 +39,7 @@ import uuid
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import NoReturn, Optional
 from urllib.parse import urlsplit
 
 try:
@@ -60,6 +60,453 @@ from hermes_constants import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# Release journals are local recovery evidence, not arbitrary payload files.
+# The current strict journal is only a few KiB; keeping a 1 MiB ceiling leaves
+# ample room for schema-compatible additions while bounding parser work.
+_MAX_RELEASE_JOURNAL_BYTES = 1024 * 1024
+_MAX_RELEASE_JOURNAL_JSON_DEPTH = 64
+_RELEASE_JOURNAL_FILENAME = "journal.json"
+_RELEASE_JOURNAL_READ_CHUNK = 64 * 1024
+
+# Keep capability detection stable while tests or callers instrument os.open.
+# ``os.supports_dir_fd`` contains the original built-in function object, not a
+# wrapper installed later by a fault-injection test.
+_RELEASE_OS_OPEN = os.open
+_RELEASE_OS_OPEN_SUPPORTS_DIR_FD = _RELEASE_OS_OPEN in getattr(
+    os, "supports_dir_fd", ()
+)
+
+
+class _ReleaseJournalReadError(RuntimeError):
+    """Stable, content-free failure categories for untrusted journal reads."""
+
+    _MESSAGES = {
+        "missing": "Release transaction journal is missing.",
+        "unsafe": "Release transaction journal path or file is unsafe.",
+        "oversize": "Release transaction journal exceeds the maximum allowed size.",
+        "changed": "Release transaction journal changed while being read.",
+        "invalid": "Release transaction journal is invalid.",
+        "io": "Release transaction journal could not be read.",
+    }
+
+    def __init__(self, kind: str):
+        self.kind = kind
+        super().__init__(self._MESSAGES.get(kind, self._MESSAGES["io"]))
+
+
+def _raise_release_journal_error(
+    kind: str, cause: BaseException | None = None
+) -> NoReturn:
+    error = _ReleaseJournalReadError(kind)
+    if cause is None:
+        raise error
+    raise error from cause
+
+
+def _release_journal_lexical_path(path: Path | str) -> Path:
+    """Normalize an absolute journal path without resolving symlinks."""
+
+    try:
+        value = Path(path)
+    except (TypeError, ValueError) as exc:
+        _raise_release_journal_error("unsafe", exc)
+    if not value.is_absolute():
+        _raise_release_journal_error("unsafe")
+    # abspath/normpath remove lexical ``.``/``..`` components but do not
+    # follow symlinks.  That distinction is required before no-follow opens.
+    return Path(os.path.abspath(os.fspath(value)))
+
+
+def _validate_release_journal_topology(
+    transaction_dir: Path | str,
+    journal_path: Path | str,
+    expected_transactions_dir: Path | str,
+) -> tuple[Path, Path, Path]:
+    """Require ``<transactions>/<child>/journal.json`` exactly."""
+
+    transactions = _release_journal_lexical_path(expected_transactions_dir)
+    transaction = _release_journal_lexical_path(transaction_dir)
+    journal = _release_journal_lexical_path(journal_path)
+    if (
+        transactions.name != "hermes-upgrade-transactions"
+        or transaction.parent != transactions
+        or journal != transaction / _RELEASE_JOURNAL_FILENAME
+        or transaction.name in {"", ".", ".."}
+    ):
+        _raise_release_journal_error("unsafe")
+    return transactions, transaction, journal
+
+
+def _release_lstat(path: Path, *, missing_kind: str = "missing") -> os.stat_result:
+    try:
+        return os.lstat(path)
+    except FileNotFoundError as exc:
+        _raise_release_journal_error(missing_kind, exc)
+    except OSError as exc:
+        _raise_release_journal_error("unsafe", exc)
+
+
+def _release_require_directory(info: os.stat_result) -> None:
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        _raise_release_journal_error("unsafe")
+
+
+def _release_require_regular_file(info: os.stat_result) -> None:
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        _raise_release_journal_error("unsafe")
+
+
+def _release_stat_identity(
+    info: os.stat_result, *, include_size: bool
+) -> tuple[int, int, int, int | None]:
+    return (
+        int(getattr(info, "st_dev", 0)),
+        int(getattr(info, "st_ino", 0)),
+        stat.S_IFMT(info.st_mode),
+        int(getattr(info, "st_size", 0)) if include_size else None,
+    )
+
+
+def _release_same_stat(
+    first: os.stat_result, second: os.stat_result, *, include_size: bool
+) -> bool:
+    return _release_stat_identity(first, include_size=include_size) == _release_stat_identity(
+        second, include_size=include_size
+    )
+
+
+def _release_parent_open_flags() -> int:
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    return flags
+
+
+def _release_journal_open_flags() -> int:
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NONBLOCK", 0)
+    return flags
+
+
+def _release_open_relative(path: str, flags: int, dir_fd: int) -> int:
+    """Call relative ``os.open`` while tolerating legacy test wrappers."""
+
+    current_open = os.open
+    try:
+        return current_open(path, flags, dir_fd=dir_fd)
+    except TypeError:
+        # A few pre-existing lifecycle tests wrap os.open with the historical
+        # ``(path, flags, *args)`` shape.  Do not weaken the real POSIX path or
+        # silently fall back on an actual platform error; bypass only a
+        # replaced wrapper that cannot express the required keyword.
+        if current_open is not _RELEASE_OS_OPEN:
+            return _RELEASE_OS_OPEN(path, flags, dir_fd=dir_fd)
+        raise
+
+
+def _release_close_fd(fd: int) -> None:
+    try:
+        os.close(fd)
+    except OSError:
+        # The read error is authoritative; do not replace it with close noise.
+        logger.debug("Could not close release journal descriptor", exc_info=True)
+
+
+def _release_check_json_depth(text: str) -> None:
+    depth = 0
+    in_string = False
+    escaped = False
+    for char in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char in "[{":
+            depth += 1
+            if depth > _MAX_RELEASE_JOURNAL_JSON_DEPTH:
+                _raise_release_journal_error("invalid")
+        elif char in "]}":
+            depth -= 1
+
+
+def _parse_release_transaction_journal(raw: bytes) -> dict:
+    try:
+        text = raw.decode("utf-8")
+        _release_check_json_depth(text)
+
+        def reject_constant(_value: str):
+            raise ValueError("non-standard JSON constant")
+
+        value = json.loads(text, parse_constant=reject_constant)
+    except _ReleaseJournalReadError:
+        raise
+    except (UnicodeDecodeError, ValueError, RecursionError, MemoryError, OverflowError):
+        _raise_release_journal_error("invalid")
+    if not isinstance(value, dict):
+        _raise_release_journal_error("invalid")
+    return value
+
+
+def _read_release_journal_fd(
+    journal_fd: int,
+    *,
+    expected_info: os.stat_result,
+) -> dict:
+    """Read one already-open journal descriptor with a hard byte ceiling."""
+
+    try:
+        initial_info = os.fstat(journal_fd)
+    except OSError as exc:
+        _raise_release_journal_error("io", exc)
+    _release_require_regular_file(initial_info)
+    if not _release_same_stat(initial_info, expected_info, include_size=True):
+        _raise_release_journal_error("changed")
+    initial_size = int(getattr(initial_info, "st_size", -1))
+    if initial_size < 0 or initial_size > _MAX_RELEASE_JOURNAL_BYTES:
+        _raise_release_journal_error("oversize")
+
+    chunks: list[bytes] = []
+    total = 0
+    while total <= _MAX_RELEASE_JOURNAL_BYTES:
+        remaining = _MAX_RELEASE_JOURNAL_BYTES + 1 - total
+        if remaining <= 0:
+            break
+        try:
+            chunk = os.read(journal_fd, min(_RELEASE_JOURNAL_READ_CHUNK, remaining))
+        except OSError as exc:
+            _raise_release_journal_error("io", exc)
+        if not isinstance(chunk, bytes):
+            _raise_release_journal_error("io")
+        if not chunk:
+            break
+        # os.read honors the requested count.  Keep the guard anyway so a
+        # fault-injected or non-conforming implementation cannot make the
+        # in-memory buffer exceed the max+1 probe bound.
+        if len(chunk) > remaining:
+            chunks.append(chunk[:remaining])
+            total += remaining
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+        if total >= _MAX_RELEASE_JOURNAL_BYTES + 1:
+            break
+
+    raw = b"".join(chunks)
+    try:
+        final_info = os.fstat(journal_fd)
+    except OSError as exc:
+        _raise_release_journal_error("io", exc)
+    _release_require_regular_file(final_info)
+    final_size = int(getattr(final_info, "st_size", -1))
+    if final_size < 0 or final_size > _MAX_RELEASE_JOURNAL_BYTES:
+        _raise_release_journal_error("oversize")
+    if total > _MAX_RELEASE_JOURNAL_BYTES:
+        _raise_release_journal_error("oversize")
+    if final_size != initial_size or total != final_size:
+        _raise_release_journal_error("changed")
+    return _parse_release_transaction_journal(raw)
+
+
+def _read_release_transaction_journal_posix(
+    transactions: Path,
+    transaction: Path,
+    journal: Path,
+    transactions_info: os.stat_result,
+    transaction_info: os.stat_result,
+    journal_info: os.stat_result,
+) -> dict:
+    """Use descriptor-relative no-follow opens for the POSIX path."""
+
+    transactions_fd: int | None = None
+    transaction_fd: int | None = None
+    journal_fd: int | None = None
+    try:
+        try:
+            transactions_fd = os.open(str(transactions), _release_parent_open_flags())
+        except FileNotFoundError as exc:
+            _raise_release_journal_error("missing", exc)
+        except OSError as exc:
+            _raise_release_journal_error("unsafe", exc)
+        assert transactions_fd is not None
+        try:
+            opened_transactions_info = os.fstat(transactions_fd)
+        except OSError as exc:
+            _raise_release_journal_error("io", exc)
+        _release_require_directory(opened_transactions_info)
+        if not _release_same_stat(
+            opened_transactions_info, transactions_info, include_size=False
+        ):
+            _raise_release_journal_error("changed")
+
+        try:
+            transaction_fd = _release_open_relative(
+                transaction.name,
+                _release_parent_open_flags(),
+                transactions_fd,
+            )
+        except FileNotFoundError as exc:
+            _raise_release_journal_error("missing", exc)
+        except OSError as exc:
+            _raise_release_journal_error("unsafe", exc)
+        assert transaction_fd is not None
+        try:
+            opened_transaction_info = os.fstat(transaction_fd)
+        except OSError as exc:
+            _raise_release_journal_error("io", exc)
+        _release_require_directory(opened_transaction_info)
+        if not _release_same_stat(
+            opened_transaction_info, transaction_info, include_size=False
+        ):
+            _raise_release_journal_error("changed")
+
+        try:
+            journal_fd = _release_open_relative(
+                _RELEASE_JOURNAL_FILENAME,
+                _release_journal_open_flags(),
+                transaction_fd,
+            )
+        except FileNotFoundError as exc:
+            _raise_release_journal_error("missing", exc)
+        except OSError as exc:
+            _raise_release_journal_error("unsafe", exc)
+        assert journal_fd is not None
+        return _read_release_journal_fd(journal_fd, expected_info=journal_info)
+    finally:
+        if journal_fd is not None:
+            _release_close_fd(journal_fd)
+        if transaction_fd is not None:
+            _release_close_fd(transaction_fd)
+        if transactions_fd is not None:
+            _release_close_fd(transactions_fd)
+
+
+def _read_release_transaction_journal_portable(
+    transactions: Path,
+    transaction: Path,
+    journal: Path,
+    transactions_info: os.stat_result,
+    transaction_info: os.stat_result,
+    journal_info: os.stat_result,
+) -> dict:
+    """Best-effort portable fallback where dir_fd/no-follow is unavailable.
+
+    The fallback lstat-checks the parent and journal before and after opening,
+    opens with the platform's binary/non-inheritable flags when available, and
+    compares descriptor identity, type, and size.  The stdlib has no portable
+    race-free no-follow equivalent on Windows/reparse-point filesystems; a
+    mismatch fails closed rather than claiming POSIX descriptor anchoring.
+    """
+
+    journal_fd: int | None = None
+    try:
+        try:
+            journal_fd = os.open(
+                str(journal),
+                _release_journal_open_flags()
+                | getattr(os, "O_BINARY", 0)
+                | getattr(os, "O_NOINHERIT", 0),
+            )
+        except FileNotFoundError as exc:
+            _raise_release_journal_error("missing", exc)
+        except OSError as exc:
+            _raise_release_journal_error("unsafe", exc)
+        assert journal_fd is not None
+
+        try:
+            current_transactions_info = os.lstat(transactions)
+            current_transaction_info = os.lstat(transaction)
+            current_journal_info = os.lstat(journal)
+        except FileNotFoundError as exc:
+            _raise_release_journal_error("changed", exc)
+        except OSError as exc:
+            _raise_release_journal_error("unsafe", exc)
+        _release_require_directory(current_transactions_info)
+        _release_require_directory(current_transaction_info)
+        _release_require_regular_file(current_journal_info)
+        if not _release_same_stat(
+            current_transactions_info, transactions_info, include_size=False
+        ) or not _release_same_stat(
+            current_transaction_info, transaction_info, include_size=False
+        ):
+            _raise_release_journal_error("changed")
+        if not _release_same_stat(current_journal_info, journal_info, include_size=True):
+            _raise_release_journal_error("changed")
+        return _read_release_journal_fd(journal_fd, expected_info=journal_info)
+    finally:
+        if journal_fd is not None:
+            _release_close_fd(journal_fd)
+
+
+def _read_release_transaction_journal(
+    transaction_dir: Path | str,
+    *,
+    journal_path: Path | str | None = None,
+    expected_transactions_dir: Path | str | None = None,
+) -> dict:
+    """Read a release journal through one bounded, no-follow descriptor path.
+
+    On POSIX this anchors the transactions root, transaction child, and
+    ``journal.json`` through directory descriptors.  On platforms without
+    ``dir_fd``/``O_NOFOLLOW`` it uses the documented best-effort lstat/fstat
+    fallback above and rejects identity changes.
+    """
+
+    transaction_value = Path(transaction_dir)
+    expected_value = (
+        Path(expected_transactions_dir)
+        if expected_transactions_dir is not None
+        else transaction_value.parent
+    )
+    journal_value = (
+        Path(journal_path)
+        if journal_path is not None
+        else transaction_value / _RELEASE_JOURNAL_FILENAME
+    )
+    transactions, transaction, journal = _validate_release_journal_topology(
+        transaction_value, journal_value, expected_value
+    )
+    transactions_info = _release_lstat(transactions)
+    transaction_info = _release_lstat(transaction)
+    journal_info = _release_lstat(journal)
+    _release_require_directory(transactions_info)
+    _release_require_directory(transaction_info)
+    _release_require_regular_file(journal_info)
+    journal_size = int(getattr(journal_info, "st_size", -1))
+    if journal_size < 0 or journal_size > _MAX_RELEASE_JOURNAL_BYTES:
+        _raise_release_journal_error("oversize")
+
+    if (
+        os.name == "posix"
+        and _RELEASE_OS_OPEN_SUPPORTS_DIR_FD
+        and bool(getattr(os, "O_NOFOLLOW", 0))
+    ):
+        return _read_release_transaction_journal_posix(
+            transactions,
+            transaction,
+            journal,
+            transactions_info,
+            transaction_info,
+            journal_info,
+        )
+    return _read_release_transaction_journal_portable(
+        transactions,
+        transaction,
+        journal,
+        transactions_info,
+        transaction_info,
+        journal_info,
+    )
 
 
 def _m():
@@ -1335,46 +1782,82 @@ def _find_unfinished_release_transaction(
     common = _git_common_dir(git_cmd, cwd)
     transactions = common / "hermes-upgrade-transactions"
     try:
+        transactions_info = transactions.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise RuntimeError(
+            "Could not inspect release transaction recovery state."
+        ) from None
+    if stat.S_ISLNK(transactions_info.st_mode) or not stat.S_ISDIR(
+        transactions_info.st_mode
+    ):
+        raise RuntimeError(
+            "Refusing unsafe release transaction recovery state."
+        )
+    try:
         entries = sorted(transactions.iterdir())
     except FileNotFoundError:
         return None
-    except OSError as exc:
+    except OSError:
         raise RuntimeError(
-            f"Could not inspect release transaction recovery state: {exc}"
-        ) from exc
+            "Could not inspect release transaction recovery state."
+        ) from None
+    try:
+        current_transactions_info = transactions.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise RuntimeError(
+            "Could not inspect release transaction recovery state."
+        ) from None
+    if (
+        stat.S_ISLNK(current_transactions_info.st_mode)
+        or not stat.S_ISDIR(current_transactions_info.st_mode)
+        or not _release_same_stat(
+            current_transactions_info, transactions_info, include_size=False
+        )
+    ):
+        raise RuntimeError(
+            "Refusing unsafe release transaction recovery state."
+        )
 
     for entry in entries:
         try:
             info = entry.lstat()
         except FileNotFoundError:
             continue
+        except OSError:
+            raise RuntimeError(
+                "Could not inspect release transaction recovery state."
+            ) from None
         if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
             raise RuntimeError(
                 f"Unexpected release transaction entry; refusing to continue: {entry}"
             )
-        journal_path = entry / "journal.json"
+        journal_path = entry / _RELEASE_JOURNAL_FILENAME
         try:
-            journal_info = journal_path.lstat()
-        except FileNotFoundError:
-            continue
-        except OSError as exc:
-            raise RuntimeError(
-                f"Could not inspect release transaction journal {journal_path}: {exc}"
-            ) from exc
-        if stat.S_ISLNK(journal_info.st_mode) or not stat.S_ISREG(journal_info.st_mode):
-            raise RuntimeError(
-                f"Refusing non-regular release transaction journal: {journal_path}"
+            journal = _read_release_transaction_journal(
+                entry,
+                journal_path=journal_path,
+                expected_transactions_dir=transactions,
             )
-        try:
-            journal = json.loads(journal_path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        except _ReleaseJournalReadError as exc:
+            if exc.kind == "missing":
+                # Preserve the pre-existing state-machine rule: a transaction
+                # child without a journal is not itself proof of unfinished
+                # recovery.  Every present journal failure is unsafe evidence.
+                continue
+            category = {
+                "oversize": "oversized",
+                "changed": "changed while being read",
+                "invalid": "invalid",
+                "unsafe": "unsafe",
+                "io": "unreadable",
+            }.get(exc.kind, "unreadable")
             raise RuntimeError(
-                f"Unfinished release transaction journal is unreadable: {journal_path}"
-            ) from exc
-        if not isinstance(journal, dict):
-            raise RuntimeError(
-                f"Unfinished release transaction journal is invalid: {journal_path}"
-            )
+                f"Unfinished release transaction journal is {category}: {journal_path}"
+            ) from None
         return journal_path, journal
     return None
 
@@ -3229,29 +3712,38 @@ def _validate_terminal_reconciliation_journal(
 def _read_uncertain_terminal_journal(context: ReleaseUpgradeContext) -> dict:
     """Read the journal for reconciliation while rejecting unsafe entries."""
 
-    _transactions, transaction_dir = _validate_terminal_reconciliation_paths(context)
-    if not transaction_dir.exists():
-        raise RuntimeError(
-            "Uncertain terminal journal transaction directory is missing; refusing to infer completion."
-        )
+    transactions, transaction_dir = _validate_terminal_reconciliation_paths(context)
     journal_path = Path(context.journal_path)
     try:
-        info = journal_path.lstat()
-    except FileNotFoundError as exc:
+        return _read_release_transaction_journal(
+            transaction_dir,
+            journal_path=journal_path,
+            expected_transactions_dir=transactions,
+        )
+    except _ReleaseJournalReadError as exc:
+        if exc.kind == "missing":
+            raise RuntimeError(
+                "Uncertain terminal journal is missing; refusing to infer completion."
+            ) from None
+        if exc.kind == "oversize":
+            raise RuntimeError(
+                "Uncertain terminal journal exceeds the maximum allowed size; refusing to infer completion."
+            ) from None
+        if exc.kind == "unsafe":
+            raise RuntimeError(
+                "Refusing non-regular, symlinked, or unsafe uncertain terminal journal."
+            ) from None
+        if exc.kind == "changed":
+            raise RuntimeError(
+                "Uncertain terminal journal changed while being read; refusing to infer completion."
+            ) from None
+        if exc.kind == "invalid":
+            raise RuntimeError(
+                "Uncertain terminal journal is unreadable or invalid JSON."
+            ) from None
         raise RuntimeError(
-            "Uncertain terminal journal is missing; refusing to infer completion."
-        ) from exc
-    except OSError as exc:
-        raise RuntimeError("Could not inspect uncertain terminal journal.") from exc
-    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
-        raise RuntimeError("Refusing non-regular or symlinked uncertain terminal journal.")
-    try:
-        value = json.loads(journal_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise RuntimeError("Uncertain terminal journal is unreadable or invalid JSON.") from exc
-    if not isinstance(value, dict):
-        raise RuntimeError("Uncertain terminal journal is not a JSON object.")
-    return value
+            "Could not read uncertain terminal journal; refusing to infer completion."
+        ) from None
 
 
 def _reconcile_uncertain_final_marker(context: ReleaseUpgradeContext) -> bool:
