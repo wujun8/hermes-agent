@@ -16,6 +16,7 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Callable, NamedTuple, Optional
 
 from agent.secret_scope import (
@@ -155,6 +156,27 @@ _cfg_cache: dict | None = None
 _cfg_mtime: float | None = None
 _cfg_path = None
 _session_resume_lock = threading.Lock()
+
+
+class _MicroControlTarget(NamedTuple):
+    """Frozen identity/routing snapshot for one live ``/micro`` invocation."""
+
+    sid: str
+    session: dict
+    session_key: str
+    agent: Any
+    agent_session_id: str
+    profile_home: str | None
+    generation: int
+    token: object
+
+
+_SESSION_CONTROL_BUSY = object()
+_MICRO_TURN_BUSY = object()
+_MICRO_TURN_BUSY_MESSAGE = (
+    "session busy — /micro can't run mid-turn; interrupt the current turn first"
+)
+_MICRO_CONTROL_BUSY_MESSAGE = "session busy — /micro control command already in progress"
 try:
     _slash_timeout = float(os.environ.get("HERMES_TUI_SLASH_TIMEOUT_S") or "45")
 except (ValueError, TypeError):
@@ -872,7 +894,7 @@ def _attach_worker(sid: str, session: dict, worker) -> None:
     worker.close()
 
 
-def _pop_session_by_id(sid: str) -> dict | None:
+def _pop_session_by_id(sid: str, *, respect_control: bool = True):
     """Atomically detach one live session from the registry.
 
     Detaching is the ownership claim for teardown: once the record is no
@@ -883,6 +905,19 @@ def _pop_session_by_id(sid: str) -> dict | None:
     the global ``_session_resume_lock``.
     """
     with _sessions_lock:
+        session = _sessions.get(sid)
+        if session is None:
+            return None
+        if respect_control:
+            history_lock = session.get("history_lock")
+            if history_lock is not None:
+                with history_lock:
+                    if session.get("_session_control_inflight") is not None:
+                        return _SESSION_CONTROL_BUSY
+                    # Reserve the exact object before detaching it.  A concurrent
+                    # micro claim can therefore not pass its history-lock check
+                    # between the busy check and the registry pop.
+                    session["_session_control_inflight"] = object()
         session = _sessions.pop(sid, None)
     if session is None:
         return None
@@ -897,7 +932,7 @@ def _teardown_popped_session(
     session: dict | None, *, end_reason: str = "tui_close"
 ) -> bool:
     """Finish a close after the caller has atomically detached the session."""
-    if session is None:
+    if session is None or session is _SESSION_CONTROL_BUSY:
         return False
     _teardown_session(session, end_reason=end_reason)
     return True
@@ -922,13 +957,15 @@ def _close_session_by_id(
     delegated work before teardown.
     """
     if predicate is None:
-        session = _pop_session_by_id(sid)
+        session = _pop_session_by_id(sid, respect_control=True)
     else:
         with _sessions_lock:
             current = _sessions.get(sid)
             if current is None or not predicate(current):
                 return False
-            session = _pop_session_by_id(sid)
+            session = _pop_session_by_id(sid, respect_control=True)
+    if session is _SESSION_CONTROL_BUSY:
+        return False
     return _teardown_popped_session(session, end_reason=end_reason)
 
 
@@ -1052,6 +1089,9 @@ def _schedule_ws_orphan_reap(sid: str) -> None:
                 reschedule = True
             else:
                 session = _pop_session_by_id(sid)
+                if session is _SESSION_CONTROL_BUSY:
+                    reschedule = True
+                    session = None
         if reschedule:
             _schedule_ws_orphan_reap(sid)
             return
@@ -2785,8 +2825,8 @@ def _persist_branch_seed(session: dict) -> None:
 
 
 @contextlib.contextmanager
-def _session_db(session: dict):
-    """Yield the SessionDB that owns this session's row (profile-aware).
+def _session_db_for_profile(profile_home: str | None):
+    """Yield the SessionDB selected by an immutable profile-home snapshot.
 
     Mirrors :func:`_ensure_session_db_row`: a remote/profile session persists
     into its own profile's ``state.db`` (a fresh handle we close on exit);
@@ -2794,7 +2834,6 @@ def _session_db(session: dict):
     None when the db is unavailable.
     """
     db, close_db = None, False
-    profile_home = session.get("profile_home")
     if profile_home:
         from hermes_state import SessionDB
 
@@ -2812,18 +2851,18 @@ def _session_db(session: dict):
                 db.close()
 
 
-def _session_micro_config_loader(session: dict):
-    """Return the readonly micro policy config loader for this session.
+@contextlib.contextmanager
+def _session_db(session: dict):
+    """Yield the SessionDB that owns this session's row (profile-aware)."""
+    with _session_db_for_profile(session.get("profile_home")) as db:
+        yield db
 
-    A TUI gateway can host sessions from more than one profile.  The shared
-    micro command service intentionally accepts a loader so its global value
-    cannot accidentally come from the gateway launch profile.  Bind the
-    session's stored profile home only for the read; the ContextVar is restored
-    before the RPC thread handles another session.
-    """
+
+def _session_micro_config_loader_for_profile(profile_home: str | None):
+    """Return a readonly micro config loader bound to one profile path."""
     from hermes_cli.config import load_config_readonly
 
-    profile_home = str(session.get("profile_home") or "").strip()
+    profile_home = str(profile_home or "").strip()
     if not profile_home:
         return load_config_readonly
 
@@ -2835,6 +2874,133 @@ def _session_micro_config_loader(session: dict):
             reset_hermes_home_override(token)
 
     return load_profile_config
+
+
+def _session_micro_config_loader(session: dict):
+    """Return the readonly micro policy config loader for this session.
+
+    A TUI gateway can host sessions from more than one profile.  The shared
+    micro command service intentionally accepts a loader so its global value
+    cannot accidentally come from the gateway launch profile.  Bind the
+    session's stored profile home only for the read; the ContextVar is restored
+    before the RPC thread handles another session.
+    """
+    return _session_micro_config_loader_for_profile(session.get("profile_home"))
+
+
+def _claim_live_micro_control(sid: str, session: dict | None):
+    """Atomically claim an idle live session for one direct ``/micro`` call.
+
+    The claim is the only part that runs under ``history_lock``.  It snapshots
+    every mutable routing identity needed by the command and leaves all config,
+    SessionDB, ensure, and runtime-setter work to the caller after the lock is
+    released.  The second return value is ``_SESSION_CONTROL_BUSY`` for a
+    concurrent control, a string for a non-mutating identity error, or ``None``
+    when the session is cold and must use the unchanged slash worker fallback.
+    """
+    if session is None:
+        return None, None
+    history_lock = session.get("history_lock")
+    if history_lock is None:
+        return None, None
+
+    with history_lock:
+        active = bool(session.get("running"))
+        session_key = str(session.get("session_key") or "")
+        if not active:
+            active = _child_run_active(session_key)
+        if active:
+            return None, _MICRO_TURN_BUSY
+        if session.get("_session_control_inflight") is not None:
+            return None, _SESSION_CONTROL_BUSY
+
+        agent = session.get("agent")
+        if agent is None:
+            return None, None
+        agent_key = str(getattr(agent, "session_id", "") or "")
+        if not session_key.strip() or not agent_key.strip():
+            return (
+                None,
+                "Micro-compaction error: live session identity is incomplete; refusing to mutate",
+            )
+        if session_key != agent_key:
+            return (
+                None,
+                "Micro-compaction error: live session identity mismatch; refusing to mutate",
+            )
+
+        token = object()
+        target = _MicroControlTarget(
+            sid=str(sid or ""),
+            session=session,
+            session_key=session_key,
+            agent=agent,
+            agent_session_id=agent_key,
+            profile_home=(
+                str(session.get("profile_home"))
+                if session.get("profile_home") is not None
+                else None
+            ),
+            generation=int(session.get("session_generation", 0) or 0),
+            token=token,
+        )
+        session["_session_control_inflight"] = token
+        return target, None
+
+
+def _release_live_micro_control(target: _MicroControlTarget) -> bool:
+    """Clear a live micro claim and report whether its target stayed exact.
+
+    This cleanup is deliberately defensive: it must not replace an exception
+    from config/DB/plugin/runtime work, including ``BaseException`` subclasses.
+    """
+    session = target.session
+    try:
+        with session["history_lock"]:
+            current = _sessions.get(target.sid)
+            unchanged = (
+                current is session
+                and session.get("session_key") == target.session_key
+                and session.get("agent") is target.agent
+                and str(getattr(target.agent, "session_id", "") or "")
+                == target.agent_session_id
+                and (
+                    str(session.get("profile_home"))
+                    if session.get("profile_home") is not None
+                    else None
+                )
+                == target.profile_home
+                and int(session.get("session_generation", 0) or 0) == target.generation
+            )
+            if session.get("_session_control_inflight") is target.token:
+                session.pop("_session_control_inflight", None)
+            return unchanged
+    except BaseException:
+        # There is no user/plugin code in this block.  A cleanup failure must
+        # never mask the command's original exception; the next caller will
+        # still see the conservative busy state if the field could not clear.
+        return False
+
+
+def _try_claim_session_control(session: dict):
+    """Reserve one session-wide control transition without holding I/O locks."""
+    with session["history_lock"]:
+        if session.get("_session_control_inflight") is not None:
+            return None
+        token = object()
+        session["_session_control_inflight"] = token
+        return token
+
+
+def _release_session_control(session: dict, token) -> None:
+    """Release a non-micro transition reservation, best effort."""
+    try:
+        with session["history_lock"]:
+            if session.get("_session_control_inflight") is token:
+                session.pop("_session_control_inflight", None)
+    except BaseException:
+        # Transition cleanup must not replace the operation's original failure.
+        pass
 
 
 def _persist_session_git_meta(session: dict, cwd: str) -> None:
@@ -4780,6 +4946,7 @@ def _sync_session_key_after_compress(
     *,
     clear_pending_title: bool = True,
     restart_slash_worker: bool = True,
+    control_token=None,
 ) -> None:
     """Re-anchor session_key when AIAgent._compress_context rotates session_id.
 
@@ -4799,6 +4966,14 @@ def _sync_session_key_after_compress(
             if the caller manages the worker lifecycle separately.
     """
     agent = session.get("agent")
+    with session["history_lock"]:
+        active_control = session.get("_session_control_inflight")
+        if active_control is not None and active_control is not control_token:
+            logger.warning(
+                "Compression rotation skipped while session control is active: sid=%s",
+                sid,
+            )
+            return
     new_session_id = getattr(agent, "session_id", None) or ""
     old_key = session.get("session_key", "") or ""
     if not new_session_id or new_session_id == old_key:
@@ -4830,7 +5005,18 @@ def _sync_session_key_after_compress(
             unregister_gateway_notify(old_key)
         except Exception:
             pass
-        session["session_key"] = new_session_id
+        with session["history_lock"]:
+            active_control = session.get("_session_control_inflight")
+            if active_control is not None and active_control is not control_token:
+                logger.warning(
+                    "Compression rotation skipped while session control is active: sid=%s",
+                    sid,
+                )
+                return
+            session["session_key"] = new_session_id
+            session["session_generation"] = int(
+                session.get("session_generation", 0) or 0
+            ) + 1
         try:
             yolo_was_on = is_session_yolo_enabled(old_key)
         except Exception:
@@ -4852,7 +5038,18 @@ def _sync_session_key_after_compress(
         # Even if the approval module fails to import, still anchor the
         # session_key on the new continuation id so downstream lookups
         # don't keep targeting the ended row.
-        session["session_key"] = new_session_id
+        with session["history_lock"]:
+            active_control = session.get("_session_control_inflight")
+            if active_control is not None and active_control is not control_token:
+                logger.warning(
+                    "Compression rotation skipped while session control is active: sid=%s",
+                    sid,
+                )
+                return
+            session["session_key"] = new_session_id
+            session["session_generation"] = int(
+                session.get("session_generation", 0) or 0
+            ) + 1
 
     if clear_pending_title:
         session["pending_title"] = None
@@ -6533,6 +6730,7 @@ def _init_session(
             "history": history,
             "history_lock": threading.Lock(),
             "history_version": 0,
+            "session_generation": 0,
             "inflight_turn": None,
             "created_at": now,
             "last_active": now,
@@ -7740,6 +7938,7 @@ def _deferred_session_record(
         "history": history,
         "history_lock": threading.Lock(),
         "history_version": 0,
+        "session_generation": 0,
         "image_counter": 0,
         "inflight_turn": None,
         "last_active": now,
@@ -7762,13 +7961,19 @@ def _deferred_session_record(
 
 def _claim_or_reuse_live(
     sid: str, session_key: str, record: dict, lease
-) -> tuple[str, dict] | None:
+) -> tuple[str, dict] | object | None:
     """Register ``record`` as the live session for ``session_key`` under the
     resume lock, or — if a concurrent resume already won — release ``lease`` and
-    return the winner for the caller to reuse."""
+    return the winner for the caller to reuse. A live control lease returns the
+    stable busy sentinel instead of mutating/attaching that session.
+    """
     with _session_resume_lock:
         live = _find_live_session_by_key(session_key)
         if live is not None:
+            live_session = live[1]
+            with live_session["history_lock"]:
+                if live_session.get("_session_control_inflight") is not None:
+                    return _SESSION_CONTROL_BUSY
             if lease is not None:
                 lease.release()
             return live
@@ -7975,8 +8180,11 @@ def _live_session_payload(
     touch: bool = False,
     transport: Transport | None = None,
     omit_messages: bool = False,
-) -> dict:
+    reject_session_control: bool = False,
+) -> dict | None:
     with session["history_lock"]:
+        if reject_session_control and session.get("_session_control_inflight") is not None:
+            return None
         if cols is not None:
             session["cols"] = cols
         if transport is not None:
@@ -12462,7 +12670,14 @@ def _format_live_model_output(session: dict) -> str:
     return "Current model: (unknown)"
 
 
-def _live_slash_command_output(sid: str, session: Optional[dict], name: str, arg: str) -> Optional[str]:
+def _live_slash_command_output(
+    sid: str,
+    session: Optional[dict],
+    name: str,
+    arg: str,
+    *,
+    micro_target: _MicroControlTarget | None = None,
+) -> Optional[str]:
     name = (name or "").lstrip("/").lower()
     arg = arg or ""
     if name == "micro":
@@ -12470,11 +12685,20 @@ def _live_slash_command_output(sid: str, session: Optional[dict], name: str, arg
         # normal profile-aware slash worker, whose classic CLI path persists
         # the row for the later agent hydration.  Only an already-built main
         # agent is eligible for direct live application.
-        if session is None or session.get("agent") is None:
+        if micro_target is None and (session is None or session.get("agent") is None):
             return None
-        agent = session["agent"]
-        session_key = str(session.get("session_key") or "")
-        agent_key = str(getattr(agent, "session_id", "") or "")
+        if micro_target is not None:
+            # The lease holder owns this exact object/agent/key snapshot.  Do
+            # not re-read mutable session fields after releasing history_lock.
+            agent = micro_target.agent
+            session_key = micro_target.session_key
+            agent_key = micro_target.agent_session_id
+            profile_home = micro_target.profile_home
+        else:
+            agent = session["agent"]
+            session_key = str(session.get("session_key") or "")
+            agent_key = str(getattr(agent, "session_id", "") or "")
+            profile_home = session.get("profile_home")
         if not session_key.strip() or not agent_key.strip():
             return (
                 "Micro-compaction error: live session identity is incomplete; "
@@ -12487,14 +12711,20 @@ def _live_slash_command_output(sid: str, session: Optional[dict], name: str, arg
             )
         from hermes_cli.micro_command import execute_micro_command
 
-        with _session_db(session) as db:
+        target_session_view = (
+            MappingProxyType({"profile_home": profile_home})
+            if micro_target is not None
+            else session
+        )
+        db_context = _session_db(target_session_view)
+        with db_context as db:
             return execute_micro_command(
                 agent=agent,
                 session_db=db,
-                session_id=str(session.get("session_key") or ""),
+                session_id=session_key,
                 raw_args=arg,
                 ensure_session=getattr(agent, "_ensure_db_session", None),
-                config_loader=_session_micro_config_loader(session),
+                config_loader=_session_micro_config_loader(target_session_view),
             )
     if name == "model" and not arg.strip():
         return _format_live_model_output(session or {})

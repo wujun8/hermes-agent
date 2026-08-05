@@ -89,6 +89,7 @@ def _(rid, params: dict) -> dict:
             "history": history,
             "history_lock": threading.Lock(),
             "history_version": 0,
+            "session_generation": 0,
             "image_counter": 0,
             "cwd": resolved_cwd,
             "inflight_turn": None,
@@ -377,7 +378,7 @@ def _(rid, params: dict) -> dict:
         profile_home
     )
 
-    def _reuse_live_payload(sid: str, session: dict) -> dict:
+    def _reuse_live_payload(sid: str, session: dict) -> dict | None:
         payload = _live_session_payload(
             sid,
             session,
@@ -385,7 +386,10 @@ def _(rid, params: dict) -> dict:
             touch=True,
             transport=current_transport() or _stdio_transport,
             omit_messages=omit_messages,
+            reject_session_control=True,
         )
+        if payload is None:
+            return None
         payload["resumed"] = target
         # A lazy watch session never owns a run loop, so its payload's running
         # flag is always False — overlay the child-run registry so a reconnecting
@@ -395,11 +399,17 @@ def _(rid, params: dict) -> dict:
             payload["status"] = "streaming"
         return payload
 
-    # Fast path: if the session is already live, reuse it under the lock.
+    # Fast path: if the session is already live, snapshot the registry winner
+    # under the resume lock, then build its payload after releasing that global
+    # lock.  The payload reads SessionDB outside the short coordination window;
+    # its history-lock lease check still rejects a concurrent control command.
     with _session_resume_lock:
         live = _find_live_session_by_key(target)
-        if live is not None:
-            return _ok(rid, _reuse_live_payload(*live))
+    if live is not None:
+        payload = _reuse_live_payload(*live)
+        if payload is None:
+            return _err(rid, 4009, _MICRO_CONTROL_BUSY_MESSAGE)
+        return _ok(rid, payload)
 
     # Lazy/watch resume: register the live session WITHOUT building an agent.
     # Used by the desktop's subagent windows — the child runs inside the
@@ -437,8 +447,14 @@ def _(rid, params: dict) -> dict:
             profile_home=profile_home,
             lazy=True,
         )
-        if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
-            return _ok(rid, _reuse_live_payload(*live))
+        live = _claim_or_reuse_live(sid, target, record, lease)
+        if live is _SESSION_CONTROL_BUSY:
+            return _err(rid, 4009, _MICRO_CONTROL_BUSY_MESSAGE)
+        if live is not None:
+            payload = _reuse_live_payload(*live)
+            if payload is None:
+                return _err(rid, 4009, _MICRO_CONTROL_BUSY_MESSAGE)
+            return _ok(rid, payload)
         # A delegated child mid-run emits no session events of its own — report
         # its liveness from the relay registry so the window shows a busy turn.
         child_running = _child_run_active(target)
@@ -535,8 +551,14 @@ def _(rid, params: dict) -> dict:
             model_override=overrides.get("model_override"),
             resume_runtime_overrides=overrides or None,
         )
-        if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
-            return _ok(rid, _reuse_live_payload(*live))
+        live = _claim_or_reuse_live(sid, target, record, lease)
+        if live is _SESSION_CONTROL_BUSY:
+            return _err(rid, 4009, _MICRO_CONTROL_BUSY_MESSAGE)
+        if live is not None:
+            payload = _reuse_live_payload(*live)
+            if payload is None:
+                return _err(rid, 4009, _MICRO_CONTROL_BUSY_MESSAGE)
+            return _ok(rid, payload)
 
         _schedule_agent_build(sid)
         _schedule_session_cap_enforcement()  # trim detached idle sessions over the cap
@@ -638,25 +660,33 @@ def _(rid, params: dict) -> dict:
     # discard our just-built agent and reuse theirs (no worker/poller wired yet).
     with _session_resume_lock:
         live = _find_live_session_by_key(target)
-        if live is not None:
-            try:
-                if hasattr(agent, "close"):
-                    agent.close()
-            except Exception:
-                pass
-            if lease is not None:
-                lease.release()
-            other_sid, other_session = live
-            payload = _live_session_payload(
-                other_sid,
-                other_session,
-                cols=cols,
-                touch=True,
-                transport=current_transport() or _stdio_transport,
-                omit_messages=omit_messages,
-            )
-            payload["resumed"] = target
-            return _ok(rid, payload)
+    if live is not None:
+        # Closing the losing agent and building the winner's payload can touch
+        # plugins/SessionDB, so both happen after the coordination lock is out
+        # of scope.  The payload's lease check still gives a stable busy result.
+        try:
+            if hasattr(agent, "close"):
+                agent.close()
+        except Exception:
+            pass
+        if lease is not None:
+            lease.release()
+        other_sid, other_session = live
+        payload = _live_session_payload(
+            other_sid,
+            other_session,
+            cols=cols,
+            touch=True,
+            transport=current_transport() or _stdio_transport,
+            omit_messages=omit_messages,
+            reject_session_control=True,
+        )
+        if payload is None:
+            return _err(rid, 4009, _MICRO_CONTROL_BUSY_MESSAGE)
+        payload["resumed"] = target
+        return _ok(rid, payload)
+
+    with _session_resume_lock:
         try:
             init_home_token = (
                 set_hermes_home_override(str(profile_home))
@@ -2591,6 +2621,8 @@ def _(rid, params: dict) -> dict:
     # keep every unrelated session.resume waiting behind it.
     with _session_resume_lock:
         session = _pop_session_by_id(sid)
+    if session is _SESSION_CONTROL_BUSY:
+        return _err(rid, 4009, _MICRO_CONTROL_BUSY_MESSAGE)
     closed = _teardown_popped_session(session, end_reason="tui_close")
     return _ok(rid, {"closed": closed})
 

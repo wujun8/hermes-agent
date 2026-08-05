@@ -111,6 +111,12 @@ def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
     if err:
         return err
+    # A live control command owns this session until its config/DB/runtime work
+    # has finished.  Check before the active-session slot and again in the
+    # history claim below so a released lock cannot turn into a prompt race.
+    with session["history_lock"]:
+        if session.get("_session_control_inflight") is not None:
+            return _err(rid, 4009, _MICRO_CONTROL_BUSY_MESSAGE)
     if (limit_message := _ensure_active_session_slot(sid, session)) is not None:
         return _err(rid, 4090, limit_message)
     if truncate_user_ordinal is not None and isinstance(text, str):
@@ -131,6 +137,8 @@ def _(rid, params: dict) -> dict:
     while True:
         busy_transport = None
         with session["history_lock"]:
+            if session.get("_session_control_inflight") is not None:
+                return _err(rid, 4009, _MICRO_CONTROL_BUSY_MESSAGE)
             if session.get("running"):
                 # Don't reject a mid-turn prompt — queue it (and, by default,
                 # interrupt the live turn) so it runs as the next turn. The
@@ -150,6 +158,8 @@ def _(rid, params: dict) -> dict:
         # queue whose drain already ran.
 
     with session["history_lock"]:
+        if session.get("_session_control_inflight") is not None:
+            return _err(rid, 4009, _MICRO_CONTROL_BUSY_MESSAGE)
         # A watch session's run lives in the PARENT turn, so its own running
         # flag is False — without this, typing mid-run builds a second agent
         # racing the in-flight child on the same stored session (interleaved

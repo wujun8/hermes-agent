@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import importlib
 import threading
 from pathlib import Path
@@ -66,6 +67,10 @@ class RecordingWorker:
 
     def close(self) -> None:
         self.closed = True
+
+
+class _MicroControlAbort(BaseException):
+    """Non-Exception failure used to prove lease cleanup covers BaseException."""
 
 
 @pytest.fixture()
@@ -382,3 +387,599 @@ def test_live_micro_rejects_mismatched_session_identity_without_mutation(gateway
     assert agent.context_compressor.enabled is engine_enabled_before
     assert agent.context_compressor.calls == []
     assert session["slash_worker"] is None
+
+
+def _assert_history_lock_available(lock: threading.Lock) -> None:
+    acquired = threading.Event()
+
+    def acquire_and_release() -> None:
+        with lock:
+            acquired.set()
+
+    thread = threading.Thread(target=acquire_and_release)
+    thread.start()
+    assert acquired.wait(2), "history_lock was held during blocking live work"
+    thread.join(timeout=2)
+    assert not thread.is_alive()
+
+
+def test_live_micro_config_and_db_work_run_without_history_lock(gateway, monkeypatch):
+    server, db, _home = gateway
+    agent = LiveAgent(db, "outside-lock")
+    session = _session(server, db, "sid-outside-lock", "outside-lock", agent)
+    config_entered = threading.Event()
+    config_release = threading.Event()
+    setter_entered = threading.Event()
+    setter_release = threading.Event()
+    apply_entered = threading.Event()
+    apply_release = threading.Event()
+    original_setter = db.set_session_micro_compact_override
+    from agent import agent_init
+
+    original_apply = agent_init.apply_micro_compact_policy
+
+    def blocked_config():
+        config_entered.set()
+        assert config_release.wait(2)
+        return {"compression": {"micro_compact": False}}
+
+    def blocked_setter(session_id, override):
+        setter_entered.set()
+        assert setter_release.wait(2)
+        return original_setter(session_id, override)
+
+    def blocked_apply(*args, **kwargs):
+        apply_entered.set()
+        assert apply_release.wait(2)
+        return original_apply(*args, **kwargs)
+
+    monkeypatch.setattr(server, "_session_micro_config_loader", lambda _session: blocked_config)
+    monkeypatch.setattr(db, "set_session_micro_compact_override", blocked_setter)
+    monkeypatch.setattr(agent_init, "apply_micro_compact_policy", blocked_apply)
+    result = {}
+
+    def run_micro() -> None:
+        result["response"] = _call(
+            server, "slash.exec", session_id="sid-outside-lock", command="micro on"
+        )
+
+    thread = threading.Thread(target=run_micro)
+    thread.start()
+    try:
+        assert config_entered.wait(2)
+        _assert_history_lock_available(session["history_lock"])
+        config_release.set()
+        assert setter_entered.wait(2)
+        _assert_history_lock_available(session["history_lock"])
+        setter_release.set()
+        assert apply_entered.wait(2)
+        _assert_history_lock_available(session["history_lock"])
+    finally:
+        config_release.set()
+        setter_release.set()
+        apply_release.set()
+        thread.join(timeout=2)
+    assert not thread.is_alive()
+    assert "result" in result["response"]
+
+
+def test_live_micro_lease_blocks_prompt_and_second_micro_until_release(gateway, monkeypatch):
+    server, db, _home = gateway
+    agent = LiveAgent(db, "lease-busy")
+    session = _session(server, db, "sid-lease-busy", "lease-busy", agent)
+    setter_entered = threading.Event()
+    setter_release = threading.Event()
+    original_setter = db.set_session_micro_compact_override
+
+    def blocked_setter(session_id, override):
+        setter_entered.set()
+        assert setter_release.wait(2)
+        return original_setter(session_id, override)
+
+    monkeypatch.setattr(db, "set_session_micro_compact_override", blocked_setter)
+    monkeypatch.setattr(server, "_ensure_active_session_slot", lambda *_args: None)
+    first = {}
+    second = {}
+    prompt = {}
+    second_done = threading.Event()
+    prompt_done = threading.Event()
+
+    def run_first() -> None:
+        first["response"] = _call(
+            server, "slash.exec", session_id="sid-lease-busy", command="micro on"
+        )
+
+    def run_second() -> None:
+        second["response"] = _call(
+            server, "slash.exec", session_id="sid-lease-busy", command="micro off"
+        )
+        second_done.set()
+
+    def run_prompt() -> None:
+        prompt["response"] = _call(
+            server, "prompt.submit", session_id="sid-lease-busy", text="must wait"
+        )
+        prompt_done.set()
+
+    first_thread = threading.Thread(target=run_first)
+    second_thread = threading.Thread(target=run_second)
+    prompt_thread = threading.Thread(target=run_prompt)
+    first_thread.start()
+    try:
+        assert setter_entered.wait(2)
+        second_thread.start()
+        prompt_thread.start()
+        assert second_done.wait(2), "second /micro did not get a stable busy response"
+        assert prompt_done.wait(2), "prompt.submit did not get a stable busy response"
+    finally:
+        setter_release.set()
+        first_thread.join(timeout=2)
+        second_thread.join(timeout=2)
+        prompt_thread.join(timeout=2)
+    assert not first_thread.is_alive()
+    assert not second_thread.is_alive()
+    assert not prompt_thread.is_alive()
+    assert second["response"]["error"]["code"] == 4009
+    assert prompt["response"]["error"]["code"] == 4009
+    assert session["running"] is False
+    assert session["history"] == []
+    assert agent.run_conversation_calls == 0
+
+
+def _assert_micro_lease_cleared(
+    session: dict, *, expected_running: bool = False
+) -> None:
+    assert session.get("_session_control_inflight") is None
+    assert session.get("running") is expected_running
+
+
+@pytest.mark.parametrize("failure_type", [RuntimeError, KeyboardInterrupt, _MicroControlAbort])
+def test_live_micro_config_failure_clears_lease_and_allows_retry(gateway, failure_type):
+    server, db, _home = gateway
+    key = "config-failure"
+    agent = LiveAgent(db, key)
+    session = _session(server, db, "sid-config-failure", key, agent)
+    row_before = db.get_session(key)
+    failure = failure_type("config boom")
+
+    def failing_config():
+        raise failure
+
+    with patch.object(server, "_session_micro_config_loader", return_value=failing_config):
+        if issubclass(failure_type, Exception):
+            response = _call(
+                server,
+                "slash.exec",
+                session_id="sid-config-failure",
+                command="micro on",
+            )
+            assert "could not read global configuration" in _result(response)["output"]
+        else:
+            with pytest.raises(failure_type):
+                _call(
+                    server,
+                    "slash.exec",
+                    session_id="sid-config-failure",
+                    command="micro on",
+                )
+
+    _assert_micro_lease_cleared(session)
+    assert db.get_session(key) == row_before
+    assert agent.ensure_calls == 0
+    assert agent.context_compressor.calls == []
+
+    retry = _result(
+        _call(server, "slash.exec", session_id="sid-config-failure", command="micro on")
+    )
+    assert "override saved: ON" in retry["output"]
+    assert db.session_micro_compact_override(db.get_session(key)) is True
+    assert agent.context_compressor.calls == [True]
+    _assert_micro_lease_cleared(session)
+
+
+@pytest.mark.parametrize("boundary", ["db_context", "db_read", "ensure", "db_set", "live_apply"])
+@pytest.mark.parametrize("failure_type", [RuntimeError, KeyboardInterrupt, _MicroControlAbort])
+def test_live_micro_failure_matrix_releases_lease_and_preserves_db_first_contract(
+    gateway, monkeypatch, boundary, failure_type
+):
+    server, db, _home = gateway
+    key = f"{boundary}-failure-{failure_type.__name__}"
+    agent = LiveAgent(db, key)
+    session = _session(server, db, f"sid-{key}", key, agent)
+    row_before = db.get_session(key)
+    failure = failure_type(f"{boundary} boom")
+
+    def invoke_and_assert(*, propagates: bool = False):
+        if propagates or not issubclass(failure_type, Exception):
+            with pytest.raises(failure_type):
+                _call(server, "slash.exec", session_id=f"sid-{key}", command="micro on")
+            return
+        response = _call(server, "slash.exec", session_id=f"sid-{key}", command="micro on")
+        assert "result" in response, response
+        assert boundary in _result(response)["output"]
+
+    if boundary == "db_context":
+        @contextlib.contextmanager
+        def failing_session_db(_session_view):
+            raise failure
+            yield None
+
+        with patch.object(server, "_session_db", failing_session_db):
+            invoke_and_assert(propagates=True)
+    elif boundary == "db_read":
+        with patch.object(agent, "_ensure_db_session", return_value=None), patch.object(
+            db, "get_session", side_effect=failure
+        ):
+            invoke_and_assert()
+    elif boundary == "ensure":
+        with patch.object(agent, "_ensure_db_session", side_effect=failure):
+            invoke_and_assert()
+    elif boundary == "db_set":
+        with patch.object(db, "set_session_micro_compact_override", side_effect=failure):
+            invoke_and_assert()
+    else:
+        with patch("agent.agent_init.apply_micro_compact_policy", side_effect=failure):
+            invoke_and_assert()
+
+    _assert_micro_lease_cleared(session)
+    if boundary == "live_apply":
+        assert db.session_micro_compact_override(db.get_session(key)) is True
+        assert agent.micro_compact_enabled is False
+    else:
+        assert db.get_session(key) == row_before
+    assert agent.context_compressor.calls == []
+
+    # Restore the failed seam and prove the same session can claim the lease
+    # again.  ``off`` also checks that a DB-first failure did not leave a stale
+    # durable override behind.
+    retry = _result(
+        _call(server, "slash.exec", session_id=f"sid-{key}", command="micro off")
+    )
+    assert "override saved: OFF" in retry["output"]
+    assert db.session_micro_compact_override(db.get_session(key)) is False
+    _assert_micro_lease_cleared(session)
+
+
+@pytest.mark.parametrize("failure_type", [RuntimeError, _MicroControlAbort])
+def test_live_micro_profile_session_db_open_failure_clears_lease_and_allows_retry(
+    gateway, tmp_path, failure_type
+):
+    server, db, _home = gateway
+    from hermes_state import SessionDB
+
+    key = f"profile-open-{failure_type.__name__}"
+    profile_home = tmp_path / "profile-open-home"
+    profile_home.mkdir()
+    profile_db = SessionDB(db_path=profile_home / "state.db")
+    profile_db.create_session(key, source="tui", model="test-model")
+    profile_db.close()
+    agent = LiveAgent(db, key)
+    session = _session(server, db, f"sid-{key}", key, agent)
+    session["profile_home"] = str(profile_home)
+    row_before = db.get_session(key)
+    failure = failure_type("profile SessionDB open boom")
+
+    class FailingSessionDB:
+        def __init__(self, **_kwargs):
+            raise failure
+
+    with patch("hermes_state.SessionDB", FailingSessionDB), patch.object(
+        server, "_session_micro_config_loader", return_value=lambda: {"compression": {}}
+    ):
+        if issubclass(failure_type, Exception):
+            response = _call(server, "slash.exec", session_id=f"sid-{key}", command="micro on")
+            assert "session database is not available" in _result(response)["output"]
+        else:
+            with pytest.raises(failure_type):
+                _call(server, "slash.exec", session_id=f"sid-{key}", command="micro on")
+
+    _assert_micro_lease_cleared(session)
+    assert db.get_session(key) == row_before
+    assert agent.context_compressor.calls == []
+
+    # The profile DB opens normally once the seam is restored, and the exact
+    # target row can be mutated by the next claim.
+    with patch.object(agent, "_ensure_db_session", return_value=None):
+        retry = _result(
+            _call(server, "slash.exec", session_id=f"sid-{key}", command="micro off")
+        )
+    assert "override saved: OFF" in retry["output"]
+    check_db = SessionDB(db_path=profile_home / "state.db")
+    try:
+        assert check_db.session_micro_compact_override(check_db.get_session(key)) is False
+    finally:
+        check_db.close()
+    assert agent.context_compressor.calls == [False]
+    _assert_micro_lease_cleared(session)
+
+
+@pytest.mark.parametrize("busy_source", ["running", "child"])
+def test_busy_micro_rejects_before_lease_config_db_or_live_mutation(
+    gateway, monkeypatch, busy_source
+):
+    server, db, _home = gateway
+    key = f"busy-{busy_source}"
+    agent = LiveAgent(db, key)
+    session = _session(server, db, f"sid-{key}", key, agent)
+    row_before = db.get_session(key)
+    if busy_source == "running":
+        session["running"] = True
+    else:
+        monkeypatch.setattr(server, "_child_run_active", lambda _key: True)
+
+    def fail_config(_session):
+        pytest.fail("busy /micro must reject before loading config")
+
+    monkeypatch.setattr(server, "_session_micro_config_loader", fail_config)
+    monkeypatch.setattr(
+        db,
+        "set_session_micro_compact_override",
+        lambda *_args, **_kwargs: pytest.fail("busy /micro must not write the DB"),
+    )
+
+    response = _call(server, "slash.exec", session_id=f"sid-{key}", command="micro on")
+
+    assert response["error"]["code"] == 4009
+    _assert_micro_lease_cleared(
+        session, expected_running=(busy_source == "running")
+    )
+    assert db.get_session(key) == row_before
+    assert agent.ensure_calls == 0
+    assert agent.context_compressor.calls == []
+
+
+def _start_blocked_micro(
+    server, db, monkeypatch, *, sid: str, blocked_session_id: str | None = None
+):
+    entered = threading.Event()
+    release = threading.Event()
+    result: dict = {}
+    original_setter = db.set_session_micro_compact_override
+    if blocked_session_id is None:
+        blocked_session_id = str(
+            server._sessions[sid].get("session_key") or sid
+        )
+
+    def blocked_setter(session_id, override):
+        if session_id == blocked_session_id:
+            entered.set()
+            assert release.wait(5), "blocked micro was not released"
+        return original_setter(session_id, override)
+
+    monkeypatch.setattr(db, "set_session_micro_compact_override", blocked_setter)
+
+    def run_micro() -> None:
+        result["response"] = _call(server, "slash.exec", session_id=sid, command="micro on")
+
+    thread = threading.Thread(target=run_micro)
+    thread.start()
+    assert entered.wait(2), "micro did not reach the blocking DB setter"
+    return thread, release, result
+
+
+def _join_blocked_micro(thread: threading.Thread, release: threading.Event) -> None:
+    release.set()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+
+
+def test_session_resume_reuse_rejects_during_micro_and_reuses_after_release(gateway, monkeypatch):
+    server, db, _home = gateway
+    key = "resume-while-micro"
+    agent = LiveAgent(db, key)
+    session = _session(server, db, "sid-resume-while-micro", key, agent)
+    thread, release, first = _start_blocked_micro(
+        server, db, monkeypatch, sid="sid-resume-while-micro"
+    )
+    try:
+        busy = _call(server, "session.resume", session_id=key)
+        assert busy["error"]["code"] == 4009
+        assert server._sessions.get("sid-resume-while-micro") is session
+        assert db.session_micro_compact_override(db.get_session(key)) is None
+    finally:
+        _join_blocked_micro(thread, release)
+
+    assert "result" in first["response"]
+    resumed = _call(server, "session.resume", session_id=key)
+    assert "result" in resumed, resumed
+    assert resumed["result"]["session_id"] == "sid-resume-while-micro"
+    assert server._sessions.get("sid-resume-while-micro") is session
+    assert db.session_micro_compact_override(db.get_session(key)) is True
+
+
+def test_session_reuse_releases_resume_lock_before_blocking_db_payload_read(gateway, monkeypatch):
+    server, db, _home = gateway
+    key = "resume-payload-lock"
+    agent = LiveAgent(db, key)
+    _session(server, db, "sid-resume-payload-lock", key, agent)
+    db_read_entered = threading.Event()
+    db_read_release = threading.Event()
+    resume_result: dict = {}
+
+    def blocked_messages(*_args, **_kwargs):
+        db_read_entered.set()
+        assert db_read_release.wait(5), "blocked resume payload read was not released"
+        return []
+
+    monkeypatch.setattr(db, "get_messages_as_conversation", blocked_messages)
+
+    def resume() -> None:
+        resume_result["response"] = _call(server, "session.resume", session_id=key)
+
+    resume_thread = threading.Thread(target=resume)
+    resume_thread.start()
+    assert db_read_entered.wait(2)
+    lock_acquired = threading.Event()
+
+    def acquire_resume_lock() -> None:
+        with server._session_resume_lock:
+            lock_acquired.set()
+
+    lock_thread = threading.Thread(target=acquire_resume_lock)
+    lock_thread.start()
+    try:
+        assert lock_acquired.wait(2), "resume held the global lock during DB payload I/O"
+    finally:
+        db_read_release.set()
+        resume_thread.join(timeout=5)
+        lock_thread.join(timeout=5)
+    assert not resume_thread.is_alive()
+    assert not lock_thread.is_alive()
+    assert "result" in resume_result["response"]
+
+
+def test_session_close_rejects_during_micro_and_succeeds_after_release(gateway, monkeypatch):
+    server, db, _home = gateway
+    key = "close-while-micro"
+    agent = LiveAgent(db, key)
+    session = _session(server, db, "sid-close-while-micro", key, agent)
+    thread, release, first = _start_blocked_micro(
+        server, db, monkeypatch, sid="sid-close-while-micro"
+    )
+    try:
+        busy = _call(server, "session.close", session_id="sid-close-while-micro")
+        assert busy["error"]["code"] == 4009
+        assert server._sessions.get("sid-close-while-micro") is session
+        assert db.session_micro_compact_override(db.get_session(key)) is None
+    finally:
+        _join_blocked_micro(thread, release)
+
+    assert "result" in first["response"]
+    closed = _call(server, "session.close", session_id="sid-close-while-micro")
+    assert closed["result"]["closed"] is True
+    assert "sid-close-while-micro" not in server._sessions
+    assert db.session_micro_compact_override(db.get_session(key)) is True
+
+
+def test_compression_rotation_defers_during_micro_and_reanchors_after_release(gateway, monkeypatch):
+    server, db, _home = gateway
+    old_key = "rotation-old"
+    new_key = "rotation-new"
+    agent = LiveAgent(db, old_key)
+    session = _session(server, db, "sid-rotation", old_key, agent)
+    db.create_session(new_key, source="tui", model="test-model")
+    generation_before = session.get("session_generation", 0)
+    thread, release, first = _start_blocked_micro(
+        server, db, monkeypatch, sid="sid-rotation"
+    )
+    try:
+        # Compression has already produced a continuation id, but the gateway
+        # must defer the registry/session-key re-anchor while /micro owns the
+        # exact session object.
+        agent.session_id = new_key
+        server._sync_session_key_after_compress("sid-rotation", session)
+        assert session["session_key"] == old_key
+        assert session.get("session_generation", 0) == generation_before
+        assert db.session_micro_compact_override(db.get_session(old_key)) is None
+        assert db.session_micro_compact_override(db.get_session(new_key)) is None
+        agent.session_id = old_key
+    finally:
+        _join_blocked_micro(thread, release)
+
+    assert "result" in first["response"]
+    assert db.session_micro_compact_override(db.get_session(old_key)) is True
+    assert db.session_micro_compact_override(db.get_session(new_key)) is None
+
+    monkeypatch.setattr(server, "_transfer_active_session_slot", lambda *_a, **_k: True)
+    monkeypatch.setattr(server, "_restart_slash_worker", lambda *_a, **_k: None)
+    agent.session_id = new_key
+    with patch("tools.approval.unregister_gateway_notify"), patch(
+        "tools.approval.enable_session_yolo"
+    ), patch("tools.approval.disable_session_yolo"), patch(
+        "tools.approval.is_session_yolo_enabled", return_value=False
+    ), patch("tools.approval.register_gateway_notify"):
+        server._sync_session_key_after_compress("sid-rotation", session)
+    assert session["session_key"] == new_key
+    assert session["session_generation"] == generation_before + 1
+    assert db.session_micro_compact_override(db.get_session(old_key)) is True
+    assert db.session_micro_compact_override(db.get_session(new_key)) is None
+
+
+def test_old_micro_finally_cannot_clear_replacement_session_lease(gateway, monkeypatch):
+    server, db, _home = gateway
+    old_key = "aba-old"
+    new_key = "aba-new"
+    old_agent = LiveAgent(db, old_key)
+    old_session = _session(server, db, "sid-aba", old_key, old_agent)
+    thread, release, first = _start_blocked_micro(server, db, monkeypatch, sid="sid-aba")
+    new_target = None
+    try:
+        new_agent = LiveAgent(db, new_key)
+        db.create_session(new_key, source="tui", model="test-model")
+        new_session = {
+            "session_key": new_key,
+            "agent": new_agent,
+            "history": [],
+            "history_lock": threading.Lock(),
+            "history_version": 0,
+            "session_generation": 1,
+            "running": False,
+            "profile_home": None,
+            "slash_worker": None,
+            "model": "test-model",
+        }
+        with server._sessions_lock:
+            server._sessions["sid-aba"] = new_session
+        new_target, claim_error = server._claim_live_micro_control("sid-aba", new_session)
+        assert claim_error is None
+        assert new_target is not None
+        new_token = new_session["_session_control_inflight"]
+        assert new_token is new_target.token
+
+        release.set()
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+        assert "result" in first["response"]
+        output = first["response"]["result"]["output"]
+        assert isinstance(output, str)
+        assert "live session changed" in output
+        assert old_session.get("_session_control_inflight") is None
+        assert new_session.get("_session_control_inflight") is new_token
+        assert db.session_micro_compact_override(db.get_session(old_key)) is True
+        assert db.session_micro_compact_override(db.get_session(new_key)) is None
+        assert old_agent.context_compressor.calls == [True]
+        assert new_agent.context_compressor.calls == []
+    finally:
+        release.set()
+        thread.join(timeout=5)
+        if new_target is not None:
+            server._release_live_micro_control(new_target)
+
+
+def test_blocked_micro_on_one_session_does_not_block_other_session_or_status(
+    gateway, monkeypatch
+):
+    server, db, _home = gateway
+    agent_a = LiveAgent(db, "isolated-a")
+    agent_b = LiveAgent(db, "isolated-b")
+    _session(server, db, "sid-isolated-a", "isolated-a", agent_a)
+    _session(server, db, "sid-isolated-b", "isolated-b", agent_b)
+    thread, release, first = _start_blocked_micro(
+        server,
+        db,
+        monkeypatch,
+        sid="sid-isolated-a",
+        blocked_session_id="isolated-a",
+    )
+    other_result: dict = {}
+    other_done = threading.Event()
+
+    def run_other_micro() -> None:
+        other_result["response"] = _call(
+            server, "slash.exec", session_id="sid-isolated-b", command="micro on"
+        )
+        other_done.set()
+
+    other_thread = threading.Thread(target=run_other_micro)
+    other_thread.start()
+    try:
+        assert other_done.wait(2), "session B was blocked by session A's micro I/O"
+        assert "result" in other_result["response"]
+        assert db.session_micro_compact_override(db.get_session("isolated-b")) is True
+        status = _call(server, "session.status", session_id="sid-isolated-b")
+        assert "result" in status
+    finally:
+        _join_blocked_micro(thread, release)
+        other_thread.join(timeout=5)
+    assert "result" in first["response"]
+    assert not other_thread.is_alive()

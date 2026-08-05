@@ -1095,37 +1095,60 @@ def _(rid, params: dict) -> dict:
 
     if _cmd_base == "micro":
         # Reuse the central registry's busy policy rather than allowing a
-        # worker/live path to mutate a session during its active turn. Hold the
-        # session history lock across the direct call so a new turn cannot race
-        # in between the check and DB-first execution.
+        # worker/live path to mutate a session during its active turn.  The
+        # live path claims a short per-session control lease here, then does all
+        # config/DB/runtime work outside history_lock.  Prompt/session claims
+        # check the same lease, so releasing the lock cannot reintroduce a
+        # check-then-act race.
         from hermes_cli.commands import resolve_command
 
         _micro_def = resolve_command(_cmd_base)
 
         def _run_micro_slash():
-            active = bool(session.get("running"))
-            if not active and session.get("agent") is None:
-                active = _child_run_active(str(session.get("session_key") or ""))
-            if _micro_def is not None and _micro_def.busy_policy == "reject" and active:
+            if _micro_def is not None and _micro_def.busy_policy == "reject":
+                _micro_target, _micro_claim = _claim_live_micro_control(
+                    params.get("session_id", ""), session
+                )
+            else:
+                _micro_target, _micro_claim = None, None
+            if _micro_claim is _MICRO_TURN_BUSY:
                 return _err(
                     rid,
                     4009,
-                    f"session busy — /{_micro_def.name} can't run mid-turn; "
-                    "interrupt the current turn first",
+                    _MICRO_TURN_BUSY_MESSAGE,
                 )
-            return _live_slash_command_output(
-                params.get("session_id", ""), session, _cmd_base, _cmd_arg
-            )
+            if _micro_claim is _SESSION_CONTROL_BUSY:
+                return _err(rid, 4009, _MICRO_CONTROL_BUSY_MESSAGE)
+            if isinstance(_micro_claim, str):
+                return _micro_claim
+            if _micro_target is None:
+                # Cold worker fallback stays unchanged: it owns row creation
+                # and later hydration for sessions with no live agent yet.
+                return _live_slash_command_output(
+                    params.get("session_id", ""), session, _cmd_base, _cmd_arg
+                )
 
-        _micro_lock = session.get("history_lock")
-        if _micro_lock is None:
-            live_output = _run_micro_slash()
-        else:
-            with _micro_lock:
-                _micro_response = _run_micro_slash()
-            if isinstance(_micro_response, dict) and "error" in _micro_response:
-                return _micro_response
-            live_output = _micro_response
+            _micro_response = None
+            try:
+                _micro_response = _live_slash_command_output(
+                    params.get("session_id", ""),
+                    session,
+                    _cmd_base,
+                    _cmd_arg,
+                    micro_target=_micro_target,
+                )
+            finally:
+                _micro_identity_unchanged = _release_live_micro_control(_micro_target)
+            if not _micro_identity_unchanged:
+                return (
+                    "Micro-compaction error: live session changed while the "
+                    "command was running; refusing to report a new target mutation"
+                )
+            return _micro_response
+
+        live_output = _run_micro_slash()
+        if isinstance(live_output, dict) and "error" in live_output:
+            return live_output
     else:
         live_output = _live_slash_command_output(
             params.get("session_id", ""), session, _cmd_base, _cmd_arg
