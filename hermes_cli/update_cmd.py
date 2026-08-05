@@ -2151,6 +2151,63 @@ def _restore_original_release_checkout(
         )
 
 
+def _release_finalization_marker_state(journal: dict) -> str:
+    """Classify the context marker before any live-worktree inspection."""
+
+    phase = journal.get("phase")
+    state = journal.get("state")
+    verified = journal.get("final_state_verified")
+    finalized = journal.get("finalized")
+    if phase == "finalized":
+        if verified is not True:
+            return "inconsistent"
+        if state is not None and state != "finalized":
+            return "inconsistent"
+        if finalized is not None and finalized is not True:
+            return "inconsistent"
+        return "verified"
+    if verified is True or finalized is True or state == "finalized":
+        return "inconsistent"
+    return "unfinalized"
+
+
+
+def _acknowledge_finalized_release(context: ReleaseUpgradeContext) -> bool:
+    """Remove terminal transaction evidence without touching the live checkout."""
+
+    try:
+        context.journal_path.lstat()
+    except FileNotFoundError:
+        return True
+    context.journal_path.unlink()
+    try:
+        context.transaction_dir.rmdir()
+    except OSError:
+        pass
+    return True
+
+
+
+def _mark_release_finalized(context: ReleaseUpgradeContext) -> None:
+    """Persist the terminal marker before exposing it to retry logic."""
+
+    terminal_journal = dict(context.journal)
+    terminal_journal.update(
+        {
+            "phase": "finalized",
+            "state": "finalized",
+            "final_state_verified": True,
+            "finalized": True,
+        }
+    )
+    _write_transaction_journal(
+        context.common_dir, terminal_journal, path=context.journal_path
+    )
+    context.journal.clear()
+    context.journal.update(terminal_journal)
+
+
+
 def _finalize_release_upgrade(
     git_cmd: list[str],
     cwd: Path | str,
@@ -2163,6 +2220,42 @@ def _finalize_release_upgrade(
     root = Path(cwd)
     journal = context.journal
     try:
+        marker_state = _release_finalization_marker_state(journal)
+        if marker_state == "verified":
+            # The final live state was already verified.  Only acknowledge the
+            # durable journal; never re-inspect or mutate the checkout.
+            return _acknowledge_finalized_release(context)
+        if marker_state == "inconsistent":
+            logger.error(
+                "Refusing to replay release finalization with an inconsistent "
+                "terminal journal marker: %s",
+                context.journal_path,
+            )
+            print(
+                "✗ Release finalization has an inconsistent terminal marker; "
+                "refusing destructive cleanup."
+            )
+            print(f"  Recovery journal retained at {context.journal_path}")
+            return False
+        try:
+            context.journal_path.lstat()
+        except FileNotFoundError:
+            # Journal absence is not proof that first finalization completed.
+            print(
+                "✗ Release finalization journal is missing before terminal "
+                "verification; refusing destructive cleanup."
+            )
+            print(f"  Expected recovery journal at {context.journal_path}")
+            return False
+        except OSError as exc:
+            logger.warning(
+                "Could not inspect release finalization journal %s: %s",
+                context.journal_path,
+                exc,
+            )
+            print(f"⚠ Release user-state recovery is incomplete; journal: {context.journal_path}")
+            return False
+
         if journal.get("stash_capture_uncertain") and not journal.get(
             "stash_capture_confirmed"
         ):
@@ -2303,20 +2396,10 @@ def _finalize_release_upgrade(
                 f"at {context.journal_path}"
             )
             return False
-        _journal_update(
-            context,
-            "finalized",
-            final_state_verified=True,
-            finalized=True,
-        )
-        # Delete the journal last.  If this unlink fails, all immutable payload,
-        # stash and candidate identities remain actionable in the directory.
-        context.journal_path.unlink()
-        try:
-            context.transaction_dir.rmdir()
-        except OSError:
-            pass
-        return True
+        _mark_release_finalized(context)
+        # Mark the verified terminal state before acknowledging journal removal.
+        # Any retry now takes the filesystem-only path above.
+        return _acknowledge_finalized_release(context)
     except BaseException as exc:
         # A second Ctrl-C must not erase the only recovery evidence.  Preserve
         # the journal and let an already-active exception continue propagating.

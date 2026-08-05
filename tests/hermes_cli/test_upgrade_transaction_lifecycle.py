@@ -147,6 +147,56 @@ def _assert_exact_checkout(repo: Path, branch: str | None, sha: str) -> None:
 
 
 
+def _capture_user_state(repo: Path, paths: tuple[str, ...]) -> dict:
+    return {
+        "bytes": {
+            path: (repo / path).read_bytes() if (repo / path).exists() else None
+            for path in paths
+        },
+        "status": _git(repo, "status", "--porcelain=v2").stdout,
+        "cached_diff": _git(repo, "diff", "--cached", "--binary").stdout,
+        "unstaged_diff": _git(repo, "diff", "--binary").stdout,
+        "index_entries": _git(repo, "ls-files", "--stage", "-z").stdout,
+        "index_tree": _git(repo, "write-tree").stdout,
+    }
+
+
+
+def _write_user_state(repo: Path, prefix: str) -> dict:
+    _git(repo, "config", "core.autocrlf", "false")
+    tracked = repo / "README.txt"
+    tracked.write_bytes(f"{prefix} staged\r\nsecond staged line\r\n".encode())
+    _git(repo, "add", "--", tracked.name)
+    tracked.write_bytes(f"{prefix} working\r\nsecond working line\r\n".encode())
+    binary_name = f"{prefix}-binary.bin"
+    crlf_name = f"{prefix}-crlf.txt"
+    (repo / binary_name).write_bytes(b"\x00" + prefix.encode() + b"\xff\x00\r\n")
+    (repo / crlf_name).write_bytes(
+        f"{prefix} untracked\r\nintentional CRLF\r\n".encode()
+    )
+    return _capture_user_state(repo, ("README.txt", binary_name, crlf_name))
+
+
+
+def _assert_captured_user_state(
+    repo: Path, expected: dict, *, include_index: bool = True
+) -> None:
+    actual = _capture_user_state(repo, tuple(expected["bytes"]))
+    if include_index:
+        assert actual == expected
+        return
+    for key in ("bytes", "status", "cached_diff", "unstaged_diff"):
+        assert actual[key] == expected[key]
+    expected_readme = next(
+        entry for entry in expected["index_entries"].split(b"\0") if entry.endswith(b"\tREADME.txt")
+    )
+    actual_readme = next(
+        entry for entry in actual["index_entries"].split(b"\0") if entry.endswith(b"\tREADME.txt")
+    )
+    assert actual_readme == expected_readme
+
+
+
 def test_keyboard_interrupt_after_stash_restores_exact_branch_and_bytes(
     tmp_path, monkeypatch
 ):
@@ -377,3 +427,148 @@ def test_stash_restore_conflict_keeps_immutable_stash_and_journal(tmp_path):
     assert after["stash_pending"] is True
     assert after["stash_sha"] == stash_sha
     assert after["original_head_sha"] == original_sha
+
+
+
+def test_verified_release_finalizer_is_idempotent_and_preserves_post_finalization_state(
+    tmp_path, monkeypatch
+):
+    repo, _base_sha, _maintenance_sha, target_sha = _release_repo(tmp_path)
+    before = _write_user_state(repo, "before")
+    result = update_cmd._prepare_and_promote_release(
+        ["git"], repo, "v2.0.0", target_sha,
+        candidate_validator=_test_candidate_validator,
+    )
+    assert result.context is not None
+    context = result.context
+
+    assert update_cmd._finalize_release_upgrade(["git"], repo, context) is True
+    _assert_captured_user_state(repo, before, include_index=False)
+    assert context.journal["phase"] == "finalized"
+    assert context.journal["final_state_verified"] is True
+    assert not context.journal_path.exists()
+
+    after = _write_user_state(repo, "after")
+    with monkeypatch.context() as patcher:
+        real_run = subprocess.run
+        calls: list[list[str]] = []
+
+        def record_run(command, *args, **kwargs):
+            calls.append([str(part) for part in command])
+            return real_run(command, *args, **kwargs)
+
+        patcher.setattr(update_cmd.subprocess, "run", record_run)
+        assert update_cmd._finalize_release_upgrade(["git"], repo, context) is True
+        assert calls == []
+
+    _assert_captured_user_state(repo, after)
+    assert context.journal["phase"] == "finalized"
+    assert context.journal["final_state_verified"] is True
+
+
+
+def test_verified_finalizer_retries_only_journal_ack_after_unlink_failure(
+    tmp_path, monkeypatch
+):
+    repo, _base_sha, _maintenance_sha, target_sha = _release_repo(tmp_path)
+    _write_user_state(repo, "before")
+    result = update_cmd._prepare_and_promote_release(
+        ["git"], repo, "v2.0.0", target_sha,
+        candidate_validator=_test_candidate_validator,
+    )
+    assert result.context is not None
+    context = result.context
+    journal_path = context.journal_path
+    real_unlink = Path.unlink
+    fail_once = True
+
+    def fail_journal_unlink(path, *args, **kwargs):
+        nonlocal fail_once
+        if path == journal_path and fail_once:
+            fail_once = False
+            raise OSError("injected journal unlink failure")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_journal_unlink)
+    assert update_cmd._finalize_release_upgrade(["git"], repo, context) is False
+    assert journal_path.exists()
+    assert context.journal["phase"] == "finalized"
+    assert context.journal["final_state_verified"] is True
+    persisted = json.loads(journal_path.read_text(encoding="utf-8"))
+    assert persisted["phase"] == "finalized"
+    assert persisted["final_state_verified"] is True
+
+    after = _write_user_state(repo, "after-unlink-failure")
+    with monkeypatch.context() as patcher:
+        real_run = subprocess.run
+        calls: list[list[str]] = []
+
+        def record_run(command, *args, **kwargs):
+            calls.append([str(part) for part in command])
+            return real_run(command, *args, **kwargs)
+
+        patcher.setattr(update_cmd.subprocess, "run", record_run)
+        assert update_cmd._finalize_release_upgrade(["git"], repo, context) is True
+        assert calls == []
+
+    assert not journal_path.exists()
+    _assert_captured_user_state(repo, after)
+
+    with monkeypatch.context() as patcher:
+        real_run = subprocess.run
+        calls: list[list[str]] = []
+
+        def record_third_run(command, *args, **kwargs):
+            calls.append([str(part) for part in command])
+            return real_run(command, *args, **kwargs)
+
+        patcher.setattr(update_cmd.subprocess, "run", record_third_run)
+        assert update_cmd._finalize_release_upgrade(["git"], repo, context) is True
+        assert calls == []
+
+    _assert_captured_user_state(repo, after)
+
+
+
+@pytest.mark.parametrize("verified_marker", [False, None])
+def test_inconsistent_finalized_marker_fails_closed_without_git_or_state_mutation(
+    tmp_path, monkeypatch, verified_marker
+):
+    repo, _base_sha, _maintenance_sha, target_sha = _release_repo(tmp_path)
+    result = update_cmd._prepare_and_promote_release(
+        ["git"], repo, "v2.0.0", target_sha,
+        candidate_validator=_test_candidate_validator,
+    )
+    assert result.context is not None
+    context = result.context
+    update_cmd._journal_update(context, "finalized", finalized=False)
+    if verified_marker is None:
+        context.journal.pop("final_state_verified", None)
+        update_cmd._write_transaction_journal(
+            context.common_dir, context.journal, path=context.journal_path
+        )
+    else:
+        assert context.journal["final_state_verified"] is False
+
+    expected = _write_user_state(repo, "inconsistent")
+    with monkeypatch.context() as patcher:
+        real_run = subprocess.run
+        calls: list[list[str]] = []
+
+        def record_run(command, *args, **kwargs):
+            calls.append([str(part) for part in command])
+            return real_run(command, *args, **kwargs)
+
+        patcher.setattr(update_cmd.subprocess, "run", record_run)
+        assert update_cmd._finalize_release_upgrade(["git"], repo, context) is False
+        assert calls == []
+
+    _assert_captured_user_state(repo, expected)
+    assert context.journal["phase"] == "finalized"
+    assert context.journal_path.exists()
+    journal = json.loads(context.journal_path.read_text(encoding="utf-8"))
+    assert journal["phase"] == "finalized"
+    if verified_marker is None:
+        assert "final_state_verified" not in journal
+    else:
+        assert journal["final_state_verified"] is False
