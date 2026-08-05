@@ -53,6 +53,15 @@ class LiveAgent:
         self.run_conversation_calls += 1
 
 
+class RecordingLease:
+    def __init__(self, lease_id: str = "lease") -> None:
+        self.lease_id = lease_id
+        self.release_calls = 0
+
+    def release(self) -> None:
+        self.release_calls += 1
+
+
 class RecordingWorker:
     instances: list["RecordingWorker"] = []
 
@@ -524,6 +533,346 @@ def test_live_micro_lease_blocks_prompt_and_second_micro_until_release(gateway, 
     assert session["running"] is False
     assert session["history"] == []
     assert agent.run_conversation_calls == 0
+
+
+def test_prompt_control_race_releases_only_new_active_session_lease(gateway, monkeypatch):
+    server, db, _home = gateway
+    agent = LiveAgent(db, "prompt-control-race")
+    session = _session(server, db, "sid-prompt-control-race", "prompt-control-race", agent)
+
+    lease = RecordingLease("prompt-control-race")
+    claim_entered = threading.Event()
+    claim_release = threading.Event()
+
+    def blocked_claim(*_args, **_kwargs):
+        claim_entered.set()
+        assert claim_release.wait(5), "active-session claim was not released"
+        return lease, None
+
+    monkeypatch.setattr(server, "_claim_active_session_slot", blocked_claim)
+    prompt_result: dict = {}
+
+    def run_prompt() -> None:
+        prompt_result["response"] = _call(
+            server,
+            "prompt.submit",
+            session_id="sid-prompt-control-race",
+            text="must not run",
+        )
+
+    prompt_thread = threading.Thread(target=run_prompt)
+    prompt_thread.start()
+    assert claim_entered.wait(2), "prompt did not reach active-session claim"
+
+    micro_thread, micro_release, micro_result = _start_blocked_micro(
+        server,
+        db,
+        monkeypatch,
+        sid="sid-prompt-control-race",
+    )
+    try:
+        claim_release.set()
+        prompt_thread.join(timeout=5)
+        assert not prompt_thread.is_alive()
+        response = prompt_result["response"]
+        assert response["error"]["code"] == 4009
+        assert session["running"] is False
+        assert session["history"] == []
+        assert agent.run_conversation_calls == 0
+        assert session.get("active_session_lease") is None
+        assert lease.release_calls == 1
+    finally:
+        _join_blocked_micro(micro_thread, micro_release)
+    assert "result" in micro_result["response"]
+
+
+def test_prompt_control_race_preserves_preexisting_active_session_lease(gateway, monkeypatch):
+    server, db, _home = gateway
+    agent = LiveAgent(db, "prompt-control-preexisting")
+    session = _session(
+        server,
+        db,
+        "sid-prompt-control-preexisting",
+        "prompt-control-preexisting",
+        agent,
+    )
+    lease = RecordingLease("preexisting")
+    session["active_session_lease"] = lease
+    config_entered = threading.Event()
+    config_release = threading.Event()
+
+    def blocked_config():
+        config_entered.set()
+        assert config_release.wait(5), "prompt preflight was not released"
+        return {}
+
+    monkeypatch.setattr(server, "_load_dashboard_process_isolation_config", blocked_config)
+    prompt_result: dict = {}
+
+    def run_prompt() -> None:
+        prompt_result["response"] = _call(
+            server,
+            "prompt.submit",
+            session_id="sid-prompt-control-preexisting",
+            text="must not run",
+        )
+
+    prompt_thread = threading.Thread(target=run_prompt)
+    prompt_thread.start()
+    assert config_entered.wait(2), "prompt did not reach the preflight barrier"
+    micro_thread, micro_release, micro_result = _start_blocked_micro(
+        server,
+        db,
+        monkeypatch,
+        sid="sid-prompt-control-preexisting",
+    )
+    try:
+        config_release.set()
+        prompt_thread.join(timeout=5)
+        assert not prompt_thread.is_alive()
+        assert prompt_result["response"]["error"]["code"] == 4009
+        assert session.get("active_session_lease") is lease
+        assert lease.release_calls == 0
+        assert session["running"] is False
+        assert session["history"] == []
+        assert agent.run_conversation_calls == 0
+    finally:
+        _join_blocked_micro(micro_thread, micro_release)
+    assert "result" in micro_result["response"]
+
+
+def test_prompt_exact_lease_cleanup_skips_replaced_session(gateway, monkeypatch):
+    server, db, _home = gateway
+    old_agent = LiveAgent(db, "prompt-aba-old")
+    old_session = _session(server, db, "sid-prompt-aba", "prompt-aba-old", old_agent)
+    old_lease = RecordingLease("aba-old")
+    old_session["active_session_lease"] = old_lease
+    new_agent = LiveAgent(db, "prompt-aba-new")
+    new_session = _session(server, db, "sid-prompt-aba-new", "prompt-aba-new", new_agent)
+    new_lease = RecordingLease("aba-new")
+    new_session["active_session_lease"] = new_lease
+
+    registry_checked = threading.Event()
+    registry_release = threading.Event()
+
+    def blocked_child_check(_session_key: str) -> bool:
+        registry_checked.set()
+        assert registry_release.wait(5), "cleanup registry seam was not released"
+        return False
+
+    monkeypatch.setattr(server, "_child_run_active", blocked_child_check)
+    cleanup_result: dict = {}
+
+    def run_cleanup() -> None:
+        cleanup_result["value"] = server._release_prompt_active_session_slot(
+            "sid-prompt-aba",
+            old_session,
+            old_lease,
+            lease_token=old_lease.lease_id,
+        )
+
+    cleanup_thread = threading.Thread(target=run_cleanup)
+    cleanup_thread.start()
+    assert registry_checked.wait(2), "cleanup did not reach the replacement seam"
+    with server._sessions_lock:
+        server._sessions["sid-prompt-aba"] = new_session
+    registry_release.set()
+    cleanup_thread.join(timeout=5)
+    assert not cleanup_thread.is_alive()
+    assert cleanup_result["value"] is False
+    assert old_session.get("active_session_lease") is old_lease
+    assert old_lease.release_calls == 0
+    assert new_session.get("active_session_lease") is new_lease
+    assert new_lease.release_calls == 0
+
+
+def test_prompt_exact_lease_cleanup_skips_changed_lease(gateway):
+    server, db, _home = gateway
+    agent = LiveAgent(db, "prompt-lease-aba")
+    session = _session(server, db, "sid-prompt-lease-aba", "prompt-lease-aba", agent)
+    old_lease = RecordingLease("lease-old")
+    new_lease = RecordingLease("lease-new")
+    session["active_session_lease"] = new_lease
+
+    result = server._release_prompt_active_session_slot(
+        "sid-prompt-lease-aba",
+        session,
+        old_lease,
+        lease_token=old_lease.lease_id,
+    )
+
+    assert result is False
+    assert session.get("active_session_lease") is new_lease
+    assert old_lease.release_calls == 0
+    assert new_lease.release_calls == 0
+
+
+def test_successful_prompt_transfers_new_lease_to_normal_turn_lifecycle(gateway, monkeypatch):
+    server, db, _home = gateway
+    agent = LiveAgent(db, "prompt-success-lease")
+    session = _session(server, db, "sid-prompt-success-lease", "prompt-success-lease", agent)
+    lease = RecordingLease("prompt-success")
+    monkeypatch.setattr(server, "_claim_active_session_slot", lambda *a, **k: (lease, None))
+    monkeypatch.setattr(server, "_load_dashboard_process_isolation_config", lambda: {})
+    monkeypatch.setattr(server, "_ensure_session_db_row", lambda *_a, **_k: None)
+    monkeypatch.setattr(server, "_persist_branch_seed", lambda *_a, **_k: None)
+    monkeypatch.setattr(server, "_start_agent_build", lambda *_a, **_k: None)
+    monkeypatch.setattr(server, "_wait_agent_for_prompt", lambda *_a, **_k: None)
+    monkeypatch.setattr(server, "_run_prompt_submit", lambda *_a, **_k: None)
+
+    response = _call(
+        server,
+        "prompt.submit",
+        session_id="sid-prompt-success-lease",
+        text="normal turn",
+    )
+
+    assert response["result"]["status"] == "streaming"
+    assert session["running"] is True
+    assert session.get("active_session_lease") is lease
+    assert lease.release_calls == 0
+    server._release_active_session_slot(session)
+    assert lease.release_calls == 1
+
+
+def test_concurrent_prompts_do_not_release_winner_active_session_lease(gateway, monkeypatch):
+    server, db, _home = gateway
+    agent = LiveAgent(db, "prompt-two-winners")
+    session = _session(server, db, "sid-prompt-two-winners", "prompt-two-winners", agent)
+    lease = RecordingLease("prompt-two-winners")
+    claim_entered = threading.Event()
+    claim_release = threading.Event()
+    preflight_barrier = threading.Barrier(2)
+    claim_calls = 0
+    claim_lock = threading.Lock()
+
+    def blocked_claim(*_args, **_kwargs):
+        nonlocal claim_calls
+        with claim_lock:
+            claim_calls += 1
+            first = claim_calls == 1
+        if first:
+            claim_entered.set()
+            assert claim_release.wait(5), "first prompt claim was not released"
+            return lease, None
+        raise AssertionError("second prompt tried to acquire a replacement lease")
+
+    def synchronized_config():
+        preflight_barrier.wait(timeout=5)
+        return {}
+
+    monkeypatch.setattr(server, "_claim_active_session_slot", blocked_claim)
+    monkeypatch.setattr(server, "_load_dashboard_process_isolation_config", synchronized_config)
+    monkeypatch.setattr(server, "_ensure_session_db_row", lambda *_a, **_k: None)
+    monkeypatch.setattr(server, "_persist_branch_seed", lambda *_a, **_k: None)
+    monkeypatch.setattr(server, "_start_agent_build", lambda *_a, **_k: None)
+    monkeypatch.setattr(server, "_wait_agent_for_prompt", lambda *_a, **_k: None)
+    monkeypatch.setattr(server, "_run_prompt_submit", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        server,
+        "_handle_busy_submit",
+        lambda *_a, **_k: {"error": {"code": 4009, "message": "session busy"}},
+    )
+    responses: list[dict] = []
+
+    def run_prompt() -> None:
+        responses.append(
+            _call(
+                server,
+                "prompt.submit",
+                session_id="sid-prompt-two-winners",
+                text="concurrent",
+            )
+        )
+
+    first_thread = threading.Thread(target=run_prompt)
+    second_thread = threading.Thread(target=run_prompt)
+    first_thread.start()
+    assert claim_entered.wait(2), "first prompt did not reach active-session claim"
+    second_thread.start()
+    claim_release.set()
+    first_thread.join(timeout=5)
+    second_thread.join(timeout=5)
+    assert not first_thread.is_alive()
+    assert not second_thread.is_alive()
+    assert len(responses) == 2
+    assert any(response.get("result", {}).get("status") == "streaming" for response in responses)
+    assert any(response.get("error", {}).get("code") == 4009 for response in responses)
+    assert session["running"] is True
+    assert session.get("active_session_lease") is lease
+    assert lease.release_calls == 0
+    server._release_active_session_slot(session)
+
+
+def test_prompt_exact_lease_cleanup_failure_is_non_masking_and_unlocks(gateway, monkeypatch, caplog):
+    server, db, _home = gateway
+    agent = LiveAgent(db, "prompt-cleanup-failure")
+    session = _session(server, db, "sid-prompt-cleanup-failure", "prompt-cleanup-failure", agent)
+    lease = RecordingLease("cleanup-failure")
+    session["active_session_lease"] = lease
+    calls: list[tuple[tuple, dict]] = []
+
+    class CleanupAbort(BaseException):
+        pass
+
+    def failing_canonical(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise CleanupAbort("release seam failed")
+
+    monkeypatch.setattr(server, "_release_active_session_slot", failing_canonical)
+    result = server._release_prompt_active_session_slot(
+        "sid-prompt-cleanup-failure",
+        session,
+        lease,
+        lease_token=lease.lease_id,
+    )
+
+    assert result is False
+    assert len(calls) == 1
+    assert "sid-prompt-cleanup-failure" in caplog.text
+    with session["history_lock"]:
+        pass
+    with server._sessions_lock:
+        pass
+
+
+def test_prompt_exact_lease_release_does_not_hold_coordination_locks(gateway):
+    server, db, _home = gateway
+    agent = LiveAgent(db, "prompt-release-seam")
+    session = _session(server, db, "sid-prompt-release-seam", "prompt-release-seam", agent)
+    release_entered = threading.Event()
+    release_gate = threading.Event()
+
+    class BlockingLease(RecordingLease):
+        def release(self) -> None:
+            release_entered.set()
+            assert release_gate.wait(5), "lease release seam was not released"
+            super().release()
+
+    lease = BlockingLease("release-seam")
+    session["active_session_lease"] = lease
+    cleanup_result: dict = {}
+
+    def run_cleanup() -> None:
+        cleanup_result["value"] = server._release_prompt_active_session_slot(
+            "sid-prompt-release-seam",
+            session,
+            lease,
+            lease_token=lease.lease_id,
+        )
+
+    cleanup_thread = threading.Thread(target=run_cleanup)
+    cleanup_thread.start()
+    try:
+        assert release_entered.wait(2), "cleanup did not reach the release seam"
+        _assert_history_lock_available(session["history_lock"])
+        _assert_history_lock_available(server._sessions_lock)
+    finally:
+        release_gate.set()
+        cleanup_thread.join(timeout=5)
+    assert not cleanup_thread.is_alive()
+    assert cleanup_result["value"] is True
+    assert lease.release_calls == 1
 
 
 def test_manual_compression_routes_reject_before_any_mutation_during_micro(

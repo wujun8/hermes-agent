@@ -566,6 +566,90 @@ def _claim_active_session_slot(
         return None, None
 
 
+def _active_session_slot_lock(session: dict) -> threading.Lock:
+    """Return the per-session lock that serializes lazy slot acquisition.
+
+    The lock is deliberately separate from ``history_lock``: acquiring the
+    cross-process active-session lease performs file I/O and must not run while
+    the prompt/control coordination lock is held.
+    """
+    history_lock = session.get("history_lock")
+    if history_lock is None:
+        return session.setdefault("_active_session_slot_lock", threading.Lock())
+    with history_lock:
+        lock = session.get("_active_session_slot_lock")
+        if lock is None:
+            lock = threading.Lock()
+            session["_active_session_slot_lock"] = lock
+        return lock
+
+
+def _release_unowned_active_session_lease(lease, *, sid: str) -> bool:
+    """Release a lease that could not be installed on its original session."""
+    if lease is None:
+        return True
+    try:
+        lease.release()
+    except BaseException as exc:
+        logger.warning(
+            "active-session lease cleanup failed before prompt ownership "
+            "was installed: sid=%s error=%s",
+            sid,
+            exc,
+        )
+        return False
+    return True
+
+
+def _claim_active_session_slot_for_prompt(
+    sid: str, session: dict
+) -> tuple[str | None, Any | None]:
+    """Claim a prompt's active-session slot and return only a new lease.
+
+    The second item is the exact lease installed by *this* invocation.  A
+    pre-existing session lease returns ``(None, None)`` so a later control-busy
+    cleanup cannot release ownership that predates this prompt.
+    """
+    with _active_session_slot_lock(session):
+        history_lock = session.get("history_lock")
+        if history_lock is not None:
+            with history_lock:
+                if session.get("active_session_lease") is not None:
+                    return None, None
+                if session.get("_finalized"):
+                    return None, None
+        elif session.get("active_session_lease") is not None:
+            return None, None
+
+        lease, limit_message = _claim_active_session_slot(
+            str(session.get("session_key") or ""),
+            live_session_id=sid,
+            surface=_session_source(session),
+        )
+        if limit_message is not None:
+            return limit_message, None
+        if lease is None:
+            return None, None
+
+        installed = False
+        if history_lock is not None:
+            with history_lock:
+                if (
+                    session.get("active_session_lease") is None
+                    and not session.get("_finalized")
+                ):
+                    session["active_session_lease"] = lease
+                    installed = True
+        elif session.get("active_session_lease") is None and not session.get("_finalized"):
+            session["active_session_lease"] = lease
+            installed = True
+
+        if not installed:
+            _release_unowned_active_session_lease(lease, sid=sid)
+            return None, None
+        return None, lease
+
+
 def _ensure_active_session_slot(sid: str, session: dict) -> str | None:
     """Claim this session's cap slot on its first real turn; None when ok.
 
@@ -580,29 +664,129 @@ def _ensure_active_session_slot(sid: str, session: dict) -> str | None:
     contract _ensure_session_db_row already uses for the row itself, and keeps
     the invariant that anything holding a slot is something the user can see.
     """
-    if session.get("active_session_lease") is not None:
-        return None
-    lease, limit_message = _claim_active_session_slot(
-        str(session.get("session_key") or ""),
-        live_session_id=sid,
-        surface=_session_source(session),
-    )
-    if limit_message is not None:
-        return limit_message
-    session["active_session_lease"] = lease
-    return None
+    limit_message, _lease = _claim_active_session_slot_for_prompt(sid, session)
+    return limit_message
 
 
-def _release_active_session_slot(session: dict | None) -> None:
+def _release_active_session_slot(
+    session: dict | None,
+    *,
+    sid: str | None = None,
+    expected_lease=None,
+    expected_lease_token=None,
+    reject_active: bool = False,
+) -> bool:
+    """Release an active-session slot, optionally with exact ownership checks.
+
+    The legacy no-argument form releases the session's current lease.  The
+    exact form is used by prompt rejection cleanup and validates the object,
+    lease identity/token, idle state, and registry mapping in separate lock
+    phases.  It never performs the global/file release while ``history_lock``
+    or ``_sessions_lock`` is held.
+    """
     if not session:
-        return
-    lease = session.pop("active_session_lease", None)
-    if lease is None:
-        return
+        return False
+
+    if expected_lease is None:
+        lease = session.pop("active_session_lease", None)
+        if lease is None:
+            return True
+        try:
+            lease.release()
+        except BaseException as exc:
+            logger.warning("Failed to release active session slot: %s", exc)
+            return False
+        return True
+
+    history_lock = session.get("history_lock")
+    if history_lock is None:
+        return False
     try:
-        lease.release()
-    except Exception:
-        logger.debug("Failed to release active session slot", exc_info=True)
+        with history_lock:
+            current = session.get("active_session_lease")
+            token_matches = (
+                expected_lease_token is None
+                or getattr(current, "lease_id", None) == expected_lease_token
+            )
+            if current is not expected_lease or not token_matches:
+                return False
+            if reject_active and session.get("running"):
+                return False
+            session_key = str(session.get("session_key") or "")
+
+        # This is a lock-free registry phase.  In particular, never acquire
+        # _sessions_lock while history_lock is held (or vice versa).
+        if reject_active and _child_run_active(session_key):
+            return False
+        if sid is not None:
+            with _sessions_lock:
+                if _sessions.get(sid) is not session:
+                    return False
+
+        with history_lock:
+            current = session.get("active_session_lease")
+            token_matches = (
+                expected_lease_token is None
+                or getattr(current, "lease_id", None) == expected_lease_token
+            )
+            if current is not expected_lease or not token_matches:
+                return False
+            if reject_active and session.get("running"):
+                return False
+            session.pop("active_session_lease", None)
+
+        try:
+            expected_lease.release()
+        except BaseException as exc:
+            # Keep the exact lease attached when the canonical global release
+            # fails so teardown/orphan reconciliation can retry it.  This is
+            # outside both coordination locks and never masks a prompt error.
+            with history_lock:
+                if session.get("active_session_lease") is None:
+                    session["active_session_lease"] = expected_lease
+            logger.warning(
+                "Failed to release prompt active-session lease: sid=%s error=%s",
+                sid,
+                exc,
+            )
+            return False
+        return True
+    except BaseException as exc:
+        logger.warning(
+            "Prompt active-session lease validation failed: sid=%s error=%s",
+            sid,
+            exc,
+        )
+        return False
+
+
+def _release_prompt_active_session_slot(
+    sid: str,
+    session: dict,
+    lease,
+    *,
+    lease_token=None,
+) -> bool:
+    """Best-effort exact cleanup for a prompt rejected by live control."""
+    if lease is None:
+        return True
+    try:
+        return _release_active_session_slot(
+            session,
+            sid=sid,
+            expected_lease=lease,
+            expected_lease_token=lease_token,
+            reject_active=True,
+        )
+    except BaseException as exc:
+        # A patched/canonical helper must not turn the stable 4009 busy result
+        # into a provider/history mutation or mask an original BaseException.
+        logger.warning(
+            "Prompt active-session lease cleanup failed: sid=%s error=%s",
+            sid,
+            exc,
+        )
+        return False
 
 
 def _transfer_active_session_slot(
