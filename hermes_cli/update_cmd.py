@@ -752,6 +752,457 @@ def _find_unfinished_release_transaction(
     return None
 
 
+def _recovery_safe_text(value: object, *, limit: int = 4096) -> str | None:
+    """Return journal text that is safe to display, or ``None``.
+
+    Journals survive hard kills and are local input, not trusted program state.
+    In particular, do not let a newline, terminal control, or an overlong value
+    turn recovery output into a second command or an opaque dump of the journal.
+    """
+
+    if not isinstance(value, str) or not value or len(value) > limit:
+        return None
+    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in value):
+        return None
+    return value
+
+
+def _recovery_sha(value: object) -> str | None:
+    if not isinstance(value, str) or not _SHA_RE.fullmatch(value):
+        return None
+    return value.lower()
+
+
+def _recovery_ref(value: object) -> str | None:
+    """Validate a full Git ref without executing Git from the formatter."""
+
+    value = _recovery_safe_text(value)
+    if value is None or not value.startswith("refs/"):
+        return None
+    if value.endswith("/") or "//" in value or ".." in value or "@{" in value:
+        return None
+    if any(char in value for char in " ~^:?*[\\"):
+        return None
+    components = value.split("/")
+    if len(components) < 2:
+        return None
+    for component in components:
+        if (
+            not component
+            or component in {".", ".."}
+            or component.startswith(".")
+            or component.endswith(".")
+            or component.endswith(".lock")
+        ):
+            return None
+    return value
+
+
+def _recovery_branch(value: object) -> str | None:
+    """Validate a short branch name before putting it in a Git command."""
+
+    value = _recovery_safe_text(value)
+    if value is None or value.startswith("-") or value.startswith("refs/"):
+        return None
+    return value if _recovery_ref(f"refs/heads/{value}") else None
+
+
+def _recovery_absolute_path(value: object) -> Path | None:
+    value = _recovery_safe_text(value)
+    if value is None or not os.path.isabs(value):
+        return None
+    return Path(os.path.normpath(value))
+
+
+def _recovery_candidate_root(journal_path: Path) -> Path | None:
+    """Derive the sibling candidate root from the journal's Git common dir."""
+
+    path = _recovery_absolute_path(str(journal_path))
+    if path is None:
+        return None
+    # <common>/hermes-upgrade-transactions/<transaction>/journal.json
+    common = path.parent.parent.parent
+    return common.parent.parent
+
+
+def _recovery_candidate_path(journal_path: Path, value: object) -> Path | None:
+    """Accept only a direct child of the transaction's expected candidate root."""
+
+    candidate = _recovery_absolute_path(value)
+    expected_root = _recovery_candidate_root(journal_path)
+    if candidate is None or expected_root is None:
+        return None
+    if candidate.parent != expected_root or candidate == expected_root:
+        return None
+    return candidate
+
+
+_RECOVERY_PHASES = frozenset(
+    {
+        "prepared",
+        "journal-created",
+        "payload-persisted",
+        "payload-integrity-failed",
+        "stash-capture-started",
+        "stash-capture-verifying",
+        "stash-capture-uncertain",
+        "stash-captured",
+        "stashed",
+        "no-stash",
+        "stash-pending",
+        "backup-failed",
+        "backup-created",
+        "candidate-create-failed",
+        "candidate-created",
+        "candidate-validated",
+        "promoting",
+        "promotion-needs-recovery",
+        "promotion-uncertain",
+        "promoted",
+        "candidate-cleanup",
+        "candidate-cleanup-failed",
+        "finalizing",
+        "stash-restore-conflict",
+        "stash-restore-failed",
+        "stash-drop-failed",
+        "stash-drop-unverified",
+        "finalized",
+    }
+)
+
+
+def _recovery_command(*parts: object) -> str:
+    return "$ " + " ".join(shlex.quote(str(part)) for part in parts)
+
+
+def _recovery_stash_list_command(marker: str) -> str:
+    # Keep the format literal and quote only the journal-derived marker.
+    return (
+        "$ git stash list --format='%gd %H %s' | grep -F -- "
+        + shlex.quote(marker)
+    )
+
+
+def _format_release_transaction_recovery_guidance(
+    journal_path: Path | str,
+    journal: dict,
+    *,
+    repo_root: Path | str,
+) -> str:
+    """Format immutable, phase-aware recovery guidance without side effects.
+
+    This function deliberately performs no Git or filesystem operations.  Every
+    value interpolated into a command is validated locally and shell-quoted;
+    malformed journal fields become ``unavailable`` instead of becoming a
+    recovery command.  The uncertain-capture branch is intentionally terminal:
+    it emits inspection commands only.
+    """
+
+    if not isinstance(journal, dict):
+        return (
+            "Recovery guidance unavailable: the unfinished release journal is "
+            "not a JSON object. Preserve the journal and do not run cleanup."
+        )
+
+    journal_path = Path(journal_path)
+    journal_display = _recovery_safe_text(str(journal_path))
+    journal_display = journal_display or "<unavailable>"
+    journal_command_path = (
+        shlex.quote(journal_display) if journal_display != "<unavailable>" else None
+    )
+    repo_display = _recovery_safe_text(str(repo_root)) or "<unavailable>"
+    phase_raw = journal.get("phase") if "phase" in journal else journal.get("state")
+    phase = _recovery_safe_text(phase_raw)
+    if phase not in _RECOVERY_PHASES:
+        phase = None
+    phase_key = phase or ""
+
+    original_branch = _recovery_branch(journal.get("original_branch"))
+    original_branch_present = "original_branch" in journal
+    original_head_sha = _recovery_sha(journal.get("original_head_sha"))
+    original_ref = (
+        _recovery_ref(journal.get("original_ref"))
+        if "original_ref" in journal
+        else None
+    )
+    if original_branch is not None and "original_ref" in journal:
+        if original_ref != f"refs/heads/{original_branch}":
+            original_branch = None
+    elif original_branch_present and journal.get("original_branch") is None:
+        if journal.get("original_ref") not in (None, ""):
+            original_head_sha = None
+    maintenance_branch = _recovery_branch(journal.get("maintenance_branch"))
+    maintenance_old_raw = (
+        journal.get("maintenance_old_sha")
+        if "maintenance_old_sha" in journal
+        else journal.get("old_sha")
+    )
+    maintenance_old_sha = _recovery_sha(maintenance_old_raw)
+    candidate_sha = _recovery_sha(journal.get("candidate_sha"))
+    current_sha = _recovery_sha(journal.get("current_sha"))
+    current_or_candidate_sha = current_sha or candidate_sha
+    target_sha = _recovery_sha(journal.get("target_sha"))
+
+    if "maintenance_ref" in journal:
+        maintenance_ref = _recovery_ref(journal.get("maintenance_ref"))
+    elif maintenance_branch is not None:
+        maintenance_ref = f"refs/heads/{maintenance_branch}"
+    else:
+        maintenance_ref = None
+    if (
+        maintenance_ref is not None
+        and maintenance_branch is not None
+        and maintenance_ref != f"refs/heads/{maintenance_branch}"
+    ):
+        maintenance_ref = None
+    backup_ref = _recovery_ref(journal.get("backup_ref"))
+    candidate_branch = _recovery_branch(journal.get("candidate_branch"))
+    candidate_path = _recovery_candidate_path(journal_path, journal.get("candidate_path"))
+    repo_path = _recovery_absolute_path(str(repo_root))
+    if candidate_path is not None and repo_path is not None and candidate_path == repo_path:
+        candidate_path = None
+
+    marker = _recovery_safe_text(journal.get("stash_marker"))
+    stash_sha = _recovery_sha(journal.get("stash_sha"))
+    capture_required = journal.get("stash_capture_required")
+    capture_confirmed_raw = journal.get("stash_capture_confirmed")
+    capture_uncertain_raw = journal.get("stash_capture_uncertain")
+    capture_confirmed = capture_confirmed_raw is True
+    capture_uncertain_flag = capture_uncertain_raw is True
+    local_state_present = journal.get("local_state_present")
+    stash_pending_raw = journal.get("stash_pending")
+    stash_pending = stash_pending_raw is True
+    stash_apply_attempted = journal.get("stash_apply_attempted") is True
+    stash_applied = journal.get("stash_applied") is True
+
+    # Unknown local state is handled like present local state.  The only state
+    # that authorizes destructive recovery without a confirmed stash is an
+    # explicit, durably recorded ``False``.
+    capture_uncertain = (
+        capture_uncertain_flag
+        or (
+            local_state_present is not False
+            and (not capture_confirmed or stash_sha is None)
+        )
+        or (capture_required is True and not capture_confirmed)
+        or (stash_pending and (not capture_confirmed or stash_sha is None))
+    )
+    destructive_recovery_blocked = capture_uncertain
+
+    post_cas_phases = {
+        "promoting",
+        "promotion-needs-recovery",
+        "promotion-uncertain",
+        "promoted",
+        "candidate-cleanup",
+        "candidate-cleanup-failed",
+        "finalizing",
+        "stash-restore-conflict",
+        "stash-restore-failed",
+        "stash-drop-failed",
+        "stash-drop-unverified",
+        "finalized",
+    }
+    post_cas = phase_key in post_cas_phases
+    stash_conflict = stash_pending and stash_apply_attempted and not stash_applied
+    cleanup_unresolved = phase_key in {
+        "candidate-cleanup-failed",
+        "candidate-cleanup",
+    } or (
+        journal.get("candidate_created") is True
+        and journal.get("candidate_cleanup") is not True
+        and post_cas
+    )
+
+    def field(label: str, value: object, *, quote: bool = False) -> None:
+        if value is None:
+            lines.append(f"{label}: unavailable (invalid journal value)")
+        else:
+            rendered = shlex.quote(str(value)) if quote else str(value)
+            lines.append(f"{label}: {rendered}")
+
+    lines = [
+        "Unfinished release transaction recovery guidance (no commands were executed):",
+        f"journal: {journal_display}",
+        f"phase: {phase or 'unavailable (invalid journal value)'}",
+        f"repo root: {repo_display}",
+    ]
+    if original_branch_present and journal.get("original_branch") is None:
+        lines.append("original checkout: detached HEAD")
+    elif original_branch is not None:
+        lines.append(f"original checkout: branch {original_branch}")
+    else:
+        lines.append("original checkout: symbolic branch unavailable (invalid journal value)")
+    field("original HEAD SHA", original_head_sha)
+    field("maintenance ref", maintenance_ref)
+    field("maintenance old SHA", maintenance_old_sha)
+    field("target SHA", target_sha)
+    field("current/candidate SHA", current_or_candidate_sha)
+    field("candidate SHA", candidate_sha)
+    field("backup ref", backup_ref)
+    field("candidate path", candidate_path, quote=True)
+    field("candidate branch", candidate_branch)
+    field("stash marker", marker, quote=True)
+    field(
+        "local state present",
+        local_state_present if isinstance(local_state_present, bool) else None,
+    )
+    field(
+        "stash capture required",
+        capture_required if isinstance(capture_required, bool) else None,
+    )
+    field(
+        "stash capture confirmed",
+        capture_confirmed_raw if isinstance(capture_confirmed_raw, bool) else None,
+    )
+    field(
+        "stash capture uncertain",
+        capture_uncertain_raw if isinstance(capture_uncertain_raw, bool) else None,
+    )
+    field("stash pending", stash_pending_raw if isinstance(stash_pending_raw, bool) else None)
+    field("stash SHA", stash_sha)
+
+    known_objects: list[str] = []
+    for value in (original_head_sha, maintenance_old_sha, target_sha, candidate_sha, backup_ref):
+        if value is not None and value not in known_objects:
+            known_objects.append(value)
+
+    def add_inspection_commands(*, include_stash: bool) -> None:
+        lines.append("Nondestructive inspection commands:")
+        lines.append(_recovery_command("git", "status", "--short"))
+        if marker is not None:
+            lines.append(_recovery_stash_list_command(marker))
+        else:
+            lines.append("Stash-list marker command unavailable (invalid journal value).")
+        objects = list(known_objects)
+        if include_stash and stash_sha is not None:
+            objects.append(stash_sha)
+        seen: set[str] = set()
+        for value in objects:
+            if value in seen:
+                continue
+            seen.add(value)
+            lines.append(_recovery_command("git", "show", "--stat", value))
+
+    def add_original_checkout() -> bool:
+        if original_branch is not None:
+            lines.append(_recovery_command("git", "checkout", "--force", original_branch))
+            return True
+        if original_branch_present and journal.get("original_branch") is None and original_head_sha:
+            lines.append(_recovery_command("git", "checkout", "--detach", original_head_sha))
+            return True
+        lines.append("Original checkout command unavailable (invalid journal identity).")
+        return False
+
+    def add_stash_apply() -> bool:
+        if not stash_pending:
+            return False
+        if not capture_confirmed or capture_uncertain_flag or stash_sha is None:
+            lines.append("Immutable stash apply command unavailable; do not use a movable stash selector.")
+            return False
+        lines.append(_recovery_command("git", "stash", "apply", "--index", stash_sha))
+        return True
+
+    if capture_uncertain:
+        lines.extend(
+            [
+                "SAFETY STOP: stash capture is uncertain or has no verified immutable SHA while local state may be present.",
+                "DO NOT run destructive checkout/reset/clean/stash apply/drop cleanup commands.",
+                "Preserve the exact journal above and do not archive, rename, or delete it yet.",
+            ]
+        )
+        add_inspection_commands(include_stash=False)
+        lines.append("Only the inspection commands above are authorized until capture is independently verified.")
+        return "\n".join(lines)
+
+    if phase is None:
+        lines.extend(
+            [
+                "SAFETY STOP: transaction phase is unavailable or invalid; no recovery mutators are authorized.",
+                "Preserve the exact journal above and use inspection output only until a trusted phase is established.",
+            ]
+        )
+        add_inspection_commands(include_stash=capture_confirmed and stash_sha is not None)
+        return "\n".join(lines)
+
+    if post_cas:
+        lines.append("Recovery class: post-CAS/promotion state; verify identities before every write.")
+        add_inspection_commands(include_stash=True)
+        if destructive_recovery_blocked:
+            lines.append("Destructive rollback and checkout/reset commands are withheld until stash capture is confirmed.")
+        elif maintenance_ref and maintenance_old_sha and candidate_sha:
+            lines.append(
+                "1. Only if the maintenance ref currently resolves to the candidate SHA, run this exact CAS rollback:"
+            )
+            lines.append(_recovery_command("git", "update-ref", maintenance_ref, maintenance_old_sha, candidate_sha))
+            if maintenance_branch:
+                lines.append(
+                    "2. After the CAS succeeds, and only after confirmed stash capture "
+                    "(or no local state was present):"
+                )
+                lines.append(_recovery_command("git", "checkout", "--force", maintenance_branch))
+                lines.append(_recovery_command("git", "reset", "--hard", maintenance_old_sha))
+            else:
+                lines.append("Maintenance checkout/reset commands unavailable (invalid branch value).")
+            lines.append("3. Restore the original checkout only after verifying the current ref identity:")
+            original_restored = add_original_checkout()
+            if original_restored and original_branch and original_head_sha:
+                lines.append(_recovery_command("git", "reset", "--hard", original_head_sha))
+            if stash_pending:
+                lines.append("4. After the checkout identity is verified, apply the immutable stash:")
+                add_stash_apply()
+        else:
+            lines.append("CAS rollback command unavailable: maintenance ref, old SHA, or candidate SHA is invalid.")
+    else:
+        lines.append("Recovery class: pre-promotion; verify the original checkout identity before applying user state.")
+        add_inspection_commands(include_stash=True)
+        if original_branch or (original_branch_present and journal.get("original_branch") is None and original_head_sha):
+            lines.append("After verifying the original checkout identity, restore it:")
+            add_original_checkout()
+        if stash_pending:
+            lines.append("Apply user state only after verifying the original checkout identity:")
+            add_stash_apply()
+
+    if stash_conflict and not capture_uncertain:
+        lines.append("Stash restore remains unresolved; do not clean any stash reflog entry yet.")
+        if capture_confirmed and stash_sha:
+            lines.append("verify files and index before any stash reflog cleanup; never use stash@{N}:")
+            if not any(
+                line == _recovery_command("git", "stash", "apply", "--index", stash_sha)
+                for line in lines
+            ):
+                lines.append(_recovery_command("git", "stash", "apply", "--index", stash_sha))
+        else:
+            lines.append("Immutable stash apply command unavailable until a verified SHA exists.")
+
+    if cleanup_unresolved:
+        lines.append("Candidate cleanup is unresolved; inspect it only after live checkout and stash recovery verification:")
+        lines.append(_recovery_command("git", "worktree", "list", "--porcelain"))
+        if candidate_path is not None:
+            lines.append(_recovery_command("git", "-C", candidate_path, "status", "--short"))
+        else:
+            lines.append("Candidate status command unavailable (invalid candidate path).")
+        if candidate_path is not None and candidate_branch is not None:
+            lines.append("OPTIONAL final cleanup, only after live checkout and user-file/stash recovery are verified:")
+            lines.append(_recovery_command("git", "worktree", "remove", "--force", "--", candidate_path))
+            lines.append(_recovery_command("git", "branch", "-D", "--", candidate_branch))
+        else:
+            lines.append("Optional candidate removal commands withheld because a candidate path or branch is invalid.")
+
+    if journal_command_path is not None:
+        resolved_journal = shlex.quote(f"{journal_path}.resolved")
+        lines.extend(
+            [
+                "Final journal acknowledgment: only after live checkout and user files are verified, archive/rename the journal; never auto-delete it:",
+                f"$ mv -- {journal_command_path} {resolved_journal}",
+                "On platforms without POSIX mv, use the platform's equivalent rename to the same .resolved path after verification.",
+            ]
+        )
+    else:
+        lines.append("Final journal acknowledgment command unavailable; preserve the journal and do not delete it.")
+    return "\n".join(lines)
+
+
 def _reject_unfinished_release_transaction(
     git_cmd: list[str], cwd: Path | str
 ) -> None:
@@ -759,11 +1210,13 @@ def _reject_unfinished_release_transaction(
     if found is None:
         return
     journal_path, journal = found
-    phase = journal.get("phase") or journal.get("state") or "unknown"
+    guidance = _format_release_transaction_recovery_guidance(
+        journal_path, journal, repo_root=Path(cwd).absolute()
+    )
     raise RuntimeError(
         "An unfinished release transaction is already recorded at "
-        f"{journal_path} (phase={phase}); recover it before starting another "
-        "release upgrade."
+        f"{journal_path}; recover it before starting another release upgrade.\n\n"
+        f"{guidance}"
     )
 
 
