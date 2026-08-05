@@ -197,17 +197,21 @@ def execute_micro_command(
     except (TypeError, ValueError):
         return MICRO_COMPACT_USAGE
 
-    if not isinstance(session_id, str) or not session_id.strip():
-        return "Micro-compaction error: a non-empty exact session ID is required"
-    if session_db is None:
-        return "Micro-compaction error: session database is not available"
-
     try:
         global_value = _global_config_value(config_loader or load_config_readonly)
     except Exception as exc:
         return _error(_CONFIG_ERROR, exc)
 
     if command == "status":
+        # A missing route/session or unavailable DB has no possible override.
+        # Keep status read-only and report the source profile's global value
+        # without opening, creating, or querying a database.
+        if (
+            not isinstance(session_id, str)
+            or not session_id.strip()
+            or session_db is None
+        ):
+            return _status(global_value, None)
         try:
             session_meta = _read_session(session_db, session_id)
             session_override = (
@@ -218,6 +222,11 @@ def execute_micro_command(
         except Exception as exc:
             return _error(_DB_ERROR, exc)
         return _status(global_value, session_override)
+
+    if not isinstance(session_id, str) or not session_id.strip():
+        return "Micro-compaction error: a non-empty exact session ID is required"
+    if session_db is None:
+        return "Micro-compaction error: session database is not available"
 
     if ensure_session is None and agent is not None:
         ensure_session = getattr(agent, "_ensure_db_session", None)

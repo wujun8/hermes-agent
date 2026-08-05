@@ -141,6 +141,73 @@ def test_status_is_read_only_and_missing_row_means_inherit(db):
     assert missing.context_compressor.calls == []
 
 
+def test_status_without_session_id_or_db_reads_global_only():
+    config_calls: list[str] = []
+
+    def config_loader():
+        config_calls.append("config")
+        return {"compression": {"micro_compact": True}}
+
+    class _UnexpectedDBRead:
+        def get_session(self, _session_id):
+            raise AssertionError("status must not read a DB without an exact ID")
+
+    for session_db, session_id in ((_UnexpectedDBRead(), ""), (None, "existing-id")):
+        result = execute_micro_command(
+            agent=None,
+            session_db=session_db,
+            session_id=session_id,
+            raw_args="status",
+            config_loader=config_loader,
+        )
+        assert "Micro-compaction: ON" in result
+        assert "global (inherited)" in result
+
+    assert config_calls == ["config", "config"]
+
+
+def test_status_config_failure_is_reported_without_db_access():
+    class _UnexpectedDBRead:
+        def get_session(self, _session_id):
+            raise AssertionError("config failure must happen before any DB read")
+
+    result = execute_micro_command(
+        agent=None,
+        session_db=_UnexpectedDBRead(),
+        session_id="",
+        raw_args="status",
+        config_loader=lambda: (_ for _ in ()).throw(RuntimeError("config unavailable")),
+    )
+
+    assert "could not read global configuration" in result
+    assert "config unavailable" in result
+
+
+def test_mutations_still_require_exact_id_and_database():
+    ensure_calls: list[str] = []
+
+    missing_id = execute_micro_command(
+        agent=None,
+        session_db=object(),
+        session_id="",
+        raw_args="on",
+        ensure_session=lambda: ensure_calls.append("ensure"),
+        config_loader=lambda: {"compression": {"micro_compact": False}},
+    )
+    missing_db = execute_micro_command(
+        agent=None,
+        session_db=None,
+        session_id="existing-id",
+        raw_args="off",
+        ensure_session=lambda: ensure_calls.append("ensure"),
+        config_loader=lambda: {"compression": {"micro_compact": False}},
+    )
+
+    assert missing_id == "Micro-compaction error: a non-empty exact session ID is required"
+    assert missing_db == "Micro-compaction error: session database is not available"
+    assert ensure_calls == []
+
+
 def test_invalid_or_bare_command_has_no_db_or_runtime_mutation(db):
     session_id = "micro-invalid"
     db.create_session(session_id, source="cli", model_config={"keep": 1})

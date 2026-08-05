@@ -8,10 +8,10 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from gateway.config import Platform
+from gateway.config import GatewayConfig, Platform
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.run import GatewayRunner
-from gateway.session import SessionSource
+from gateway.session import AsyncSessionStore, SessionSource, SessionStore
 from hermes_cli.commands import resolve_command
 from hermes_state import SessionDB
 
@@ -20,11 +20,17 @@ class _Store:
     def __init__(self, entries: dict[tuple, str]):
         self.entries = entries
         self.calls: list[SessionSource] = []
+        self.peek_calls: list[str] = []
+        self.session_key_entries: dict[str, str] = {}
         self._store = None
 
     async def get_or_create_session(self, source):
         self.calls.append(source)
         return SimpleNamespace(session_id=self.entries[self._key(source)])
+
+    async def peek_session_id(self, session_key):
+        self.peek_calls.append(session_key)
+        return self.session_key_entries.get(session_key)
 
     @staticmethod
     def _key(source: SessionSource) -> tuple:
@@ -34,6 +40,16 @@ class _Store:
             source.chat_id,
             source.thread_id,
         )
+
+
+class _CountingCache(dict):
+    def __init__(self):
+        super().__init__()
+        self.get_calls = 0
+
+    def get(self, *args, **kwargs):
+        self.get_calls += 1
+        return super().get(*args, **kwargs)
 
 
 class _Engine:
@@ -94,9 +110,14 @@ def _runner(
     runner._async_session_store = _Store(entries)
     runner._async_session_store._store = runner.session_store
     runner._session_db = SimpleNamespace(_db=db)
-    runner._agent_cache = {}
+    runner._agent_cache = _CountingCache()
     runner._agent_cache_lock = threading.RLock()
     route_keys = route_keys or {}
+    runner.config = SimpleNamespace(multiplex_profiles=False)
+    runner._async_session_store.session_key_entries = {
+        route_keys.get(key[2], f"route:{key[2]}"): session_id
+        for key, session_id in entries.items()
+    }
     runner._session_key_for_source = lambda source: route_keys.get(
         source.chat_id, f"route:{source.chat_id}"
     )
@@ -219,7 +240,7 @@ async def test_cached_identity_mismatch_or_empty_refuses_without_mutation(
 
 
 @pytest.mark.asyncio
-async def test_invalid_and_bare_commands_do_not_mutate_row_or_engine(db):
+async def test_invalid_and_bare_commands_do_not_mutate_row_or_engine(db, monkeypatch):
     source = _source()
     session_id = "invalid-session"
     db.create_session(
@@ -242,6 +263,44 @@ async def test_invalid_and_bare_commands_do_not_mutate_row_or_engine(db):
     assert db.get_session(session_id)["model_config"] == '{"keep": "original"}'
     assert agent._ensure_calls == 0
     assert agent.context_compressor.calls == []
+    assert runner._async_session_store.calls == []
+    assert runner._async_session_store.peek_calls == []
+    assert getattr(runner._agent_cache, "get_calls") == 0
+
+
+@pytest.mark.asyncio
+async def test_status_unknown_route_peeks_without_creating_or_reading_cache(db):
+    source = _source("unknown-chat")
+    runner = _runner(db, {})
+
+    result = await runner._handle_micro_command(_event(source, "status"))
+
+    assert "global (inherited)" in result
+    assert runner._async_session_store.peek_calls == ["route:unknown-chat"]
+    assert runner._async_session_store.calls == []
+    assert db.get_session("unknown-session") is None
+
+
+@pytest.mark.asyncio
+async def test_status_existing_route_peeks_exact_id_without_creating(db):
+    source = _source("status-chat")
+    session_id = "status-exact-session"
+    db.create_session(
+        session_id,
+        source="telegram",
+        user_id="user-a",
+        chat_id="status-chat",
+        chat_type="dm",
+        model_config={"micro_compact_override": True},
+    )
+    runner = _runner(db, _entry_map((source, session_id)))
+
+    result = await runner._handle_micro_command(_event(source, "status"))
+
+    assert "Micro-compaction: ON" in result
+    assert "Source: session" in result
+    assert runner._async_session_store.peek_calls == ["route:status-chat"]
+    assert runner._async_session_store.calls == []
 
 
 @pytest.mark.asyncio
@@ -384,3 +443,175 @@ async def test_handler_returns_stable_error_for_empty_durable_id(db):
 
     assert result == "Micro-compaction error: a non-empty exact session ID is required"
     assert db.get_session("") is None
+
+
+@pytest.mark.asyncio
+async def test_real_async_session_store_status_and_invalid_do_not_create_route(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / "hermes-home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    import hermes_state
+
+    monkeypatch.setattr(
+        hermes_state,
+        "DEFAULT_DB_PATH",
+        hermes_state._IMPORT_DEFAULT_DB_PATH,
+    )
+    config = GatewayConfig(sessions_dir=home / "sessions")
+    store = SessionStore(config.sessions_dir, config)
+
+    runner = object.__new__(GatewayRunner)
+    runner.session_store = store
+    runner._async_session_store = AsyncSessionStore(store)
+    runner._session_db = SimpleNamespace(_db=store._db)
+    runner.config = config
+    runner._agent_cache = _CountingCache()
+    runner._agent_cache_lock = threading.RLock()
+    runner._session_key_for_source = store._generate_session_key
+    source = _source("real-unknown")
+
+    try:
+        invalid = await runner._handle_micro_command(_event(source, "maybe"))
+        status = await runner._handle_micro_command(_event(source, "status"))
+        session_key = runner._session_key_for_source(source)
+
+        assert "Usage: /micro on|off|inherit|status" in invalid
+        assert "global (inherited)" in status
+        assert await runner._async_session_store.peek_session_id(session_key) is None
+        assert store._db.get_session("real-unknown-session") is None
+        assert not (home / "sessions" / "sessions.json").exists()
+        assert getattr(runner._agent_cache, "get_calls") == 0
+    finally:
+        store._db.close()
+
+
+def _write_micro_config(home, enabled: bool) -> None:
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.yaml").write_text(
+        "compression:\n"
+        f"  micro_compact: {'true' if enabled else 'false'}\n",
+        encoding="utf-8",
+    )
+
+
+@pytest.mark.asyncio
+async def test_secondary_cold_micro_uses_profile_db_and_config(tmp_path, monkeypatch):
+    default_home = tmp_path / "default"
+    secondary_home = tmp_path / "secondary"
+    _write_micro_config(default_home, False)
+    _write_micro_config(secondary_home, True)
+    monkeypatch.setenv("HERMES_HOME", str(default_home))
+    import hermes_state
+
+    monkeypatch.setattr(
+        hermes_state,
+        "DEFAULT_DB_PATH",
+        hermes_state._IMPORT_DEFAULT_DB_PATH,
+    )
+    from hermes_cli.config import load_config_readonly as real_load_config_readonly
+
+    monkeypatch.setattr(
+        "hermes_cli.micro_command.load_config_readonly",
+        real_load_config_readonly,
+    )
+    default_db = SessionDB(db_path=default_home / "state.db")
+    session_id = "same-session-id"
+    default_db.create_session(
+        session_id,
+        source="telegram",
+        user_id="user-a",
+        chat_id="secondary-chat",
+        chat_type="dm",
+        model_config={"micro_compact_override": False},
+    )
+    source = _source("secondary-chat")
+    runner = _runner(default_db, _entry_map((source, session_id)))
+    runner.config = SimpleNamespace(multiplex_profiles=True)
+    runner._resolve_profile_home_for_source = lambda _source: secondary_home
+
+    try:
+        saved = await runner._handle_micro_command(_event(source, "on"))
+        profile_db = SessionDB(db_path=secondary_home / "state.db")
+        try:
+            assert _override(profile_db, session_id) is True
+        finally:
+            profile_db.close()
+        existing_status = await runner._handle_micro_command(_event(source, "status"))
+        await runner._handle_micro_command(_event(source, "off"))
+        inherited = await runner._handle_micro_command(_event(source, "inherit"))
+        global_status = await runner._handle_micro_command(
+            _event(_source("secondary-global"), "status")
+        )
+
+        assert "Micro-compaction override saved: ON" in saved
+        assert "Source: session" in existing_status
+        assert "Micro-compaction: ON" in existing_status
+        assert "global (inherited)" in inherited
+        assert "Micro-compaction: ON" in global_status
+        assert "global (inherited)" in global_status
+
+        profile_db = SessionDB(db_path=secondary_home / "state.db")
+        try:
+            assert _override(profile_db, session_id) is None
+            assert _override(default_db, session_id) is False
+        finally:
+            profile_db.close()
+    finally:
+        default_db.close()
+
+
+@pytest.mark.asyncio
+async def test_secondary_live_micro_uses_bound_profile_db_and_config(tmp_path, monkeypatch):
+    default_home = tmp_path / "default-live"
+    secondary_home = tmp_path / "secondary-live"
+    _write_micro_config(default_home, False)
+    _write_micro_config(secondary_home, True)
+    monkeypatch.setenv("HERMES_HOME", str(default_home))
+    import hermes_state
+
+    monkeypatch.setattr(
+        hermes_state,
+        "DEFAULT_DB_PATH",
+        hermes_state._IMPORT_DEFAULT_DB_PATH,
+    )
+    from hermes_cli.config import load_config_readonly as real_load_config_readonly
+
+    monkeypatch.setattr(
+        "hermes_cli.micro_command.load_config_readonly",
+        real_load_config_readonly,
+    )
+    default_db = SessionDB(db_path=default_home / "state.db")
+    profile_db = SessionDB(db_path=secondary_home / "state.db")
+    session_id = "live-same-session-id"
+    for current_db, override in ((default_db, False), (profile_db, None)):
+        current_db.create_session(
+            session_id,
+            source="telegram",
+            user_id="user-a",
+            chat_id="live-secondary-chat",
+            chat_type="dm",
+            model_config=(
+                {"micro_compact_override": override}
+                if override is not None
+                else {}
+            ),
+        )
+    source = _source("live-secondary-chat")
+    runner = _runner(default_db, _entry_map((source, session_id)))
+    runner.config = SimpleNamespace(multiplex_profiles=True)
+    runner._resolve_profile_home_for_source = lambda _source: secondary_home
+    agent = _Agent(profile_db, session_id)
+    runner._agent_cache[runner._session_key_for_source(source)] = agent
+
+    try:
+        result = await runner._handle_micro_command(_event(source, "on"))
+
+        assert "Micro-compaction override saved: ON" in result
+        assert _override(profile_db, session_id) is True
+        assert _override(default_db, session_id) is False
+        assert agent.context_compressor.calls == [(True, True)]
+    finally:
+        profile_db.close()
+        default_db.close()
