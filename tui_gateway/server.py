@@ -38,7 +38,11 @@ from utils import is_truthy_value
 from tools.environments.local import hermes_subprocess_env
 from agent.replay_cleanup import sanitize_replay_history
 from agent.skill_commands import describe_skill_invocation
-from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
+from agent.conversation_loop import (
+    API_OUTAGE_RECOVERY_RESUME_REASON,
+    INTERRUPT_WAITING_FOR_MODEL_PREFIX,
+    should_auto_resume_api_outage_result,
+)
 from tui_gateway import git_probe
 from tui_gateway.turn_marker import (
     clear_turn_marker,
@@ -8461,6 +8465,16 @@ def _auto_continue_note(prompt: str) -> str:
     )
 
 
+def _api_outage_recovery_note() -> str:
+    return (
+        "[System note: The previous turn was interrupted while waiting for "
+        "an API outage to recover. Review the conversation history and "
+        "current workspace state, then CONTINUE the interrupted task to "
+        "completion. Do not repeat tool calls whose results are already "
+        "recorded.]"
+    )
+
+
 def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> dict | None:
     """Kick off a continuation turn for a crash-interrupted session.
 
@@ -8486,7 +8500,11 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
         return None
     session["_auto_continue_scheduled"] = True
     attempt = marker["attempts"] + 1
-    text = _auto_continue_note(marker["prompt"])
+    text = (
+        _api_outage_recovery_note()
+        if marker.get("resume_reason") == API_OUTAGE_RECOVERY_RESUME_REASON
+        else _auto_continue_note(marker["prompt"])
+    )
 
     def kickoff() -> None:
         rid = f"__auto_continue__{int(time.time() * 1000)}"
@@ -10632,6 +10650,8 @@ def _run_prompt_submit(
         secret_token = None
         goal_followup = None  # set by the post-turn goal hook below
         result = None  # turn outcome; read after the finally for leftover /steer
+        api_recovery_auto_continue = False
+        api_recovery_marker_key = ""
         tts_queue = None  # streaming-TTS feed for this turn (voice mode)
         thinking_started = False  # ambient thinking sound armed for this turn
         one_turn_restore = session.pop("one_turn_model_restore", None)
@@ -11043,6 +11063,7 @@ def _run_prompt_submit(
                     if result.get("interrupted")
                     else "error" if result.get("error") else "complete"
                 )
+                api_recovery_auto_continue = should_auto_resume_api_outage_result(result)
                 # When the backend produced no visible response AND reported a
                 # real error (e.g. invalid model slug → provider 4xx), surface
                 # that error as the visible text instead of shipping an empty
@@ -11106,7 +11127,22 @@ def _run_prompt_submit(
                     (result.get("error") if isinstance(result, dict) else "") or raw
                 )
                 payload["recoverable"] = True
-            _retire_turn_marker(session, marker_key)
+            if api_recovery_auto_continue:
+                # This interruption is a resumable boundary, not a concluded
+                # user cancellation. Keep a reason-aware marker and schedule
+                # it after ``running`` is released in the finally below.
+                api_recovery_marker_key = str(session.get("session_key") or marker_key)
+                record_turn_start(
+                    marker_home,
+                    api_recovery_marker_key,
+                    marker_text,
+                    attempts=marker_attempt,
+                    resume_reason=API_OUTAGE_RECOVERY_RESUME_REASON,
+                )
+                if marker_key and marker_key != api_recovery_marker_key:
+                    clear_turn_marker(marker_home, marker_key)
+            else:
+                _retire_turn_marker(session, marker_key)
             _emit("message.complete", sid, payload)
 
             # ── /goal continuation (Ralph-style loop) ─────────────────
@@ -11339,7 +11375,8 @@ def _run_prompt_submit(
                     _clear_inflight_turn(session)
             # Backstop for turns that never reached a terminal frame (the
             # frame paths retire the marker as they emit).
-            _retire_turn_marker(session, marker_key)
+            if not api_recovery_auto_continue:
+                _retire_turn_marker(session, marker_key)
             session.pop("_auto_continue_scheduled", None)
             _emit_settled_session_info(sid, session, agent)
 
@@ -11357,6 +11394,14 @@ def _run_prompt_submit(
             with session["history_lock"]:
                 _enqueue_prompt(session, _leftover_steer, session.get("transport"))
         if _drain_queued_prompt(rid, sid, session):
+            return
+
+        if api_recovery_auto_continue:
+            _maybe_schedule_auto_continue(
+                sid,
+                session,
+                api_recovery_marker_key or marker_key,
+            )
             return
 
         # Chain a goal-continuation turn if the judge said so. We do

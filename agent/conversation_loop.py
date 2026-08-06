@@ -94,6 +94,22 @@ logger = logging.getLogger(__name__)
 # cancelled while waiting on the provider. Surfaces (ACP, TUI) match on this
 # to treat it as cancellation metadata rather than assistant prose.
 INTERRUPT_WAITING_FOR_MODEL_PREFIX = "Operation interrupted: waiting for model response ("
+API_OUTAGE_RECOVERY_RESUME_REASON = "api_outage_recovery"
+
+
+def should_auto_resume_api_outage_result(result: Any) -> bool:
+    """Return whether an interrupted API recovery wait is system-owned.
+
+    A populated ``interrupt_message`` means a user command/message or another
+    explicit control action ended the turn. Those interruptions must retain
+    their normal stop/redirect semantics instead of being replayed.
+    """
+    return bool(
+        isinstance(result, dict)
+        and result.get("interrupted")
+        and result.get("resume_reason") == API_OUTAGE_RECOVERY_RESUME_REASON
+        and not result.get("interrupt_message")
+    )
 
 # Modules that indicate a deterministic local processing error when they
 # appear in an exception traceback WITHOUT any API-call module. Used by the
@@ -427,16 +443,24 @@ def _park_for_api_outage_recovery(
         return None
 
     interrupt_text = "Operation interrupted while waiting for API outage recovery."
+    interrupt_message = getattr(agent, "_interrupt_message", None)
     close_interrupted_tool_sequence(messages, interrupt_text)
     agent._persist_session(messages, conversation_history)
     agent.clear_interrupt()
-    return {
+    result = {
         "final_response": interrupt_text,
         "messages": messages,
         "api_calls": agent._api_call_count,
         "completed": False,
         "interrupted": True,
+        "resume_reason": API_OUTAGE_RECOVERY_RESUME_REASON,
     }
+    if interrupt_message:
+        # Preserve the source of an external interrupt so the gateway can
+        # distinguish a system-owned recovery wait interruption from a user
+        # command/message that intentionally ended the turn.
+        result["interrupt_message"] = interrupt_message
+    return result
 
 
 def _billing_or_entitlement_message(

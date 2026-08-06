@@ -360,6 +360,17 @@ def _make_agent(
             skip_memory=True,
         )
     agent.client = MagicMock()
+    # Keep the fixture independent from config-loader internals across Hermes
+    # upgrades. These are the runtime fields exercised by conversation_loop.
+    agent._api_max_retries = max_retries
+    agent._api_outage_recovery_config = ApiOutageRecoveryConfig.from_mapping(
+        {
+            "enabled": True,
+            "probe_command": probe_command,
+            "probe_interval_seconds": 600,
+            "probe_timeout_seconds": 60,
+        }
+    )
     return agent
 
 
@@ -529,7 +540,10 @@ def test_codex_transient_terminal_parks_then_resumes_but_generic_malformed_does_
 def test_interrupt_while_parked_returns_interrupted_not_failed():
     agent = _make_agent()
     waiter = MagicMock()
-    waiter.wait.return_value = "interrupted"
+    def interrupt_during_wait(*_args, **_kwargs):
+        agent._interrupt_message = "Stop requested"
+        return "interrupted"
+    waiter.wait.side_effect = interrupt_during_wait
     agent._api_outage_recovery_waiter = waiter
     agent.clear_interrupt = MagicMock()
 
@@ -537,6 +551,8 @@ def test_interrupt_while_parked_returns_interrupted_not_failed():
 
     assert result["completed"] is False
     assert result["interrupted"] is True
+    assert result["resume_reason"] == "api_outage_recovery"
+    assert result["interrupt_message"] == "Stop requested"
     assert "failed" not in result
     agent.clear_interrupt.assert_called_once()
 

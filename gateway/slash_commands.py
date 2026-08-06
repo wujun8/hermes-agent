@@ -1574,6 +1574,14 @@ class GatewaySlashCommandsMixin:
         source = event.source
         session_entry = await self.async_session_store.get_or_create_session(source)
         session_key = session_entry.session_key
+        try:
+            await self.async_session_store.clear_resume_pending(session_key)
+        except Exception as exc:
+            logger.debug(
+                "clear_resume_pending on /stop failed for %s: %s",
+                session_key,
+                exc,
+            )
 
         agent = self._running_agents.get(session_key)
         if agent is _AGENT_PENDING_SENTINEL:

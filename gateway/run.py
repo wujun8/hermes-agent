@@ -57,7 +57,11 @@ from agent.conversation_compression import (
     PRE_API_COMPRESSION_STATUS_TEMPLATE,
     PREFLIGHT_COMPRESSION_STATUS_TEMPLATE,
 )
-from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
+from agent.conversation_loop import (
+    API_OUTAGE_RECOVERY_RESUME_REASON,
+    INTERRUPT_WAITING_FOR_MODEL_PREFIX,
+    should_auto_resume_api_outage_result,
+)
 from agent.i18n import t
 from agent.interrupt_compat import request_hard_interrupt
 from hermes_cli.config import cfg_get
@@ -957,8 +961,11 @@ def build_resume_recovery_note(
     silently abandoned behind a "restored" acknowledgement that goes
     nowhere (#57056).
     """
+    is_api_recovery = reason == API_OUTAGE_RECOVERY_RESUME_REASON
     reason_phrase = (
-        "a gateway restart"
+        "an API outage recovery wait interruption"
+        if is_api_recovery
+        else "a gateway restart"
         if reason == "restart_timeout"
         else "a gateway shutdown"
         if reason == "shutdown_timeout"
@@ -972,6 +979,15 @@ def build_resume_recovery_note(
         tail_guidance = (
             "Do NOT re-execute old tool calls — skip any "
             "unfinished work from the conversation history."
+        )
+    elif is_api_recovery:
+        resume_guidance = (
+            "Review the conversation history and CONTINUE the interrupted "
+            "task to completion."
+        )
+        tail_guidance = (
+            "Do NOT re-run tool calls whose results already appear in the "
+            "history — resume from the first step that has no recorded result."
         )
     elif interactive:
         resume_guidance = (
@@ -3505,6 +3521,16 @@ def _should_clear_resume_pending_after_turn(agent_result: dict) -> bool:
     if agent_result.get("completed") is False:
         return False
     return True
+
+
+def _should_auto_resume_after_turn(agent_result: dict) -> bool:
+    """Return True for system-owned interruptions that must be replayed.
+
+    User control interrupts intentionally end a turn. API recovery waits are
+    different: the agent has persisted the exact boundary and should be
+    scheduled through the normal durable resume queue after its slot releases.
+    """
+    return should_auto_resume_api_outage_result(agent_result)
 
 
 def _preserve_queued_followup_history_offset(
@@ -10134,7 +10160,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # .clean_shutdown marker).  All three mean "the agent was mid-turn and
     # we killed it" — eligible for startup auto-resume.
     _AUTO_RESUME_REASONS = frozenset(
-        {"restart_timeout", "shutdown_timeout", "restart_interrupted"}
+        {
+            "restart_timeout",
+            "shutdown_timeout",
+            "restart_interrupted",
+            API_OUTAGE_RECOVERY_RESUME_REASON,
+        }
     )
 
     async def _run_startup_resume_event(
@@ -10389,7 +10420,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
         return redelivered
 
-    def _schedule_resume_pending_sessions(self, platform=None) -> int:
+    def _schedule_resume_pending_sessions(
+        self,
+        platform=None,
+        *,
+        session_key: Optional[str] = None,
+        record_restart_guard: bool = True,
+    ) -> int:
         """Auto-continue fresh restart-interrupted sessions after startup.
 
         ``resume_pending`` already preserves the transcript AND the existing
@@ -10423,6 +10460,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     and entry.origin is not None
                     and entry.resume_reason in self._AUTO_RESUME_REASONS
                     and (platform is None or entry.origin.platform == platform)
+                    and (session_key is None or entry.session_key == session_key)
                 ]
         except Exception as exc:
             logger.warning("Failed to enumerate resume-pending sessions: %s", exc)
@@ -10438,7 +10476,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # is now in the loop). Defenses 1-2 cover the cron/CLI/terminal paths;
         # this catches every other SIGTERM source (e.g. a raw `terminal(
         # "launchctl kickstart ai.hermes.gateway")`).
-        if candidates:
+        if candidates and record_restart_guard:
             try:
                 from gateway import restart_loop_guard as _rlg
 
@@ -14155,6 +14193,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # is truly hung — the executor thread is blocked and never checks
         # _interrupt_requested.  Force-clean _running_agents so the session
         # is unlocked and subsequent messages are processed normally.
+        try:
+            await self.async_session_store.clear_resume_pending(quick_key)
+        except Exception as exc:
+            logger.debug("clear_resume_pending on /stop failed for %s: %s", quick_key, exc)
         await self._interrupt_and_clear_session(
             quick_key,
             source,
@@ -15650,9 +15692,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _claim_state.turn.started_ts = time.time()
         self._persist_active_agents()
         _run_generation = self._begin_session_run_generation(_quick_key)
+        _auto_resume_after_release = False
 
         try:
             _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
+            if _should_auto_resume_after_turn(_agent_result):
+                try:
+                    await self.async_session_store.mark_resume_pending(
+                        _quick_key, _agent_result["resume_reason"]
+                    )
+                    _auto_resume_after_release = True
+                except Exception as _resume_exc:
+                    logger.warning(
+                        "Failed to persist API recovery auto-resume for %s: %s",
+                        _quick_key,
+                        _resume_exc,
+                    )
             # Goal continuation: after the agent returns a final response
             # for this turn, check any standing /goal — the judge will
             # either mark it done, pause it (budget), or enqueue a
@@ -15668,7 +15723,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # Skip for empty responses (interrupted / errored) — the
                 # judge would almost always say "continue" and we'd loop
                 # on error. Let the user drive the next turn.
-                if _final_text.strip():
+                if _final_text.strip() and not _auto_resume_after_release:
                     try:
                         session_entry = await self.async_session_store.get_or_create_session(source)
                     except Exception:
@@ -15705,6 +15760,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # (routing key, run generation) so this unwind can only ever free
             # the lease its own turn acquired, never a newer turn's.
             self._release_turn_lease(_quick_key, _run_generation)
+            if _auto_resume_after_release:
+                # Schedule only after the current slot is released; otherwise
+                # the resume scanner correctly treats this session as active.
+                def _schedule_api_recovery_resume() -> None:
+                    self._schedule_resume_pending_sessions(
+                        platform=source.platform,
+                        session_key=_quick_key,
+                        record_restart_guard=False,
+                    )
+
+                asyncio.get_running_loop().call_soon(_schedule_api_recovery_resume)
 
     def _restore_moa_one_shot(self, event: "MessageEvent", quick_key: str) -> None:
         """Revert a ``/moa <prompt>`` one-shot model override after its turn.

@@ -1,0 +1,704 @@
+diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
+index 3f33a0fb0..ffc59d870 100644
+--- a/agent/conversation_loop.py
++++ b/agent/conversation_loop.py
+@@ -94,6 +94,22 @@ logger = logging.getLogger(__name__)
+ # cancelled while waiting on the provider. Surfaces (ACP, TUI) match on this
+ # to treat it as cancellation metadata rather than assistant prose.
+ INTERRUPT_WAITING_FOR_MODEL_PREFIX = "Operation interrupted: waiting for model response ("
++API_OUTAGE_RECOVERY_RESUME_REASON = "api_outage_recovery"
++
++
++def should_auto_resume_api_outage_result(result: Any) -> bool:
++    """Return whether an interrupted API recovery wait is system-owned.
++
++    A populated ``interrupt_message`` means a user command/message or another
++    explicit control action ended the turn. Those interruptions must retain
++    their normal stop/redirect semantics instead of being replayed.
++    """
++    return bool(
++        isinstance(result, dict)
++        and result.get("interrupted")
++        and result.get("resume_reason") == API_OUTAGE_RECOVERY_RESUME_REASON
++        and not result.get("interrupt_message")
++    )
+ 
+ # Modules that indicate a deterministic local processing error when they
+ # appear in an exception traceback WITHOUT any API-call module. Used by the
+@@ -427,16 +443,24 @@ def _park_for_api_outage_recovery(
+         return None
+ 
+     interrupt_text = "Operation interrupted while waiting for API outage recovery."
++    interrupt_message = getattr(agent, "_interrupt_message", None)
+     close_interrupted_tool_sequence(messages, interrupt_text)
+     agent._persist_session(messages, conversation_history)
+     agent.clear_interrupt()
+-    return {
++    result = {
+         "final_response": interrupt_text,
+         "messages": messages,
+         "api_calls": agent._api_call_count,
+         "completed": False,
+         "interrupted": True,
++        "resume_reason": API_OUTAGE_RECOVERY_RESUME_REASON,
+     }
++    if interrupt_message:
++        # Preserve the source of an external interrupt so the gateway can
++        # distinguish a system-owned recovery wait interruption from a user
++        # command/message that intentionally ended the turn.
++        result["interrupt_message"] = interrupt_message
++    return result
+ 
+ 
+ def _billing_or_entitlement_message(
+diff --git a/gateway/run.py b/gateway/run.py
+index c4cad5196..b19487f60 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -57,7 +57,11 @@ from agent.conversation_compression import (
+     PRE_API_COMPRESSION_STATUS_TEMPLATE,
+     PREFLIGHT_COMPRESSION_STATUS_TEMPLATE,
+ )
+-from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
++from agent.conversation_loop import (
++    API_OUTAGE_RECOVERY_RESUME_REASON,
++    INTERRUPT_WAITING_FOR_MODEL_PREFIX,
++    should_auto_resume_api_outage_result,
++)
+ from agent.i18n import t
+ from agent.interrupt_compat import request_hard_interrupt
+ from hermes_cli.config import cfg_get
+@@ -957,8 +961,11 @@ def build_resume_recovery_note(
+     silently abandoned behind a "restored" acknowledgement that goes
+     nowhere (#57056).
+     """
++    is_api_recovery = reason == API_OUTAGE_RECOVERY_RESUME_REASON
+     reason_phrase = (
+-        "a gateway restart"
++        "an API outage recovery wait interruption"
++        if is_api_recovery
++        else "a gateway restart"
+         if reason == "restart_timeout"
+         else "a gateway shutdown"
+         if reason == "shutdown_timeout"
+@@ -973,6 +980,15 @@ def build_resume_recovery_note(
+             "Do NOT re-execute old tool calls — skip any "
+             "unfinished work from the conversation history."
+         )
++    elif is_api_recovery:
++        resume_guidance = (
++            "Review the conversation history and CONTINUE the interrupted "
++            "task to completion."
++        )
++        tail_guidance = (
++            "Do NOT re-run tool calls whose results already appear in the "
++            "history — resume from the first step that has no recorded result."
++        )
+     elif interactive:
+         resume_guidance = (
+             "Report to the user that the session was restored "
+@@ -3507,6 +3523,16 @@ def _should_clear_resume_pending_after_turn(agent_result: dict) -> bool:
+     return True
+ 
+ 
++def _should_auto_resume_after_turn(agent_result: dict) -> bool:
++    """Return True for system-owned interruptions that must be replayed.
++
++    User control interrupts intentionally end a turn. API recovery waits are
++    different: the agent has persisted the exact boundary and should be
++    scheduled through the normal durable resume queue after its slot releases.
++    """
++    return should_auto_resume_api_outage_result(agent_result)
++
++
+ def _preserve_queued_followup_history_offset(
+     current_result: dict,
+     followup_result: dict,
+@@ -10134,7 +10160,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+     # .clean_shutdown marker).  All three mean "the agent was mid-turn and
+     # we killed it" — eligible for startup auto-resume.
+     _AUTO_RESUME_REASONS = frozenset(
+-        {"restart_timeout", "shutdown_timeout", "restart_interrupted"}
++        {
++            "restart_timeout",
++            "shutdown_timeout",
++            "restart_interrupted",
++            API_OUTAGE_RECOVERY_RESUME_REASON,
++        }
+     )
+ 
+     async def _run_startup_resume_event(
+@@ -10389,7 +10420,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                     )
+         return redelivered
+ 
+-    def _schedule_resume_pending_sessions(self, platform=None) -> int:
++    def _schedule_resume_pending_sessions(
++        self,
++        platform=None,
++        *,
++        session_key: Optional[str] = None,
++        record_restart_guard: bool = True,
++    ) -> int:
+         """Auto-continue fresh restart-interrupted sessions after startup.
+ 
+         ``resume_pending`` already preserves the transcript AND the existing
+@@ -10423,6 +10460,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                     and entry.origin is not None
+                     and entry.resume_reason in self._AUTO_RESUME_REASONS
+                     and (platform is None or entry.origin.platform == platform)
++                    and (session_key is None or entry.session_key == session_key)
+                 ]
+         except Exception as exc:
+             logger.warning("Failed to enumerate resume-pending sessions: %s", exc)
+@@ -10438,7 +10476,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+         # is now in the loop). Defenses 1-2 cover the cron/CLI/terminal paths;
+         # this catches every other SIGTERM source (e.g. a raw `terminal(
+         # "launchctl kickstart ai.hermes.gateway")`).
+-        if candidates:
++        if candidates and record_restart_guard:
+             try:
+                 from gateway import restart_loop_guard as _rlg
+ 
+@@ -14155,6 +14193,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+         # is truly hung — the executor thread is blocked and never checks
+         # _interrupt_requested.  Force-clean _running_agents so the session
+         # is unlocked and subsequent messages are processed normally.
++        try:
++            await self.async_session_store.clear_resume_pending(quick_key)
++        except Exception as exc:
++            logger.debug("clear_resume_pending on /stop failed for %s: %s", quick_key, exc)
+         await self._interrupt_and_clear_session(
+             quick_key,
+             source,
+@@ -15650,9 +15692,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+         _claim_state.turn.started_ts = time.time()
+         self._persist_active_agents()
+         _run_generation = self._begin_session_run_generation(_quick_key)
++        _auto_resume_after_release = False
+ 
+         try:
+             _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
++            if _should_auto_resume_after_turn(_agent_result):
++                try:
++                    await self.async_session_store.mark_resume_pending(
++                        _quick_key, _agent_result["resume_reason"]
++                    )
++                    _auto_resume_after_release = True
++                except Exception as _resume_exc:
++                    logger.warning(
++                        "Failed to persist API recovery auto-resume for %s: %s",
++                        _quick_key,
++                        _resume_exc,
++                    )
+             # Goal continuation: after the agent returns a final response
+             # for this turn, check any standing /goal — the judge will
+             # either mark it done, pause it (budget), or enqueue a
+@@ -15668,7 +15723,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                 # Skip for empty responses (interrupted / errored) — the
+                 # judge would almost always say "continue" and we'd loop
+                 # on error. Let the user drive the next turn.
+-                if _final_text.strip():
++                if _final_text.strip() and not _auto_resume_after_release:
+                     try:
+                         session_entry = await self.async_session_store.get_or_create_session(source)
+                     except Exception:
+@@ -15705,6 +15760,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+             # (routing key, run generation) so this unwind can only ever free
+             # the lease its own turn acquired, never a newer turn's.
+             self._release_turn_lease(_quick_key, _run_generation)
++            if _auto_resume_after_release:
++                # Schedule only after the current slot is released; otherwise
++                # the resume scanner correctly treats this session as active.
++                def _schedule_api_recovery_resume() -> None:
++                    self._schedule_resume_pending_sessions(
++                        platform=source.platform,
++                        session_key=_quick_key,
++                        record_restart_guard=False,
++                    )
++
++                asyncio.get_running_loop().call_soon(_schedule_api_recovery_resume)
+ 
+     def _restore_moa_one_shot(self, event: "MessageEvent", quick_key: str) -> None:
+         """Revert a ``/moa <prompt>`` one-shot model override after its turn.
+diff --git a/gateway/slash_commands.py b/gateway/slash_commands.py
+index d622aa4fc..4795c9d02 100644
+--- a/gateway/slash_commands.py
++++ b/gateway/slash_commands.py
+@@ -1574,6 +1574,14 @@ class GatewaySlashCommandsMixin:
+         source = event.source
+         session_entry = await self.async_session_store.get_or_create_session(source)
+         session_key = session_entry.session_key
++        try:
++            await self.async_session_store.clear_resume_pending(session_key)
++        except Exception as exc:
++            logger.debug(
++                "clear_resume_pending on /stop failed for %s: %s",
++                session_key,
++                exc,
++            )
+ 
+         agent = self._running_agents.get(session_key)
+         if agent is _AGENT_PENDING_SENTINEL:
+diff --git a/tests/gateway/test_restart_resume_pending.py b/tests/gateway/test_restart_resume_pending.py
+index 1acc357e1..5fbc7ebda 100644
+--- a/tests/gateway/test_restart_resume_pending.py
++++ b/tests/gateway/test_restart_resume_pending.py
+@@ -72,6 +72,32 @@ def test_resume_pending_is_cleared_only_after_successful_turn():
+     assert _should_clear_resume_pending_after_turn({"error": "boom"}) is False
+ 
+ 
++def test_api_outage_recovery_interrupt_is_auto_resumable():
++    """An outage-wait interruption must opt into the existing resume queue."""
++    from gateway.run import _should_auto_resume_after_turn
++
++    assert _should_auto_resume_after_turn(
++        {"interrupted": True, "resume_reason": "api_outage_recovery"}
++    ) is True
++    assert _should_auto_resume_after_turn(
++        {"interrupted": True, "resume_reason": "user_stop"}
++    ) is False
++    assert _should_auto_resume_after_turn(
++        {
++            "interrupted": True,
++            "resume_reason": "api_outage_recovery",
++            "interrupt_message": "Stop requested",
++        }
++    ) is False
++    assert _should_auto_resume_after_turn(
++        {
++            "interrupted": True,
++            "resume_reason": "api_outage_recovery",
++            "interrupt_message": "please continue with the new request",
++        }
++    ) is False
++
++
+ def _make_source(platform=Platform.TELEGRAM, chat_id="123", user_id="u1"):
+     return SessionSource(platform=platform, chat_id=chat_id, user_id=user_id)
+ 
+@@ -313,6 +339,12 @@ class TestResumePendingSystemNote:
+         # But still guards against re-running already-recorded tool calls.
+         assert "already appear in the history" in note
+ 
++    def test_api_recovery_note_continues_even_on_interactive_platform(self):
++        note = build_resume_recovery_note("api_outage_recovery", "", interactive=True)
++        assert "API outage recovery wait interruption" in note
++        assert "CONTINUE the interrupted task" in note
++        assert "ask what they would like to do next" not in note
++
+ 
+     def test_resume_pending_fires_without_tool_tail(self):
+         """Key improvement over PR #9934: the restart-resume note fires
+@@ -667,6 +699,79 @@ async def test_reconnect_reschedule_is_platform_scoped():
+     assert event.source == tg_source
+ 
+ 
++@pytest.mark.asyncio
++async def test_api_outage_recovery_resume_is_scoped_and_skips_restart_guard():
++    """Runtime API recovery reuses the durable scheduler without boot accounting."""
++    runner, adapter = make_restart_runner()
++    source = make_restart_source(chat_id="api-recovery-chat")
++    session_key = "agent:main:telegram:dm:api-recovery-chat"
++    pending_entry = SessionEntry(
++        session_key=session_key,
++        session_id="sid",
++        created_at=datetime.now(),
++        updated_at=datetime.now(),
++        origin=source,
++        platform=Platform.TELEGRAM,
++        chat_type="dm",
++        resume_pending=True,
++        resume_reason="api_outage_recovery",
++        last_resume_marked_at=datetime.now(),
++    )
++    runner.session_store._entries = {session_key: pending_entry}
++    adapter.handle_message = AsyncMock()
++
++    with patch("gateway.restart_loop_guard.check_and_record") as guard:
++        scheduled = runner._schedule_resume_pending_sessions(
++            platform=Platform.TELEGRAM,
++            session_key=session_key,
++            record_restart_guard=False,
++        )
++        await asyncio.sleep(0)
++
++    assert scheduled == 1
++    guard.assert_not_called()
++    adapter.handle_message.assert_awaited_once()
++    assert adapter.handle_message.await_args.args[0].internal is True
++
++
++@pytest.mark.asyncio
++async def test_busy_stop_clears_pending_auto_resume_before_interrupting():
++    runner, _adapter = make_restart_runner()
++    source = make_restart_source(chat_id="stop-recovery-chat")
++    session_key = "agent:main:telegram:dm:stop-recovery-chat"
++    runner.session_store.clear_resume_pending = MagicMock(return_value=True)
++    runner._interrupt_and_clear_session = AsyncMock()
++    event = MessageEvent(
++        text="/stop",
++        message_type=MessageType.TEXT,
++        source=source,
++    )
++
++    await runner._busy_stop_command(event, session_key, source)
++
++    runner.session_store.clear_resume_pending.assert_called_once_with(session_key)
++    runner._interrupt_and_clear_session.assert_awaited_once()
++
++
++@pytest.mark.asyncio
++async def test_idle_stop_clears_pending_auto_resume_marker():
++    runner, _adapter = make_restart_runner()
++    source = make_restart_source(chat_id="idle-stop-recovery-chat")
++    session_key = "agent:main:telegram:dm:idle-stop-recovery-chat"
++    entry = MagicMock(session_key=session_key)
++    runner.session_store.get_or_create_session = MagicMock(return_value=entry)
++    runner.session_store.clear_resume_pending = MagicMock(return_value=True)
++    event = MessageEvent(
++        text="/stop",
++        message_type=MessageType.TEXT,
++        source=source,
++    )
++
++    await runner._handle_stop_command(event)
++
++    runner.session_store.clear_resume_pending.assert_called_once_with(session_key)
++
++
+ @pytest.mark.asyncio
+ async def test_startup_restore_waits_for_resume_before_draining_inbound():
+     """Queued inbound turns replay only after startup resume tasks finish."""
+@@ -1038,5 +1143,3 @@ async def test_startup_restore_gate_releases_when_resume_turn_outlives_timeout(
+ 
+     never_finishes.set()
+     await slow_task
+-
+-
+diff --git a/tests/run_agent/test_api_outage_recovery.py b/tests/run_agent/test_api_outage_recovery.py
+index 2cb5542ed..7c45e238c 100644
+--- a/tests/run_agent/test_api_outage_recovery.py
++++ b/tests/run_agent/test_api_outage_recovery.py
+@@ -360,6 +360,17 @@ def _make_agent(
+             skip_memory=True,
+         )
+     agent.client = MagicMock()
++    # Keep the fixture independent from config-loader internals across Hermes
++    # upgrades. These are the runtime fields exercised by conversation_loop.
++    agent._api_max_retries = max_retries
++    agent._api_outage_recovery_config = ApiOutageRecoveryConfig.from_mapping(
++        {
++            "enabled": True,
++            "probe_command": probe_command,
++            "probe_interval_seconds": 600,
++            "probe_timeout_seconds": 60,
++        }
++    )
+     return agent
+ 
+ 
+@@ -529,7 +540,10 @@ def test_codex_transient_terminal_parks_then_resumes_but_generic_malformed_does_
+ def test_interrupt_while_parked_returns_interrupted_not_failed():
+     agent = _make_agent()
+     waiter = MagicMock()
+-    waiter.wait.return_value = "interrupted"
++    def interrupt_during_wait(*_args, **_kwargs):
++        agent._interrupt_message = "Stop requested"
++        return "interrupted"
++    waiter.wait.side_effect = interrupt_during_wait
+     agent._api_outage_recovery_waiter = waiter
+     agent.clear_interrupt = MagicMock()
+ 
+@@ -537,6 +551,8 @@ def test_interrupt_while_parked_returns_interrupted_not_failed():
+ 
+     assert result["completed"] is False
+     assert result["interrupted"] is True
++    assert result["resume_reason"] == "api_outage_recovery"
++    assert result["interrupt_message"] == "Stop requested"
+     assert "failed" not in result
+     agent.clear_interrupt.assert_called_once()
+ 
+diff --git a/tests/tui_gateway/test_auto_continue.py b/tests/tui_gateway/test_auto_continue.py
+index 5910f421b..ab49daf31 100644
+--- a/tests/tui_gateway/test_auto_continue.py
++++ b/tests/tui_gateway/test_auto_continue.py
+@@ -98,19 +98,26 @@ def turn_env(monkeypatch, tmp_path, marker_home):
+     monkeypatch.setattr(server, "_register_session_cwd", lambda session: None)
+     monkeypatch.setattr(server, "_tts_stream_begin", lambda: None)
+     monkeypatch.setattr(server, "_sync_session_key_after_compress", lambda *a, **k: None)
+-    monkeypatch.setattr(server, "_get_usage", lambda agent: {})
++    monkeypatch.setattr(server, "_get_usage", lambda agent, **_kwargs: {})
+ 
+ 
+ # ── Marker module ──────────────────────────────────────────────────────
+ 
+ 
+ def test_marker_roundtrip(tmp_path):
+-    record_turn_start(tmp_path, "abc", "fix the bug", attempts=1)
++    record_turn_start(
++        tmp_path,
++        "abc",
++        "fix the bug",
++        attempts=1,
++        resume_reason="api_outage_recovery",
++    )
+ 
+     marker = read_turn_marker(tmp_path, "abc")
+     assert marker is not None
+     assert marker["prompt"] == "fix the bug"
+     assert marker["attempts"] == 1
++    assert marker["resume_reason"] == "api_outage_recovery"
+     assert marker["started_at"] == pytest.approx(time.time(), abs=5)
+ 
+     clear_turn_marker(tmp_path, "abc")
+@@ -169,6 +176,67 @@ def test_handled_failure_still_clears_marker(emits, turn_env, marker_home):
+     assert read_turn_marker(marker_home, "session-key") is None
+ 
+ 
++def test_api_recovery_interrupt_schedules_runtime_continuation(
++    emits, turn_env, marker_home, monkeypatch
++):
++    scheduled: list[tuple[str, str]] = []
++
++    def _run(message, **kwargs):
++        return {
++            "final_response": "Operation interrupted while waiting for API outage recovery.",
++            "interrupted": True,
++            "completed": False,
++            "resume_reason": "api_outage_recovery",
++        }
++
++    monkeypatch.setattr(
++        server,
++        "_maybe_schedule_auto_continue",
++        lambda sid, session, key: scheduled.append((sid, key)) or {"attempt": 1},
++    )
++    agent = types.SimpleNamespace(
++        session_id="session-key", run_conversation=_run, clear_interrupt=lambda: None
++    )
++    session = _session(agent=agent, running=True)
++
++    server._run_prompt_submit("rid", "sid", session, "do the thing")
++
++    assert scheduled == [("sid", "session-key")]
++    marker = read_turn_marker(marker_home, "session-key")
++    assert marker is not None
++    assert marker["resume_reason"] == "api_outage_recovery"
++
++
++def test_explicit_interrupt_does_not_schedule_runtime_continuation(
++    emits, turn_env, marker_home, monkeypatch
++):
++    scheduled: list = []
++
++    def _run(message, **kwargs):
++        return {
++            "final_response": "Operation interrupted while waiting for API outage recovery.",
++            "interrupted": True,
++            "completed": False,
++            "resume_reason": "api_outage_recovery",
++            "interrupt_message": "Stop requested",
++        }
++
++    monkeypatch.setattr(
++        server,
++        "_maybe_schedule_auto_continue",
++        lambda *args, **kwargs: scheduled.append((args, kwargs)),
++    )
++    agent = types.SimpleNamespace(
++        session_id="session-key", run_conversation=_run, clear_interrupt=lambda: None
++    )
++    session = _session(agent=agent, running=True)
++
++    server._run_prompt_submit("rid", "sid", session, "do the thing")
++
++    assert scheduled == []
++    assert read_turn_marker(marker_home, "session-key") is None
++
++
+ def test_continuation_turn_records_attempt_and_original_prompt(
+     emits, turn_env, marker_home
+ ):
+@@ -263,6 +331,23 @@ def test_fresh_marker_schedules_continuation(emits, schedule_env, marker_home):
+     assert ("message.start", "sid", None) in [(e, s, p) for e, s, p in emits]
+ 
+ 
++def test_api_recovery_marker_uses_continue_note(emits, schedule_env, marker_home):
++    record_turn_start(
++        marker_home,
++        "session-key",
++        "fix the flaky test",
++        resume_reason="api_outage_recovery",
++    )
++
++    result = server._maybe_schedule_auto_continue("sid", _session(), "session-key")
++
++    assert result is not None
++    (text, kwargs), = schedule_env
++    assert text == server._api_outage_recovery_note()
++    assert "CONTINUE the interrupted task" in text
++    assert kwargs["display_kind"] == "auto_continue"
++
++
+ def test_stale_marker_is_cleared_not_continued(schedule_env, marker_home, monkeypatch):
+     record_turn_start(marker_home, "session-key", "old prompt")
+     monkeypatch.setattr(
+@@ -372,5 +457,3 @@ def test_failed_agent_build_leaves_marker_for_retry(
+ 
+ 
+ # ── End to end: continuation runs a real turn and clears the marker ────
+-
+-
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index 0d6d5f4fb..46aea7d19 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -38,7 +38,11 @@ from utils import is_truthy_value
+ from tools.environments.local import hermes_subprocess_env
+ from agent.replay_cleanup import sanitize_replay_history
+ from agent.skill_commands import describe_skill_invocation
+-from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
++from agent.conversation_loop import (
++    API_OUTAGE_RECOVERY_RESUME_REASON,
++    INTERRUPT_WAITING_FOR_MODEL_PREFIX,
++    should_auto_resume_api_outage_result,
++)
+ from tui_gateway import git_probe
+ from tui_gateway.turn_marker import (
+     clear_turn_marker,
+@@ -8461,6 +8465,16 @@ def _auto_continue_note(prompt: str) -> str:
+     )
+ 
+ 
++def _api_outage_recovery_note() -> str:
++    return (
++        "[System note: The previous turn was interrupted while waiting for "
++        "an API outage to recover. Review the conversation history and "
++        "current workspace state, then CONTINUE the interrupted task to "
++        "completion. Do not repeat tool calls whose results are already "
++        "recorded.]"
++    )
++
++
+ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> dict | None:
+     """Kick off a continuation turn for a crash-interrupted session.
+ 
+@@ -8486,7 +8500,11 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) ->
+         return None
+     session["_auto_continue_scheduled"] = True
+     attempt = marker["attempts"] + 1
+-    text = _auto_continue_note(marker["prompt"])
++    text = (
++        _api_outage_recovery_note()
++        if marker.get("resume_reason") == API_OUTAGE_RECOVERY_RESUME_REASON
++        else _auto_continue_note(marker["prompt"])
++    )
+ 
+     def kickoff() -> None:
+         rid = f"__auto_continue__{int(time.time() * 1000)}"
+@@ -10632,6 +10650,8 @@ def _run_prompt_submit(
+         secret_token = None
+         goal_followup = None  # set by the post-turn goal hook below
+         result = None  # turn outcome; read after the finally for leftover /steer
++        api_recovery_auto_continue = False
++        api_recovery_marker_key = ""
+         tts_queue = None  # streaming-TTS feed for this turn (voice mode)
+         thinking_started = False  # ambient thinking sound armed for this turn
+         one_turn_restore = session.pop("one_turn_model_restore", None)
+@@ -11043,6 +11063,7 @@ def _run_prompt_submit(
+                     if result.get("interrupted")
+                     else "error" if result.get("error") else "complete"
+                 )
++                api_recovery_auto_continue = should_auto_resume_api_outage_result(result)
+                 # When the backend produced no visible response AND reported a
+                 # real error (e.g. invalid model slug → provider 4xx), surface
+                 # that error as the visible text instead of shipping an empty
+@@ -11106,7 +11127,22 @@ def _run_prompt_submit(
+                     (result.get("error") if isinstance(result, dict) else "") or raw
+                 )
+                 payload["recoverable"] = True
+-            _retire_turn_marker(session, marker_key)
++            if api_recovery_auto_continue:
++                # This interruption is a resumable boundary, not a concluded
++                # user cancellation. Keep a reason-aware marker and schedule
++                # it after ``running`` is released in the finally below.
++                api_recovery_marker_key = str(session.get("session_key") or marker_key)
++                record_turn_start(
++                    marker_home,
++                    api_recovery_marker_key,
++                    marker_text,
++                    attempts=marker_attempt,
++                    resume_reason=API_OUTAGE_RECOVERY_RESUME_REASON,
++                )
++                if marker_key and marker_key != api_recovery_marker_key:
++                    clear_turn_marker(marker_home, marker_key)
++            else:
++                _retire_turn_marker(session, marker_key)
+             _emit("message.complete", sid, payload)
+ 
+             # ── /goal continuation (Ralph-style loop) ─────────────────
+@@ -11339,7 +11375,8 @@ def _run_prompt_submit(
+                     _clear_inflight_turn(session)
+             # Backstop for turns that never reached a terminal frame (the
+             # frame paths retire the marker as they emit).
+-            _retire_turn_marker(session, marker_key)
++            if not api_recovery_auto_continue:
++                _retire_turn_marker(session, marker_key)
+             session.pop("_auto_continue_scheduled", None)
+             _emit_settled_session_info(sid, session, agent)
+ 
+@@ -11359,6 +11396,14 @@ def _run_prompt_submit(
+         if _drain_queued_prompt(rid, sid, session):
+             return
+ 
++        if api_recovery_auto_continue:
++            _maybe_schedule_auto_continue(
++                sid,
++                session,
++                api_recovery_marker_key or marker_key,
++            )
++            return
++
+         # Chain a goal-continuation turn if the judge said so. We do
+         # this AFTER the finally releases session["running"], so the
+         # nested _run_prompt_submit doesn't deadlock on the busy
+diff --git a/tui_gateway/turn_marker.py b/tui_gateway/turn_marker.py
+index 933f384f3..91b5effee 100644
+--- a/tui_gateway/turn_marker.py
++++ b/tui_gateway/turn_marker.py
+@@ -95,7 +95,12 @@ def _store(path: Path, entries: dict[str, dict]) -> None:
+ 
+ 
+ def record_turn_start(
+-    home: Path | str, session_key: str, prompt: str, *, attempts: int = 0
++    home: Path | str,
++    session_key: str,
++    prompt: str,
++    *,
++    attempts: int = 0,
++    resume_reason: str | None = None,
+ ) -> None:
+     """Persist the marker for a turn that is about to run.
+ 
+@@ -111,6 +116,8 @@ def record_turn_start(
+         "prompt": prompt[:_MAX_PROMPT_CHARS],
+         "started_at": now,
+     }
++    if resume_reason:
++        entry["resume_reason"] = str(resume_reason)
+     try:
+         with _lock:
+             path = _marker_path(home)
+@@ -156,4 +163,10 @@ def read_turn_marker(home: Path | str, session_key: str) -> dict[str, Any] | Non
+         attempts = max(0, int(entry.get("attempts") or 0))
+     except (TypeError, ValueError):
+         return None
+-    return {"attempts": attempts, "prompt": prompt, "started_at": started_at}
++    resume_reason = entry.get("resume_reason")
++    return {
++        "attempts": attempts,
++        "prompt": prompt,
++        "started_at": started_at,
++        "resume_reason": str(resume_reason) if resume_reason else None,
++    }

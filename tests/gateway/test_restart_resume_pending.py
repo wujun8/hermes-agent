@@ -72,6 +72,32 @@ def test_resume_pending_is_cleared_only_after_successful_turn():
     assert _should_clear_resume_pending_after_turn({"error": "boom"}) is False
 
 
+def test_api_outage_recovery_interrupt_is_auto_resumable():
+    """An outage-wait interruption must opt into the existing resume queue."""
+    from gateway.run import _should_auto_resume_after_turn
+
+    assert _should_auto_resume_after_turn(
+        {"interrupted": True, "resume_reason": "api_outage_recovery"}
+    ) is True
+    assert _should_auto_resume_after_turn(
+        {"interrupted": True, "resume_reason": "user_stop"}
+    ) is False
+    assert _should_auto_resume_after_turn(
+        {
+            "interrupted": True,
+            "resume_reason": "api_outage_recovery",
+            "interrupt_message": "Stop requested",
+        }
+    ) is False
+    assert _should_auto_resume_after_turn(
+        {
+            "interrupted": True,
+            "resume_reason": "api_outage_recovery",
+            "interrupt_message": "please continue with the new request",
+        }
+    ) is False
+
+
 def _make_source(platform=Platform.TELEGRAM, chat_id="123", user_id="u1"):
     return SessionSource(platform=platform, chat_id=chat_id, user_id=user_id)
 
@@ -312,6 +338,12 @@ class TestResumePendingSystemNote:
         assert "skip any unfinished work" not in note
         # But still guards against re-running already-recorded tool calls.
         assert "already appear in the history" in note
+
+    def test_api_recovery_note_continues_even_on_interactive_platform(self):
+        note = build_resume_recovery_note("api_outage_recovery", "", interactive=True)
+        assert "API outage recovery wait interruption" in note
+        assert "CONTINUE the interrupted task" in note
+        assert "ask what they would like to do next" not in note
 
 
     def test_resume_pending_fires_without_tool_tail(self):
@@ -665,6 +697,79 @@ async def test_reconnect_reschedule_is_platform_scoped():
     adapter.handle_message.assert_awaited_once()
     event = adapter.handle_message.await_args.args[0]
     assert event.source == tg_source
+
+
+@pytest.mark.asyncio
+async def test_api_outage_recovery_resume_is_scoped_and_skips_restart_guard():
+    """Runtime API recovery reuses the durable scheduler without boot accounting."""
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(chat_id="api-recovery-chat")
+    session_key = "agent:main:telegram:dm:api-recovery-chat"
+    pending_entry = SessionEntry(
+        session_key=session_key,
+        session_id="sid",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        resume_pending=True,
+        resume_reason="api_outage_recovery",
+        last_resume_marked_at=datetime.now(),
+    )
+    runner.session_store._entries = {session_key: pending_entry}
+    adapter.handle_message = AsyncMock()
+
+    with patch("gateway.restart_loop_guard.check_and_record") as guard:
+        scheduled = runner._schedule_resume_pending_sessions(
+            platform=Platform.TELEGRAM,
+            session_key=session_key,
+            record_restart_guard=False,
+        )
+        await asyncio.sleep(0)
+
+    assert scheduled == 1
+    guard.assert_not_called()
+    adapter.handle_message.assert_awaited_once()
+    assert adapter.handle_message.await_args.args[0].internal is True
+
+
+@pytest.mark.asyncio
+async def test_busy_stop_clears_pending_auto_resume_before_interrupting():
+    runner, _adapter = make_restart_runner()
+    source = make_restart_source(chat_id="stop-recovery-chat")
+    session_key = "agent:main:telegram:dm:stop-recovery-chat"
+    runner.session_store.clear_resume_pending = MagicMock(return_value=True)
+    runner._interrupt_and_clear_session = AsyncMock()
+    event = MessageEvent(
+        text="/stop",
+        message_type=MessageType.TEXT,
+        source=source,
+    )
+
+    await runner._busy_stop_command(event, session_key, source)
+
+    runner.session_store.clear_resume_pending.assert_called_once_with(session_key)
+    runner._interrupt_and_clear_session.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_idle_stop_clears_pending_auto_resume_marker():
+    runner, _adapter = make_restart_runner()
+    source = make_restart_source(chat_id="idle-stop-recovery-chat")
+    session_key = "agent:main:telegram:dm:idle-stop-recovery-chat"
+    entry = MagicMock(session_key=session_key)
+    runner.session_store.get_or_create_session = MagicMock(return_value=entry)
+    runner.session_store.clear_resume_pending = MagicMock(return_value=True)
+    event = MessageEvent(
+        text="/stop",
+        message_type=MessageType.TEXT,
+        source=source,
+    )
+
+    await runner._handle_stop_command(event)
+
+    runner.session_store.clear_resume_pending.assert_called_once_with(session_key)
 
 
 @pytest.mark.asyncio
@@ -1038,5 +1143,3 @@ async def test_startup_restore_gate_releases_when_resume_turn_outlives_timeout(
 
     never_finishes.set()
     await slow_task
-
-
