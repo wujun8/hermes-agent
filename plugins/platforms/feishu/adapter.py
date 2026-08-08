@@ -4914,9 +4914,12 @@ class FeishuAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]],
     ) -> Any:
         effective_reply_to = reply_to
-        if not effective_reply_to and metadata and metadata.get("thread_id"):
-            effective_reply_to = metadata.get("reply_to_message_id")
-        reply_in_thread = bool((metadata or {}).get("thread_id"))
+        thread_id = (metadata or {}).get("thread_id")
+        if not effective_reply_to and thread_id:
+            effective_reply_to = (metadata or {}).get("reply_to_message_id")
+            if not effective_reply_to:
+                effective_reply_to = await self._fetch_last_message_in_thread(thread_id)
+        reply_in_thread = bool(thread_id)
         if effective_reply_to:
             body = self._build_reply_message_body(
                 content=payload,
@@ -4927,34 +4930,21 @@ class FeishuAdapter(BasePlatformAdapter):
             request = self._build_reply_message_request(effective_reply_to, body)
             return await self._run_blocking(self._client.im.v1.message.reply, request)
 
-        # For topic/thread messages that fell back from reply→create, use
-        # thread_id as receive_id so the message lands in the topic instead of
-        # the main chat.
-        _thread_id = (metadata or {}).get("thread_id")
-        if _thread_id:
-            body = self._build_create_message_body(
-                receive_id=_thread_id,
-                msg_type=msg_type,
-                content=payload,
-                uuid_value=str(uuid.uuid4()),
-            )
-            request = self._build_create_message_request("thread_id", body)
-        else:
-            receive_id = chat_id
-            receive_id_type = "chat_id"
-            if chat_id.startswith("feishu_user_id:"):
-                receive_id = chat_id.split(":", 1)[1]
-                receive_id_type = "user_id"
-            elif chat_id.startswith("ou_"):
-                receive_id_type = "open_id"
+        receive_id = chat_id
+        receive_id_type = "chat_id"
+        if chat_id.startswith("feishu_user_id:"):
+            receive_id = chat_id.split(":", 1)[1]
+            receive_id_type = "user_id"
+        elif chat_id.startswith("ou_"):
+            receive_id_type = "open_id"
 
-            body = self._build_create_message_body(
-                receive_id=receive_id,
-                msg_type=msg_type,
-                content=payload,
-                uuid_value=str(uuid.uuid4()),
-            )
-            request = self._build_create_message_request(receive_id_type, body)
+        body = self._build_create_message_body(
+            receive_id=receive_id,
+            msg_type=msg_type,
+            content=payload,
+            uuid_value=str(uuid.uuid4()),
+        )
+        request = self._build_create_message_request(receive_id_type, body)
         return await self._run_blocking(self._client.im.v1.message.create, request)
 
     @staticmethod
