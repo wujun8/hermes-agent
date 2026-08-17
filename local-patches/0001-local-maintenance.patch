@@ -1961,7 +1961,7 @@ index 37be35baeec3210c1e0ddc57497a027ed411f829..ba04041fc54aa5c93c3395057a9a5ab8
          # The agent can run indefinitely as long as it's actively calling
          # tools or receiving API responses.  Only fires when the agent has
 diff --git a/hermes_cli/main.py b/hermes_cli/main.py
-index ed9fe973ab268b41284529cc4c89559af7db261d..80319d1096aa3f6e6dc4540c341610307cb0f4c8 100644
+index ed9fe973ab268b41284529cc4c89559af7db261d..13c412571f680a532d0cbaabc7663931b59c77b9 100644
 --- a/hermes_cli/main.py
 +++ b/hermes_cli/main.py
 @@ -35,7 +35,8 @@ Usage:
@@ -2120,7 +2120,7 @@ index ed9fe973ab268b41284529cc4c89559af7db261d..80319d1096aa3f6e6dc4540c34161030
 +        _finalize_update_output(_update_io_state)
 +        sys.exit(UPDATE_EXIT_CONCURRENT)
 +    try:
-+        _cmd_update_impl(args, gateway_mode=gateway_mode)
++        _self()._cmd_update_impl(args, gateway_mode=gateway_mode)
 +    finally:
 +        _update_lock.release()
 +        _finalize_update_output(_update_io_state)
@@ -11112,10 +11112,10 @@ index 62e44f459eb9f334fcb377556f1c93062b50f601..4c0c9217f571a7b316a78b33da31e4a7
 +
 diff --git a/tests/hermes_cli/test_cmd_upgrade.py b/tests/hermes_cli/test_cmd_upgrade.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..381b478b67126b4718eed19e72ce1977f0bd27c3
+index 0000000000000000000000000000000000000000..0f771f7dd5fc29ade12ecd4cea6cab35ead9bd38
 --- /dev/null
 +++ b/tests/hermes_cli/test_cmd_upgrade.py
-@@ -0,0 +1,762 @@
+@@ -0,0 +1,784 @@
 +"""Tests for ``hermes upgrade`` release-tag update path."""
 +
 +import subprocess
@@ -11156,6 +11156,28 @@ index 0000000000000000000000000000000000000000..381b478b67126b4718eed19e72ce1977
 +    protect.assert_called_once_with(gateway_mode=False)
 +    update_impl.assert_called_once_with(args, gateway_mode=False)
 +    finalize.assert_called_once()
++
++
++def test_cmd_upgrade_resolves_update_impl_through_lazy_export():
++    from hermes_cli import update_cmd
++
++    args = SimpleNamespace(check=False, gateway=False)
++    update_impl = Mock()
++    # A cached module attribute would hide the production failure: bare global
++    # lookups do not invoke main.__getattr__, while _self().<name> does.
++    hm.__dict__.pop("_cmd_update_impl", None)
++    try:
++        with patch("hermes_cli.config.is_managed", return_value=False), \
++             patch("hermes_cli.config.detect_install_method", return_value="git"), \
++             patch.object(hm, "_fetch_latest_release_tag", return_value="v1.2.3"), \
++             patch.object(hm, "_install_hangup_protection", return_value={}), \
++             patch.object(hm, "_finalize_update_output"), \
++             patch.object(update_cmd, "_cmd_update_impl", update_impl):
++            hm.cmd_upgrade(args)
++
++        update_impl.assert_called_once_with(args, gateway_mode=False)
++    finally:
++        hm.__dict__.pop("_cmd_update_impl", None)
 +
 +
 +def test_cmd_upgrade_check_compares_head_to_latest_release_tag(capsys):

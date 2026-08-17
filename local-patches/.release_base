@@ -1,8 +1,8 @@
 {
   "base_sha": "df4b65147d7ddd74dd449f9067aabbca5aef0ec7",
   "format_version": 1,
-  "patch_bytes": 1055067,
-  "patch_sha256": "6446197ad94d8f6bab12442149b0899842be75e15ac3fa5ccc4865407c1fc0e1",
+  "patch_bytes": 1056113,
+  "patch_sha256": "9e03a0ce5c8d5fac2bc08d553f64146cdcf3071edf642852a70a6c6a063408f6",
   "tag": "v2026.8.16",
   "target_sha": "df4b65147d7ddd74dd449f9067aabbca5aef0ec7"
 }
