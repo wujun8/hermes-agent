@@ -9935,7 +9935,7 @@ def cmd_upgrade(args):
         _finalize_update_output(_update_io_state)
         sys.exit(UPDATE_EXIT_CONCURRENT)
     try:
-        _cmd_update_impl(args, gateway_mode=gateway_mode)
+        _self()._cmd_update_impl(args, gateway_mode=gateway_mode)
     finally:
         _update_lock.release()
         _finalize_update_output(_update_io_state)

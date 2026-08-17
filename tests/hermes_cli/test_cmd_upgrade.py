@@ -40,6 +40,28 @@ def test_cmd_upgrade_resolves_latest_release_and_delegates_to_update_impl():
     finalize.assert_called_once()
 
 
+def test_cmd_upgrade_resolves_update_impl_through_lazy_export():
+    from hermes_cli import update_cmd
+
+    args = SimpleNamespace(check=False, gateway=False)
+    update_impl = Mock()
+    # A cached module attribute would hide the production failure: bare global
+    # lookups do not invoke main.__getattr__, while _self().<name> does.
+    hm.__dict__.pop("_cmd_update_impl", None)
+    try:
+        with patch("hermes_cli.config.is_managed", return_value=False), \
+             patch("hermes_cli.config.detect_install_method", return_value="git"), \
+             patch.object(hm, "_fetch_latest_release_tag", return_value="v1.2.3"), \
+             patch.object(hm, "_install_hangup_protection", return_value={}), \
+             patch.object(hm, "_finalize_update_output"), \
+             patch.object(update_cmd, "_cmd_update_impl", update_impl):
+            hm.cmd_upgrade(args)
+
+        update_impl.assert_called_once_with(args, gateway_mode=False)
+    finally:
+        hm.__dict__.pop("_cmd_update_impl", None)
+
+
 def test_cmd_upgrade_check_compares_head_to_latest_release_tag(capsys):
     from hermes_cli import update_cmd
 
