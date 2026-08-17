@@ -60,6 +60,16 @@ def _commit(repo: Path, message: str) -> str:
     return _git(repo, "rev-parse", "HEAD").stdout.decode().strip()
 
 
+def _assert_merge_parents(repo: Path, merge_sha: str, *expected_parents: str) -> None:
+    fields = (
+        _git(repo, "rev-list", "--parents", "-n", "1", merge_sha)
+        .stdout.decode()
+        .strip()
+        .split()
+    )
+    assert fields == [merge_sha, *expected_parents]
+
+
 def _test_candidate_validator(git_cmd, candidate):
     """Explicit seam for non-Hermes-shaped temporary repositories."""
     resolved = update_cmd._git_resolve_commit(git_cmd, candidate, "HEAD")
@@ -418,6 +428,86 @@ def test_conflict_leaves_live_head_index_and_status_untouched(tmp_path):
     assert _git(repo, "ls-files", "--unmerged").stdout == b""
 
 
+def test_legacy_release_upgrade_migrates_to_incremental_merge_metadata(tmp_path):
+    repo = _init_repo(tmp_path)
+    base_sha = _git(repo, "rev-parse", "HEAD").stdout.decode().strip()
+    _git(repo, "tag", "-a", "v1.0.0", "-m", "v1.0.0")
+    _make_maintenance_from_tag(repo, "v1.0.0")
+    (repo / "local.txt").write_text("legacy maintenance\n", encoding="utf-8")
+    _commit(repo, "local maintenance")
+    _write_base_metadata(
+        repo,
+        tag="v1.0.0",
+        base_sha=base_sha,
+        patch_bytes=b"legacy artifact",
+    )
+    maintenance_sha = _git(repo, "rev-parse", "HEAD").stdout.decode().strip()
+    assert update_cmd._read_release_base_metadata(repo).format_version == 1
+
+    target_sha = _commit_upstream_release(
+        repo,
+        "v2.0.0",
+        filename="release.txt",
+        content="release two\n",
+    )
+    _git(repo, "switch", "hermes-release")
+
+    result = update_cmd._upgrade_release_transaction(
+        ["git"],
+        repo,
+        "v2.0.0",
+        target_sha,
+        candidate_validator=_test_candidate_validator,
+    )
+
+    assert result.old_sha == maintenance_sha
+    assert result.target_sha == target_sha
+    assert result.candidate_sha == _git(repo, "rev-parse", "HEAD").stdout.decode().strip()
+    merge_sha = _git(repo, "rev-parse", f"{result.candidate_sha}^").stdout.decode().strip()
+    _assert_merge_parents(repo, merge_sha, maintenance_sha, target_sha)
+
+    metadata = json.loads(
+        (repo / "local-patches" / ".release_base").read_text(encoding="utf-8")
+    )
+    assert metadata["format_version"] == 2
+    assert metadata["integration_mode"] == "incremental-merge"
+    assert metadata["tag"] == "v2.0.0"
+    assert metadata["base_sha"] == target_sha
+    assert metadata["target_sha"] == target_sha
+
+
+def test_non_descendant_release_target_leaves_live_state_untouched(tmp_path):
+    repo = _init_repo(tmp_path)
+    base_sha = _git(repo, "rev-parse", "HEAD").stdout.decode().strip()
+    _git(repo, "tag", "-a", "v1.0.0", "-m", "v1.0.0")
+    _make_maintenance_from_tag(repo, "v1.0.0")
+    (repo / "local.txt").write_text("local maintenance\n", encoding="utf-8")
+    _commit(repo, "local maintenance")
+    _write_base_metadata(repo, tag="v1.0.0", base_sha=base_sha)
+    maintenance_sha = _git(repo, "rev-parse", "HEAD").stdout.decode().strip()
+
+    _git(repo, "switch", "--orphan", "unrelated-release")
+    (repo / "unrelated-release.txt").write_text("unrelated\n", encoding="utf-8")
+    target_sha = _commit(repo, "unrelated release")
+    _git(repo, "tag", "-a", "v2.0.0", "-m", "v2.0.0")
+    _git(repo, "switch", "hermes-release")
+    before_status = _git(repo, "status", "--porcelain=v1").stdout
+
+    with pytest.raises(RuntimeError, match="does not descend from the recorded upstream base"):
+        update_cmd._upgrade_release_transaction(
+            ["git"],
+            repo,
+            "v2.0.0",
+            target_sha,
+            candidate_validator=_test_candidate_validator,
+        )
+
+    assert _git(repo, "rev-parse", "HEAD").stdout.decode().strip() == maintenance_sha
+    assert _git(repo, "status", "--porcelain=v1").stdout == before_status
+    assert _git(repo, "ls-files", "--unmerged").stdout == b""
+    transaction_root = update_cmd._git_common_dir(["git"], repo) / "hermes-upgrade-transactions"
+    assert not transaction_root.exists()
+
 
 def test_second_repository_lock_acquisition_fails_without_stealing(tmp_path):
     repo = _init_repo(tmp_path)
@@ -452,8 +542,9 @@ def test_binary_mode_symlink_and_rename_payload_survive_two_releases(tmp_path):
     (repo / "rename-me-local").write_text("rename content\nlocal\n", encoding="utf-8")
     (repo / "delete-me").unlink()
     (repo / "link-to-local").symlink_to("local-added")
-    maintenance_sha = _commit(repo, "local binary mode rename symlink changes")
+    _commit(repo, "local binary mode rename symlink changes")
     _write_base_metadata(repo, tag="v1.0.0", base_sha=base_sha)
+    maintenance_sha = _git(repo, "rev-parse", "HEAD").stdout.decode().strip()
     _git(repo, "switch", "main")
     (repo / "upstream-release.txt").write_text("upstream release two\n", encoding="utf-8")
     r2 = _commit(repo, "release two")
@@ -465,7 +556,17 @@ def test_binary_mode_symlink_and_rename_payload_survive_two_releases(tmp_path):
         candidate_validator=_test_candidate_validator,
     )
 
-    assert result.candidate_sha == _git(repo, "rev-parse", "HEAD").stdout.decode().strip()
+    first_promoted_sha = result.candidate_sha
+    assert first_promoted_sha == _git(repo, "rev-parse", "HEAD").stdout.decode().strip()
+    first_merge_sha = _git(repo, "rev-parse", f"{first_promoted_sha}^").stdout.decode().strip()
+    _assert_merge_parents(repo, first_merge_sha, maintenance_sha, r2)
+    first_metadata = json.loads(
+        (repo / "local-patches" / ".release_base").read_text(encoding="utf-8")
+    )
+    assert first_metadata["format_version"] == 2
+    assert first_metadata["integration_mode"] == "incremental-merge"
+    assert first_metadata["base_sha"] == r2
+    assert first_metadata["target_sha"] == r2
     assert (repo / "tracked.txt").read_text(encoding="utf-8") == "upstream one\nlocal addition\n"
     assert (repo / "upstream-release.txt").read_text(encoding="utf-8") == "upstream release two\n"
     assert (repo / "blob.bin").read_bytes() == b"local\\x00binary\\x00\\xff"
@@ -483,11 +584,17 @@ def test_binary_mode_symlink_and_rename_payload_survive_two_releases(tmp_path):
     r3 = _commit(repo, "release three")
     _git(repo, "tag", "-a", "v3.0.0", "-m", "v3.0.0")
     _git(repo, "switch", "hermes-release")
-    update_cmd._upgrade_release_transaction(
+    second_result = update_cmd._upgrade_release_transaction(
         ["git"], repo, "v3.0.0", r3,
         candidate_validator=_test_candidate_validator,
     )
 
+    second_merge_sha = (
+        _git(repo, "rev-parse", f"{second_result.candidate_sha}^")
+        .stdout.decode()
+        .strip()
+    )
+    _assert_merge_parents(repo, second_merge_sha, first_promoted_sha, r3)
     assert "upstream release three" in (repo / "upstream-release.txt").read_text(encoding="utf-8")
     assert (repo / "blob.bin").read_bytes() == b"local\\x00binary\\x00\\xff"
     assert (repo / "link-to-local").is_symlink()

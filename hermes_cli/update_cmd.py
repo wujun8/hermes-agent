@@ -540,6 +540,8 @@ class ReleaseBaseMetadata:
     target_sha: str | None = None
     patch_sha256: str | None = None
     patch_bytes: int | None = None
+    format_version: int = 1
+    integration_mode: str = "snapshot-patch"
 
 
 @dataclass(frozen=True)
@@ -1531,6 +1533,8 @@ def _parse_release_base_metadata(raw: bytes, source: str) -> ReleaseBaseMetadata
     target_sha = payload.get("target_sha")
     patch_sha256 = payload.get("patch_sha256")
     patch_bytes = payload.get("patch_bytes")
+    format_version = payload.get("format_version", 1)
+    integration_mode = payload.get("integration_mode")
     if not isinstance(tag, str) or not tag:
         raise RuntimeError(f"Invalid release metadata {source}: missing tag")
     if not isinstance(base_sha, str) or not _SHA_RE.fullmatch(base_sha):
@@ -1548,12 +1552,32 @@ def _parse_release_base_metadata(raw: bytes, source: str) -> ReleaseBaseMetadata
         not isinstance(patch_bytes, int) or patch_bytes < 0
     ):
         raise RuntimeError(f"Invalid release metadata {source}: invalid patch_bytes")
+    if not isinstance(format_version, int) or isinstance(format_version, bool):
+        raise RuntimeError(f"Invalid release metadata {source}: invalid format_version")
+    if format_version not in {1, 2}:
+        raise RuntimeError(
+            f"Invalid release metadata {source}: unsupported format_version {format_version}"
+        )
+    if integration_mode is None:
+        integration_mode = "snapshot-patch" if format_version == 1 else "incremental-merge"
+    if integration_mode not in {"snapshot-patch", "incremental-merge"}:
+        raise RuntimeError(f"Invalid release metadata {source}: invalid integration_mode")
+    if format_version == 1 and integration_mode != "snapshot-patch":
+        raise RuntimeError(
+            f"Invalid release metadata {source}: format_version 1 requires snapshot-patch"
+        )
+    if format_version == 2 and integration_mode != "incremental-merge":
+        raise RuntimeError(
+            f"Invalid release metadata {source}: format_version 2 requires incremental-merge"
+        )
     return ReleaseBaseMetadata(
         tag=tag,
         base_sha=base_sha.lower(),
         target_sha=target_sha.lower() if isinstance(target_sha, str) else None,
         patch_sha256=patch_sha256.lower() if isinstance(patch_sha256, str) else None,
         patch_bytes=patch_bytes,
+        format_version=format_version,
+        integration_mode=integration_mode,
     )
 
 
@@ -1606,6 +1630,37 @@ def _validate_release_base_metadata(
         raise RuntimeError(
             f"Release metadata target {metadata.target_sha} is missing from the repository."
         )
+
+
+def _validate_incremental_release_target(
+    git_cmd: list[str],
+    cwd: Path | str,
+    *,
+    previous_base_sha: str,
+    target_sha: str,
+) -> None:
+    """Require release upgrades to advance the recorded upstream lineage."""
+
+    ancestry = subprocess.run(
+        git_cmd + ["merge-base", "--is-ancestor", previous_base_sha, target_sha],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if ancestry.returncode == 0:
+        return
+    if ancestry.returncode == 1:
+        raise RuntimeError(
+            f"Release target {target_sha} does not descend from the recorded upstream "
+            f"base {previous_base_sha}; refusing a non-linear maintenance merge."
+        )
+    detail = (ancestry.stderr or ancestry.stdout or "").strip()
+    raise RuntimeError(
+        "Could not verify release ancestry"
+        + (f": {detail.splitlines()[0]}" if detail else ".")
+    )
 
 
 def _maintenance_pathspec() -> str:
@@ -2574,6 +2629,120 @@ def _apply_payload_to_candidate(
             pass
 
 
+def _merge_release_into_candidate(
+    git_cmd: list[str],
+    candidate: Path,
+    *,
+    maintenance_sha: str,
+    target_sha: str,
+    release_tag: str,
+) -> str:
+    """Incrementally merge one upstream release into an isolated candidate."""
+
+    merged = subprocess.run(
+        git_cmd
+        + [
+            "-c",
+            "rerere.enabled=true",
+            "-c",
+            "rerere.autoupdate=true",
+            "merge",
+            "--no-ff",
+            "--no-commit",
+            target_sha,
+        ],
+        cwd=candidate,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    unmerged = subprocess.run(
+        git_cmd + ["ls-files", "--unmerged"],
+        cwd=candidate,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    conflict_paths: list[str] = []
+    for line in (unmerged.stdout or "").splitlines():
+        path = line.split("\t", 1)[1].strip() if "\t" in line else ""
+        if path and path not in conflict_paths:
+            conflict_paths.append(path)
+
+    merge_head = _git_resolve_commit(git_cmd, candidate, "MERGE_HEAD")
+    if (
+        unmerged.returncode != 0
+        or conflict_paths
+        or merge_head != target_sha
+        or (merged.returncode != 0 and merge_head is None)
+    ):
+        detail_parts: list[str] = []
+        if conflict_paths:
+            shown = conflict_paths[:20]
+            suffix = (
+                f" (+{len(conflict_paths) - len(shown)} more)"
+                if len(conflict_paths) > len(shown)
+                else ""
+            )
+            detail_parts.append("unmerged path(s): " + ", ".join(shown) + suffix)
+        if unmerged.returncode != 0:
+            detail_parts.append("could not inspect the candidate's unmerged index")
+        merge_output = "\n".join(
+            part.strip()
+            for part in (merged.stderr or "", merged.stdout or "")
+            if part and part.strip()
+        )
+        if merge_output:
+            detail_parts.append(merge_output[:4000])
+        detail = "; ".join(detail_parts) or "incremental git merge failed"
+        raise RuntimeError(
+            f"Release {release_tag} conflicts in isolated candidate: {detail}"
+        )
+
+    _validate_candidate_gitlinks(git_cmd, candidate)
+    commit = subprocess.run(
+        git_cmd
+        + [
+            "commit",
+            "--no-gpg-sign",
+            "-m",
+            f"local: merge upstream release {release_tag}",
+        ],
+        cwd=candidate,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if commit.returncode != 0:
+        detail = (commit.stderr or commit.stdout or "").strip()
+        raise RuntimeError(
+            f"Could not commit incremental release merge: "
+            f"{detail.splitlines()[0] if detail else 'git commit failed'}"
+        )
+
+    candidate_head = _git_resolve_commit(git_cmd, candidate, "HEAD")
+    parents = subprocess.run(
+        git_cmd + ["rev-list", "--parents", "-n", "1", "HEAD"],
+        cwd=candidate,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    fields = (parents.stdout or "").strip().lower().split()
+    expected = [candidate_head, maintenance_sha, target_sha]
+    if parents.returncode != 0 or fields != expected:
+        raise RuntimeError(
+            "Incremental release candidate did not preserve the expected maintenance "
+            "and upstream parents."
+        )
+    assert candidate_head is not None
+    return candidate_head
+
+
 def _validate_candidate_gitlinks(git_cmd: list[str], candidate: Path) -> None:
     """Reject submodule-like index entries before a candidate is applied."""
 
@@ -2669,7 +2838,7 @@ def _upgrade_release_transaction(
     transaction_context: ReleaseUpgradeContext | None = None,
     candidate_validator=None,
 ) -> ReleaseUpgradeResult:
-    """Replay maintenance changes in isolation, then CAS-promote the candidate."""
+    """Merge an upstream release in isolation, then CAS-promote the candidate."""
 
     root = Path(cwd).resolve()
     _validate_release_tag_name(git_cmd, root, release_tag)
@@ -2723,6 +2892,12 @@ def _upgrade_release_transaction(
     context = transaction_context
     if context is None:
         metadata = _read_release_base_metadata(root)
+        _validate_incremental_release_target(
+            git_cmd,
+            root,
+            previous_base_sha=metadata.base_sha,
+            target_sha=target_sha,
+        )
         payload = _generate_runtime_local_payload(git_cmd, root, metadata, head_sha=old_sha)
         context = _create_release_upgrade_context(
             git_cmd,
@@ -2743,6 +2918,15 @@ def _upgrade_release_transaction(
         message = "Live maintenance ref changed before promotion; candidate and backup were preserved."
         _release_mark_manual_interference(context, message)
         raise ReleaseGitStateError(message)
+    recorded_base_sha = journal.get("base_sha")
+    if not isinstance(recorded_base_sha, str) or not _SHA_RE.fullmatch(recorded_base_sha):
+        raise RuntimeError("Release transaction has no valid recorded upstream base.")
+    _validate_incremental_release_target(
+        git_cmd,
+        root,
+        previous_base_sha=recorded_base_sha.lower(),
+        target_sha=target_sha,
+    )
     if "pre_cas_snapshot" in journal:
         try:
             current_snapshot = _validate_release_git_snapshot(
@@ -2783,7 +2967,7 @@ def _upgrade_release_transaction(
 
     try:
         worktree = subprocess.run(
-            git_cmd + ["worktree", "add", "-b", candidate_branch, str(candidate_path), target_sha],
+            git_cmd + ["worktree", "add", "-b", candidate_branch, str(candidate_path), old_sha],
             cwd=root,
             capture_output=True,
             text=True,
@@ -2799,18 +2983,19 @@ def _upgrade_release_transaction(
             )
         _journal_update(context, "candidate-created", candidate_created=True)
         _validate_candidate_gitlinks(git_cmd, candidate_path)
-        _apply_payload_to_candidate(git_cmd, candidate_path, payload, label=release_tag)
-        _commit_candidate_changes(
-            git_cmd, candidate_path, f"local: replay maintenance payload onto {release_tag}"
+        candidate_head = _merge_release_into_candidate(
+            git_cmd,
+            candidate_path,
+            maintenance_sha=old_sha,
+            target_sha=target_sha,
+            release_tag=release_tag,
         )
-        candidate_head = _git_resolve_commit(git_cmd, candidate_path, "HEAD")
-        if candidate_head is None:
-            raise RuntimeError("Candidate payload commit did not produce a commit SHA.")
         artifact_dir = _candidate_artifact_directory(candidate_path)
         artifact_payload = _git_diff_bytes(git_cmd, candidate_path, target_sha, candidate_head)
         artifact_sha = hashlib.sha256(artifact_payload).hexdigest()
         artifact_metadata = {
-            "format_version": 1,
+            "format_version": 2,
+            "integration_mode": "incremental-merge",
             "tag": release_tag,
             "base_sha": target_sha,
             "target_sha": target_sha,
@@ -3031,6 +3216,12 @@ def _prepare_and_promote_release(
     maintenance_sha = original_snapshot.maintenance_ref_sha
     metadata = _read_release_base_metadata_at_commit(git_cmd, root, maintenance_sha)
     _validate_release_base_metadata(git_cmd, root, metadata, maintenance_sha)
+    _validate_incremental_release_target(
+        git_cmd,
+        root,
+        previous_base_sha=metadata.base_sha,
+        target_sha=target_sha.lower(),
+    )
     payload = _git_diff_bytes(git_cmd, root, metadata.base_sha, maintenance_sha)
     context = _create_release_upgrade_context(
         git_cmd,
@@ -4728,16 +4919,18 @@ _LOCAL_PATCHES_README = """# Hermes local release patches
 These artifacts are maintained on the ``hermes-release`` branch.
 
 ``hermes upgrade`` captures user changes before any cleanup, generates the
-maintenance payload from committed Git history (not this file), replays it in
-a temporary candidate worktree with ``git apply --3way --index``, validates the
-candidate, and only then promotes it.  The generated patch is a portable,
-byte-safe snapshot for inspection and recovery; it is never the sole source of
-truth for an upgrade.
+maintenance payload from committed Git history (not this file), incrementally
+merges the new upstream release into the long-lived maintenance history in a
+temporary candidate worktree, validates the candidate, and only then promotes
+it.  Git rerere is enabled for the isolated merge so a previously recorded
+resolution can be reused.  The generated patch is a portable, byte-safe
+snapshot for inspection and recovery; it is never the upgrade input or sole
+source of truth.
 
 The payload excludes this directory so the series cannot patch itself.  The
-JSON ``.release_base`` file records the human release tag, immutable base SHA,
-and patch hash/size.  A missing or stale patch artifact therefore cannot make a
-committed local change disappear.
+JSON ``.release_base`` file records the integration mode, human release tag,
+immutable upstream base SHA, and patch hash/size.  A missing or stale patch
+artifact therefore cannot make a committed local change disappear.
 
 ## Regenerate after editing local customizations
 

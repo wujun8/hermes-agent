@@ -3,16 +3,18 @@
 These artifacts are maintained on the ``hermes-release`` branch.
 
 ``hermes upgrade`` captures user changes before any cleanup, generates the
-maintenance payload from committed Git history (not this file), replays it in
-a temporary candidate worktree with ``git apply --3way --index``, validates the
-candidate, and only then promotes it.  The generated patch is a portable,
-byte-safe snapshot for inspection and recovery; it is never the sole source of
-truth for an upgrade.
+maintenance payload from committed Git history (not this file), incrementally
+merges the new upstream release into the long-lived maintenance history in a
+temporary candidate worktree, validates the candidate, and only then promotes
+it.  Git rerere is enabled for the isolated merge so a previously recorded
+resolution can be reused.  The generated patch is a portable, byte-safe
+snapshot for inspection and recovery; it is never the upgrade input or sole
+source of truth.
 
 The payload excludes this directory so the series cannot patch itself.  The
-JSON ``.release_base`` file records the human release tag, immutable base SHA,
-and patch hash/size.  A missing or stale patch artifact therefore cannot make a
-committed local change disappear.
+JSON ``.release_base`` file records the integration mode, human release tag,
+immutable upstream base SHA, and patch hash/size.  A missing or stale patch
+artifact therefore cannot make a committed local change disappear.
 
 ## Regenerate after editing local customizations
 

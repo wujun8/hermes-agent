@@ -237,6 +237,60 @@ def test_gitlink_target_is_rejected_before_payload_apply_or_promotion(tmp_path):
     assert _git(repo, "status", "--porcelain=v1").stdout == b""
 
 
+def test_incremental_merge_reuses_recorded_rerere_resolution(tmp_path):
+    repo = tmp_path / "rerere-repo"
+    repo.mkdir()
+    _git(repo, "init", "-b", "main")
+    _git(repo, "config", "user.name", "Hermes Rerere Test")
+    _git(repo, "config", "user.email", "hermes-rerere@example.invalid")
+    conflict = repo / "conflict.txt"
+    conflict.write_text("base\n", encoding="utf-8")
+    _commit(repo, "base")
+
+    _git(repo, "switch", "-c", "maintenance")
+    conflict.write_text("local\n", encoding="utf-8")
+    maintenance_sha = _commit(repo, "local change")
+
+    _git(repo, "switch", "main")
+    conflict.write_text("upstream\n", encoding="utf-8")
+    target_sha = _commit(repo, "upstream change")
+
+    first = tmp_path / "candidate-first"
+    _git(repo, "worktree", "add", "-b", "candidate-first", str(first), maintenance_sha)
+    with pytest.raises(RuntimeError, match="conflict.txt"):
+        update_cmd._merge_release_into_candidate(
+            ["git"],
+            first,
+            maintenance_sha=maintenance_sha,
+            target_sha=target_sha,
+            release_tag="v2.0.0",
+        )
+    (first / "conflict.txt").write_text("local\nupstream\n", encoding="utf-8")
+    _git(first, "add", "conflict.txt")
+    _git(first, "-c", "rerere.enabled=true", "rerere")
+    _git(repo, "worktree", "remove", "--force", str(first))
+    _git(repo, "branch", "-D", "candidate-first")
+
+    second = tmp_path / "candidate-second"
+    _git(repo, "worktree", "add", "-b", "candidate-second", str(second), maintenance_sha)
+    candidate_sha = update_cmd._merge_release_into_candidate(
+        ["git"],
+        second,
+        maintenance_sha=maintenance_sha,
+        target_sha=target_sha,
+        release_tag="v2.0.0",
+    )
+
+    assert (second / "conflict.txt").read_text(encoding="utf-8") == "local\nupstream\n"
+    parents = (
+        _git(second, "rev-list", "--parents", "-n", "1", candidate_sha)
+        .stdout.decode()
+        .split()
+    )
+    assert parents == [candidate_sha, maintenance_sha, target_sha]
+    assert _git(repo, "config", "--get", "rerere.enabled", check=False).returncode == 1
+
+
 def test_payload_apply_reports_actual_unmerged_paths(monkeypatch, tmp_path):
     def fake_run(command, **_kwargs):
         if command[-2:] == ["ls-files", "--unmerged"]:

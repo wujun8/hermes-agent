@@ -87,8 +87,9 @@ def build_update_parser(
         "upgrade",
         help="Upgrade Hermes Agent to the latest published Release",
         description=(
-            "Fetch the latest GitHub Release, reset the local hermes-release "
-            "branch to that tag, then reapply in-repo local-patches/"
+            "Fetch the latest GitHub Release, incrementally merge it into the "
+            "long-lived hermes-release branch, then validate and promote the "
+            "isolated candidate"
         ),
     )
     upgrade_parser.add_argument(

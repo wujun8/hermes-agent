@@ -238,9 +238,18 @@ def test_fault_f2_candidate_commit_failure_retains_candidate_evidence(tmp_path, 
     real_run = subprocess.run
     seen_candidate = {}
 
-    def fail_after_payload(git_cmd, candidate, message):
+    def fail_after_merge(git_cmd, candidate, message):
         seen_candidate["path"] = candidate
         assert (candidate / "maintenance.txt").read_text(encoding="utf-8") == "maintenance payload\n"
+        assert (candidate / "release.txt").read_text(encoding="utf-8") == "release payload\n"
+        parents = real_run(
+            git_cmd + ["rev-list", "--parents", "-n", "1", "HEAD"],
+            cwd=candidate,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.split()
+        assert parents[1:] == [fixture.old_sha, fixture.target_sha]
         staged = real_run(
             git_cmd + ["diff", "--cached", "--name-only"],
             cwd=candidate,
@@ -248,10 +257,14 @@ def test_fault_f2_candidate_commit_failure_retains_candidate_evidence(tmp_path, 
             text=True,
             check=True,
         )
-        assert "maintenance.txt" in staged.stdout.splitlines()
+        assert set(staged.stdout.splitlines()) == {
+            "local-patches/.release_base",
+            "local-patches/0001-local-maintenance.patch",
+            "local-patches/README.md",
+        }
         raise RuntimeError("synthetic candidate commit failure")
 
-    monkeypatch.setattr(update_cmd, "_commit_candidate_changes", fail_after_payload)
+    monkeypatch.setattr(update_cmd, "_commit_candidate_changes", fail_after_merge)
 
     with pytest.raises(RuntimeError, match="synthetic candidate commit failure"):
         _prepare(fixture)
