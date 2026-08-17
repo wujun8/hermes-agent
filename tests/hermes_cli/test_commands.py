@@ -21,6 +21,7 @@ from hermes_cli.commands import (
     _sanitize_telegram_name,
     discord_skill_commands,
     gateway_help_lines,
+    is_gateway_known_command,
     resolve_command,
     slack_app_manifest,
     slack_native_slashes,
@@ -138,6 +139,24 @@ class TestGatewayKnownCommands:
 
     def test_is_frozenset(self):
         assert isinstance(GATEWAY_KNOWN_COMMANDS, frozenset)
+
+    def test_micro_is_typed_gateway_command_but_not_a_platform_menu_entry(self):
+        assert "micro" in GATEWAY_KNOWN_COMMANDS
+        assert is_gateway_known_command("micro")
+        assert any(line.startswith("`/micro ") for line in gateway_help_lines())
+        assert "micro" in slack_subcommand_map()
+
+        slack = slack_native_slashes()
+        slack_names = [name for name, _description, _hint in slack]
+        assert "micro" not in slack_names
+        assert len(slack) == 50
+        assert slack_names[-1] == "platform"
+
+        telegram_names = {name for name, _description in telegram_bot_commands()}
+        assert "micro" not in telegram_names
+        telegram_menu, _hidden = telegram_menu_commands(max_commands=60)
+        assert len(telegram_menu) <= 60
+        assert "micro" not in {name for name, _description in telegram_menu}
 
 
 class TestGatewayHelpLines:

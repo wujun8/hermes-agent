@@ -7,7 +7,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from gateway.session import SessionSource, build_session_key
-from gateway.run import GatewayRunner
+from gateway.run import (
+    GatewayRunner,
+    ProfileRouteRejectedError,
+    SecondaryPortBindingConfigError,
+)
 from gateway.profile_routing import ProfileRoute, ProfileRouteRejected
 from gateway.config import GatewayConfig, Platform
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent
@@ -20,6 +24,7 @@ def mock_runner():
     runner.config = MagicMock(profile_routes=[])
     # Bind the actual methods to the mock
     runner._profile_name_for_source = GatewayRunner._profile_name_for_source.__get__(runner)
+    runner._served_profile_names_for_source = GatewayRunner._served_profile_names_for_source.__get__(runner)
     runner._resolve_profile_home_for_source = GatewayRunner._resolve_profile_home_for_source.__get__(runner)
     return runner
 
@@ -58,45 +63,38 @@ class TestResolutionOrder:
     def test_source_profile_wins_over_routing(self, mock_runner, discord_source):
         """source.profile should be used even if routing would match."""
         discord_source.profile = "from-source"
-        
-        with patch("hermes_cli.profiles.get_active_profile_name", return_value="active"):
-            with patch("hermes_cli.profiles.get_profile_dir") as mock_get_dir:
-                with patch("hermes_cli.profiles.profile_exists", return_value=True):
-                    mock_get_dir.return_value = Path("/hermes/profiles/from-source")
-                    result = mock_runner._resolve_profile_home_for_source(discord_source)
-                    
-                    assert result == Path("/hermes/profiles/from-source")
-                    mock_get_dir.assert_called_once_with("from-source")
+        mock_runner._served_profile_names = {"from-source"}
+
+        with patch("hermes_cli.profiles.resolve_profile_home", return_value=Path("/hermes/profiles/from-source")) as resolver:
+            result = mock_runner._resolve_profile_home_for_source(discord_source)
+
+        assert result == Path("/hermes/profiles/from-source")
+        resolver.assert_called_once_with("from-source", require_exists=True)
     
     
     
 
 
 class TestMissingProfileWarning:
-    """Tests for warning when a profile doesn't exist on disk."""
+    """Invalid or missing explicit profiles are refused without fallback."""
     
     def test_nonexistent_profile_warning(self, mock_runner, discord_source, caplog):
-        """When source.profile points to a nonexistent profile, log a WARNING."""
+        """When source.profile points to a nonexistent profile, refuse it."""
         discord_source.profile = "nonexistent"
-        
-        with patch("hermes_cli.profiles.get_active_profile_name", return_value="active"):
-            with patch("hermes_cli.profiles.get_profile_dir") as mock_get_dir:
-                mock_get_dir.return_value = Path("/hermes/profiles/nonexistent")
-                with patch("hermes_cli.profiles.profile_exists", return_value=False):
-                    with patch("hermes_constants.get_hermes_home", return_value=Path("/hermes")):
-                        with caplog.at_level(logging.WARNING):
-                            result = mock_runner._resolve_profile_home_for_source(discord_source)
-                            
-                            # Should fall back to global HERMES_HOME
-                            assert result == Path("/hermes")
-                            
-                            # Should have logged a warning
-                            assert len(caplog.records) == 1
-                            assert caplog.records[0].levelname == "WARNING"
-                            assert "nonexistent" in caplog.records[0].message
-                            assert "does not exist" in caplog.records[0].message
-                            assert "discord" in caplog.records[0].message
-                            assert "123456" in caplog.records[0].message
+        mock_runner._served_profile_names = {"nonexistent"}
+
+        with patch("hermes_cli.profiles.resolve_profile_home", side_effect=FileNotFoundError):
+            with patch("hermes_constants.get_hermes_home", side_effect=AssertionError("must not fallback")):
+                with caplog.at_level(logging.WARNING):
+                    with pytest.raises(ProfileRouteRejectedError, match="^profile route rejected$"):
+                        mock_runner._resolve_profile_home_for_source(discord_source)
+
+        assert len(caplog.records) == 1
+        assert caplog.records[0].levelname == "WARNING"
+        assert "nonexistent" not in caplog.records[0].message
+        assert "does not exist" not in caplog.records[0].message
+        assert "discord" in caplog.records[0].message
+        assert "123456" in caplog.records[0].message
     
     
     
@@ -106,23 +104,20 @@ class TestExceptionHandling:
     """Tests for exception handling in profile resolution."""
     
     def test_get_profile_dir_exception_logs_warning(self, mock_runner, discord_source, caplog):
-        """When get_profile_dir raises an exception, log a WARNING with context."""
+        """When the safe resolver raises, refuse without exposing a path."""
         discord_source.profile = "bad-profile"
-        
-        with patch("hermes_cli.profiles.get_active_profile_name", return_value="active"):
-            with patch("hermes_cli.profiles.get_profile_dir", side_effect=ValueError("Invalid profile name")):
-                with patch("hermes_constants.get_hermes_home", return_value=Path("/hermes")):
-                    with caplog.at_level(logging.WARNING):
-                        result = mock_runner._resolve_profile_home_for_source(discord_source)
-                        
-                        # Should fall back to global HERMES_HOME
-                        assert result == Path("/hermes")
-                        
-                        # Should have logged a warning with exception info
-                        assert len(caplog.records) == 1
-                        assert caplog.records[0].levelname == "WARNING"
-                        assert "bad-profile" in caplog.records[0].message
-                        assert "Failed to resolve profile directory" in caplog.records[0].message
+        mock_runner._served_profile_names = {"bad-profile"}
+
+        with patch("hermes_cli.profiles.resolve_profile_home", side_effect=ValueError("outside profiles root")):
+            with patch("hermes_constants.get_hermes_home", side_effect=AssertionError("must not fallback")):
+                with caplog.at_level(logging.WARNING):
+                    with pytest.raises(ProfileRouteRejectedError, match="^profile route rejected$"):
+                        mock_runner._resolve_profile_home_for_source(discord_source)
+
+        assert len(caplog.records) == 1
+        assert caplog.records[0].levelname == "WARNING"
+        assert "bad-profile" not in caplog.records[0].message
+        assert "outside profiles root" not in caplog.records[0].message
     
 
 
@@ -132,17 +127,14 @@ class TestRoutingConsultation:
     def test_routing_consulted_when_source_profile_empty(self, mock_runner, discord_source):
         """_profile_name_for_source should be called when source.profile is empty."""
         discord_source.profile = None
-        
-        with patch("hermes_cli.profiles.get_active_profile_name", return_value="active"):
-            with patch("hermes_cli.profiles.get_profile_dir") as mock_get_dir:
-                mock_get_dir.return_value = Path("/hermes/profiles/routed")
-                
-                mock_runner._profile_name_for_source = MagicMock(return_value="routed")
-                
-                mock_runner._resolve_profile_home_for_source(discord_source)
-                
-                # Should have called routing
-                mock_runner._profile_name_for_source.assert_called_once_with(discord_source)
+        mock_runner._served_profile_names = {"routed"}
+        mock_runner._profile_name_for_source = MagicMock(return_value="routed")
+
+        with patch("hermes_cli.profiles.resolve_profile_home", return_value=Path("/hermes/profiles/routed")):
+            mock_runner._resolve_profile_home_for_source(discord_source)
+
+        # Should have called routing
+        mock_runner._profile_name_for_source.assert_called_once_with(discord_source)
     
 
 
@@ -386,4 +378,239 @@ class TestMultiplexGate:
 
         assert mock_runner._profile_name_for_source(discord_source) is None
 
+
+class TestProfileRouteContainment:
+    """Runner authorization is separate from filesystem discovery and fallback."""
+
+    @staticmethod
+    def _tree(tmp_path, monkeypatch):
+        import hermes_cli.profiles as profiles_mod
+
+        default_home = tmp_path / ".hermes"
+        profiles_root = default_home / "profiles"
+        secondary = profiles_root / "secondary"
+        active = profiles_root / "active"
+        hidden = profiles_root / "hidden"
+        outside = tmp_path / "outside"
+        for home in (default_home, profiles_root, secondary, active, hidden, outside):
+            home.mkdir(exist_ok=True)
+        for home, marker in ((secondary, "secondary"), (active, "active"), (hidden, "hidden"), (outside, "outside")):
+            (home / "config.yaml").write_text(f"marker: {marker}\n", encoding="utf-8")
+            (home / ".env").write_text(f"PROFILE_MARKER={marker}\n", encoding="utf-8")
+            (home / "state.db").write_bytes(f"{marker}-state".encode())
+        monkeypatch.setattr(profiles_mod, "_get_default_hermes_home", lambda: default_home)
+        monkeypatch.setattr(profiles_mod, "_get_profiles_root", lambda: profiles_root)
+        return default_home, profiles_root, secondary, active, hidden, outside
+
+    @staticmethod
+    def _runner(served):
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = GatewayConfig(multiplex_profiles=True, profile_routes=[])
+        runner._served_profile_names = set(served)
+        return runner
+
+    def test_invalid_and_existing_unserved_routes_do_not_touch_outside_files(
+        self, tmp_path, monkeypatch
+    ):
+        _default, _root, _secondary, _active, hidden, outside = self._tree(
+            tmp_path, monkeypatch
+        )
+        runner = self._runner({"default", "secondary"})
+
+        before = {
+            name: (path / name).read_bytes()
+            for path in (outside, hidden)
+            for name in ("config.yaml", ".env", "state.db")
+        }
+
+        invalid = SessionSource(platform=Platform.DISCORD, chat_id="bad", profile="../outside")
+        with pytest.raises(ProfileRouteRejectedError):
+            runner._resolve_profile_home_for_source(invalid)
+
+        unserved = SessionSource(platform=Platform.DISCORD, chat_id="hidden", profile="hidden")
+        with patch("hermes_cli.profiles.resolve_profile_home") as resolver:
+            with pytest.raises(ProfileRouteRejectedError):
+                runner._resolve_profile_home_for_source(unserved)
+        resolver.assert_not_called()
+
+        after = {
+            name: (path / name).read_bytes()
+            for path in (outside, hidden)
+            for name in ("config.yaml", ".env", "state.db")
+        }
+        assert after == before
+
+    def test_configured_secondary_is_authorized_even_without_adapter_and_active_default_resolve(
+        self, tmp_path, monkeypatch
+    ):
+        default, _root, secondary, active, _hidden, _outside = self._tree(
+            tmp_path, monkeypatch
+        )
+        runner = self._runner({"default", "secondary", "active"})
+
+        secondary_source = SessionSource(
+            platform=Platform.DISCORD, chat_id="secondary", profile="SeCoNdArY"
+        )
+        assert runner._resolve_profile_home_for_source(secondary_source) == secondary.resolve()
+
+        with patch("hermes_cli.profiles.get_active_profile_name", return_value="default"):
+            default_source = SessionSource(platform=Platform.DISCORD, chat_id="default")
+            assert runner._resolve_profile_home_for_source(default_source) == default.resolve()
+
+        with patch("hermes_cli.profiles.get_active_profile_name", return_value="active"):
+            active_source = SessionSource(platform=Platform.DISCORD, chat_id="active")
+            assert runner._resolve_profile_home_for_source(active_source) == active.resolve()
+
+    def test_startup_publishes_secondary_before_adapter_skip(self, tmp_path, monkeypatch):
+        import asyncio
+
+        default, _root, secondary, _active, _hidden, _outside = self._tree(
+            tmp_path, monkeypatch
+        )
+        runner = self._runner(set())
+        runner.adapters = {}
+        runner._profile_adapters = {}
+        runner._failed_platforms = {}
+        runner.pairing_stores = {}
+        runner.pairing_store = MagicMock()
+        runner._start_one_profile_adapters = AsyncMock(
+            side_effect=SecondaryPortBindingConfigError("shared listener")
+        )
+
+        with patch(
+            "hermes_cli.profiles.profiles_to_serve",
+            return_value=[("default", default), ("secondary", secondary)],
+        ), patch("hermes_cli.profiles.get_active_profile_name", return_value="default"), \
+                patch("gateway.status.write_runtime_status"):
+            assert asyncio.run(runner._start_secondary_profile_adapters()) == 0
+
+        assert runner._served_profile_names == {"default", "secondary"}
+
+
+class TestProfileRuntimeScopeCleanup:
+    """Every setup/body failure restores the exact caller context."""
+
+    @staticmethod
+    def _assert_context(home, secrets):
+        from agent.secret_scope import current_secret_scope
+        from hermes_constants import get_hermes_home_override
+
+        assert get_hermes_home_override() == str(home)
+        assert current_secret_scope() == secrets
+
+    def _failure_case(self, tmp_path, patchers):
+        from agent.secret_scope import reset_secret_scope, set_secret_scope
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+        from gateway.run import _profile_runtime_scope
+
+        outer_home = tmp_path / "outer"
+        profile_home = tmp_path / "profile"
+        outer_home.mkdir()
+        profile_home.mkdir()
+        (profile_home / ".env").write_text("INNER=1\n", encoding="utf-8")
+        outer_secrets = {"OUTER": "yes"}
+        home_token = set_hermes_home_override(outer_home)
+        secret_token = set_secret_scope(outer_secrets)
+        try:
+            with patchers:
+                with pytest.raises(RuntimeError, match="scope boom"):
+                    with _profile_runtime_scope(profile_home):
+                        pass
+            self._assert_context(outer_home, outer_secrets)
+        finally:
+            reset_secret_scope(secret_token)
+            reset_hermes_home_override(home_token)
+
+    def test_hydrate_failure_restores_prior_home_and_secret(self, tmp_path):
+        from unittest.mock import patch
+
+        self._failure_case(
+            tmp_path,
+            patch(
+                "hermes_cli.env_loader.hydrate_profile_secret_sources",
+                side_effect=RuntimeError("scope boom"),
+            ),
+        )
+
+    def test_build_scope_failure_restores_prior_home_and_secret(self, tmp_path):
+        from unittest.mock import patch
+
+        self._failure_case(
+            tmp_path,
+            patch(
+                "agent.secret_scope.build_profile_secret_scope",
+                side_effect=RuntimeError("scope boom"),
+            ),
+        )
+
+    def test_set_scope_failure_restores_prior_home_and_secret(self, tmp_path):
+        from unittest.mock import patch
+
+        self._failure_case(
+            tmp_path,
+            patch(
+                "agent.secret_scope.set_secret_scope",
+                side_effect=RuntimeError("scope boom"),
+            ),
+        )
+
+    def test_body_failure_restores_prior_home_and_secret(self, tmp_path):
+        from agent.secret_scope import reset_secret_scope, set_secret_scope
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+        from gateway.run import _profile_runtime_scope
+
+        outer_home = tmp_path / "outer"
+        profile_home = tmp_path / "profile"
+        outer_home.mkdir()
+        profile_home.mkdir()
+        (profile_home / ".env").write_text("INNER=1\n", encoding="utf-8")
+        outer_secrets = {"OUTER": "yes"}
+        home_token = set_hermes_home_override(outer_home)
+        secret_token = set_secret_scope(outer_secrets)
+        try:
+            with pytest.raises(RuntimeError, match="body boom"):
+                with _profile_runtime_scope(profile_home):
+                    raise RuntimeError("body boom")
+            self._assert_context(outer_home, outer_secrets)
+        finally:
+            reset_secret_scope(secret_token)
+            reset_hermes_home_override(home_token)
+
+    def test_nested_success_restores_each_exact_parent_context(self, tmp_path):
+        from agent.secret_scope import current_secret_scope, reset_secret_scope, set_secret_scope
+        from hermes_constants import (
+            get_hermes_home_override,
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+        from gateway.run import _profile_runtime_scope
+
+        outer_home = tmp_path / "outer"
+        profile_a = tmp_path / "profile-a"
+        profile_b = tmp_path / "profile-b"
+        for home, value in ((outer_home, "outer"), (profile_a, "a"), (profile_b, "b")):
+            home.mkdir()
+            (home / ".env").write_text(f"PROFILE={value}\n", encoding="utf-8")
+        outer_secrets = {"OUTER": "yes"}
+        home_token = set_hermes_home_override(outer_home)
+        secret_token = set_secret_scope(outer_secrets)
+        try:
+            with _profile_runtime_scope(profile_a):
+                assert get_hermes_home_override() == str(profile_a)
+                scope_a = current_secret_scope()
+                assert scope_a is not None
+                assert scope_a["PROFILE"] == "a"
+                with _profile_runtime_scope(profile_b):
+                    assert get_hermes_home_override() == str(profile_b)
+                    scope_b = current_secret_scope()
+                    assert scope_b is not None
+                    assert scope_b["PROFILE"] == "b"
+                assert get_hermes_home_override() == str(profile_a)
+                restored_a = current_secret_scope()
+                assert restored_a is not None
+                assert restored_a["PROFILE"] == "a"
+            self._assert_context(outer_home, outer_secrets)
+        finally:
+            reset_secret_scope(secret_token)
+            reset_hermes_home_override(home_token)
 

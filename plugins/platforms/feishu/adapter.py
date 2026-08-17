@@ -58,6 +58,7 @@ import logging
 import mimetypes
 import os
 import re
+import subprocess
 import threading
 import time
 import uuid
@@ -255,6 +256,27 @@ _APPROVAL_LABEL_MAP: Dict[str, str] = {
     "always": "Approved permanently",
     "deny": "Denied",
 }
+
+# Monitor-driven TUI approvals: the session-monitor cron script detects a
+# pending ApprovalPrompt in a tmux-hosted Hermes TUI and sends a Feishu card
+# with these buttons. Clicking one calls back here, and the gateway relays the
+# matching TUI keypress (1/2/3 = once/session/always, Escape = deny) into the
+# tmux pane via ``tmux send-keys``. Deny uses Escape because the TUI maps Esc
+# to deny even when "Always allow" is hidden (smart-deny) and the quick-pick
+# numbering shrinks.
+MONITOR_TUI_APPROVAL_ACTION = "monitor_tui_approval"
+_MONITOR_APPROVAL_CHOICE_KEY_MAP: Dict[str, str] = {
+    "once": "1",
+    "session": "2",
+    "always": "3",
+}
+_MONITOR_APPROVAL_RESOLVED_LABEL: Dict[str, str] = {
+    "once": "已允许一次",
+    "session": "已允许本次会话",
+    "always": "已始终允许",
+    "deny": "已拒绝",
+}
+_MONITOR_TUI_PANE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]*:\d+\.\d+$")
 
 
 async def _read_limited_feishu_webhook_body(request: Any, max_bytes: int) -> bytes:
@@ -2735,6 +2757,10 @@ class FeishuAdapter(BasePlatformAdapter):
             if isinstance(action_value, dict) else None
         )
 
+        if hermes_action == MONITOR_TUI_APPROVAL_ACTION:
+            return self._handle_monitor_tui_approval_card_action(
+                event=event, action_value=action_value, loop=loop,
+            )
         if hermes_action:
             return self._handle_approval_card_action(event=event, action_value=action_value, loop=loop)
         if update_prompt_action:
@@ -2832,6 +2858,93 @@ class FeishuAdapter(BasePlatformAdapter):
             card.type = "raw"
             card.data = self._build_resolved_approval_card(choice=choice, user_name=user_name)
             response.card = card
+        return response
+
+    @staticmethod
+    def _build_monitor_resolved_card(*, choice: str, user_name: str) -> Dict[str, Any]:
+        """Build raw card JSON for a resolved monitor TUI approval action."""
+        icon = "❌" if choice == "deny" else "✅"
+        label = _MONITOR_APPROVAL_RESOLVED_LABEL.get(choice, "已处理")
+        return {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "title": {"content": f"{icon} {label}", "tag": "plain_text"},
+                "template": "red" if choice == "deny" else "green",
+            },
+            "elements": [
+                {"tag": "markdown", "content": f"{icon} **{label}**（{user_name}）—— 按键已转发到 tmux 会话。"},
+            ],
+        }
+
+    def _handle_monitor_tui_approval_card_action(self, *, event: Any, action_value: Dict[str, Any], loop: Any) -> Any:
+        """Relay a monitor-card approval choice into the tmux-hosted TUI.
+
+        The session-monitor cron script posts an interactive card with
+        ``hermes_action=monitor_tui_approval`` buttons when it spots a pending
+        ApprovalPrompt in the monitored TUI's tmux pane. A click here maps the
+        choice to the TUI keypress (1/2/3 quick-pick, Escape for deny) and
+        sends it into the pane with ``tmux send-keys`` — the TUI resolves the
+        prompt exactly as if the user pressed the key in the terminal.
+        """
+        choice = str(action_value.get("choice", "") or "").strip()
+        pane = str(action_value.get("pane", "") or "").strip()
+        session_id = str(action_value.get("session_id", "") or "").strip()
+        if choice not in _MONITOR_APPROVAL_RESOLVED_LABEL or not _MONITOR_TUI_PANE_RE.match(pane):
+            logger.warning("[Feishu] Invalid monitor approval action value: choice=%r pane=%r", choice, pane)
+            return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
+
+        operator = getattr(event, "operator", None)
+        open_id = str(getattr(operator, "open_id", "") or "")
+        sender_id = SimpleNamespace(open_id=open_id, user_id=str(getattr(operator, "user_id", "") or ""))
+        chat_id = str(getattr(getattr(event, "context", None), "open_chat_id", "") or "")
+        if not self._allow_group_message(sender_id, chat_id, is_bot=False):
+            logger.warning("[Feishu] Unauthorized monitor approval click by %s", open_id or "<unknown>")
+            return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
+
+        user_name = self._get_cached_sender_name(open_id) or open_id
+        key = "Escape" if choice == "deny" else _MONITOR_APPROVAL_CHOICE_KEY_MAP.get(choice, "Escape")
+        success = True
+        error_text = ""
+        try:
+            result = subprocess.run(
+                ["tmux", "send-keys", "-t", pane, key],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode != 0:
+                success = False
+                error_text = (result.stderr or result.stdout or "tmux exited %d" % result.returncode).strip()
+        except Exception as exc:
+            success = False
+            error_text = str(exc)
+        if not success:
+            logger.warning("[Feishu] tmux send-keys failed for %s: %s", pane, error_text)
+            card = {
+                "config": {"wide_screen_mode": True},
+                "header": {"title": {"content": "❌ 转发失败", "tag": "plain_text"}, "template": "red"},
+                "elements": [{"tag": "markdown", "content": f"无法向 tmux `{pane}` 发送按键：{error_text[:200]}"}],
+            }
+            if P2CardActionTriggerResponse is None:
+                return None
+            response = P2CardActionTriggerResponse()
+            if CallBackCard is not None:
+                card_obj = CallBackCard()
+                card_obj.type = "raw"
+                card_obj.data = card
+                response.card = card_obj
+            return response
+
+        logger.info(
+            "[Feishu] Monitor approval %s relayed to tmux %s (choice=%s, session=%s, user=%s)",
+            choice, pane, choice, session_id, user_name,
+        )
+        if P2CardActionTriggerResponse is None:
+            return None
+        response = P2CardActionTriggerResponse()
+        if CallBackCard is not None:
+            card_obj = CallBackCard()
+            card_obj.type = "raw"
+            card_obj.data = self._build_monitor_resolved_card(choice=choice, user_name=user_name)
+            response.card = card_obj
         return response
 
     def _handle_update_prompt_card_action(self, *, event: Any, action_value: Dict[str, Any], loop: Any) -> Any:
@@ -4821,9 +4934,12 @@ class FeishuAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]],
     ) -> Any:
         effective_reply_to = reply_to
-        if not effective_reply_to and metadata and metadata.get("thread_id"):
-            effective_reply_to = metadata.get("reply_to_message_id")
-        reply_in_thread = bool((metadata or {}).get("thread_id"))
+        thread_id = (metadata or {}).get("thread_id")
+        if not effective_reply_to and thread_id:
+            effective_reply_to = (metadata or {}).get("reply_to_message_id")
+            if not effective_reply_to:
+                effective_reply_to = await self._fetch_last_message_in_thread(thread_id)
+        reply_in_thread = bool(thread_id)
         if effective_reply_to:
             body = self._build_reply_message_body(
                 content=payload,
@@ -4834,34 +4950,21 @@ class FeishuAdapter(BasePlatformAdapter):
             request = self._build_reply_message_request(effective_reply_to, body)
             return await self._run_blocking(self._client.im.v1.message.reply, request)
 
-        # For topic/thread messages that fell back from reply→create, use
-        # thread_id as receive_id so the message lands in the topic instead of
-        # the main chat.
-        _thread_id = (metadata or {}).get("thread_id")
-        if _thread_id:
-            body = self._build_create_message_body(
-                receive_id=_thread_id,
-                msg_type=msg_type,
-                content=payload,
-                uuid_value=str(uuid.uuid4()),
-            )
-            request = self._build_create_message_request("thread_id", body)
-        else:
-            receive_id = chat_id
-            receive_id_type = "chat_id"
-            if chat_id.startswith("feishu_user_id:"):
-                receive_id = chat_id.split(":", 1)[1]
-                receive_id_type = "user_id"
-            elif chat_id.startswith("ou_"):
-                receive_id_type = "open_id"
+        receive_id = chat_id
+        receive_id_type = "chat_id"
+        if chat_id.startswith("feishu_user_id:"):
+            receive_id = chat_id.split(":", 1)[1]
+            receive_id_type = "user_id"
+        elif chat_id.startswith("ou_"):
+            receive_id_type = "open_id"
 
-            body = self._build_create_message_body(
-                receive_id=receive_id,
-                msg_type=msg_type,
-                content=payload,
-                uuid_value=str(uuid.uuid4()),
-            )
-            request = self._build_create_message_request(receive_id_type, body)
+        body = self._build_create_message_body(
+            receive_id=receive_id,
+            msg_type=msg_type,
+            content=payload,
+            uuid_value=str(uuid.uuid4()),
+        )
+        request = self._build_create_message_request(receive_id_type, body)
         return await self._run_blocking(self._client.im.v1.message.create, request)
 
     @staticmethod

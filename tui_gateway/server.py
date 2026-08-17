@@ -3,6 +3,7 @@ import concurrent.futures
 import contextlib
 import contextvars
 import copy
+from dataclasses import dataclass
 import hashlib
 import inspect
 import json
@@ -16,6 +17,7 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Callable, NamedTuple, Optional
 
 from agent.secret_scope import (
@@ -36,7 +38,11 @@ from utils import is_truthy_value
 from tools.environments.local import hermes_subprocess_env
 from agent.replay_cleanup import sanitize_replay_history
 from agent.skill_commands import describe_skill_invocation
-from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
+from agent.conversation_loop import (
+    API_OUTAGE_RECOVERY_RESUME_REASON,
+    INTERRUPT_WAITING_FOR_MODEL_PREFIX,
+    should_auto_resume_api_outage_result,
+)
 from tui_gateway import git_probe
 from tui_gateway.turn_marker import (
     clear_turn_marker,
@@ -155,6 +161,65 @@ _cfg_cache: dict | None = None
 _cfg_mtime: float | None = None
 _cfg_path = None
 _session_resume_lock = threading.Lock()
+
+
+class _MicroControlTarget(NamedTuple):
+    """Frozen identity/routing snapshot for one live ``/micro`` invocation."""
+
+    sid: str
+    session: dict
+    session_key: str
+    agent: Any
+    agent_session_id: str
+    profile_home: str | None
+    generation: int
+    token: object
+
+
+class _CompressionReanchorIdentity(NamedTuple):
+    """Exact identity reserved while a deferred compression re-anchor runs."""
+
+    sid: str
+    session: dict
+    generation: int
+    agent: Any
+    new_session_id: str
+    control_token: object
+    marker: dict
+    old_session_key: str
+    profile_home: str | None
+
+
+@dataclass(frozen=True)
+class _MicroControlReleaseResult:
+    """Structured result for releasing one live ``/micro`` control lease."""
+
+    success: bool
+    warning: str = ""
+    reanchored: bool = False
+
+    def __bool__(self) -> bool:
+        return self.success
+
+
+_SESSION_CONTROL_BUSY = object()
+_MICRO_TURN_BUSY = object()
+_MICRO_TURN_BUSY_MESSAGE = (
+    "session busy — /micro can't run mid-turn; interrupt the current turn first"
+)
+_MICRO_CONTROL_BUSY_MESSAGE = "session busy — /micro control command already in progress"
+_MANUAL_COMPRESSION_TURN_BUSY_MESSAGE = (
+    "session busy — /interrupt the current turn before /compress"
+)
+_DEFERRED_COMPRESSION_ROTATION_KEY = "_deferred_compression_rotation"
+_MANUAL_COMPRESSION_CONTROL_KEY = "_manual_compression_control"
+_MICRO_CONTROL_STATE_KEY = "_micro_control_state"
+_COMPRESSION_SYNC_UNCHANGED = "unchanged"
+_COMPRESSION_SYNC_APPLIED = "applied"
+_COMPRESSION_SYNC_DEFERRED = "deferred"
+_COMPRESSION_SYNC_FAILED = "failed"
+_COMPRESSION_SYNC_IDENTITY_CHANGED = "identity_changed"
+_MICRO_OVERRIDE_UNKNOWN = object()
 try:
     _slash_timeout = float(os.environ.get("HERMES_TUI_SLASH_TIMEOUT_S") or "45")
 except (ValueError, TypeError):
@@ -598,6 +663,90 @@ def _claim_active_session_slot(
         return None, None
 
 
+def _active_session_slot_lock(session: dict) -> threading.Lock:
+    """Return the per-session lock that serializes lazy slot acquisition.
+
+    The lock is deliberately separate from ``history_lock``: acquiring the
+    cross-process active-session lease performs file I/O and must not run while
+    the prompt/control coordination lock is held.
+    """
+    history_lock = session.get("history_lock")
+    if history_lock is None:
+        return session.setdefault("_active_session_slot_lock", threading.Lock())
+    with history_lock:
+        lock = session.get("_active_session_slot_lock")
+        if lock is None:
+            lock = threading.Lock()
+            session["_active_session_slot_lock"] = lock
+        return lock
+
+
+def _release_unowned_active_session_lease(lease, *, sid: str) -> bool:
+    """Release a lease that could not be installed on its original session."""
+    if lease is None:
+        return True
+    try:
+        lease.release()
+    except BaseException as exc:
+        logger.warning(
+            "active-session lease cleanup failed before prompt ownership "
+            "was installed: sid=%s error=%s",
+            sid,
+            exc,
+        )
+        return False
+    return True
+
+
+def _claim_active_session_slot_for_prompt(
+    sid: str, session: dict
+) -> tuple[str | None, Any | None]:
+    """Claim a prompt's active-session slot and return only a new lease.
+
+    The second item is the exact lease installed by *this* invocation.  A
+    pre-existing session lease returns ``(None, None)`` so a later control-busy
+    cleanup cannot release ownership that predates this prompt.
+    """
+    with _active_session_slot_lock(session):
+        history_lock = session.get("history_lock")
+        if history_lock is not None:
+            with history_lock:
+                if session.get("active_session_lease") is not None:
+                    return None, None
+                if session.get("_finalized"):
+                    return None, None
+        elif session.get("active_session_lease") is not None:
+            return None, None
+
+        lease, limit_message = _claim_active_session_slot(
+            str(session.get("session_key") or ""),
+            live_session_id=sid,
+            surface=_session_source(session),
+        )
+        if limit_message is not None:
+            return limit_message, None
+        if lease is None:
+            return None, None
+
+        installed = False
+        if history_lock is not None:
+            with history_lock:
+                if (
+                    session.get("active_session_lease") is None
+                    and not session.get("_finalized")
+                ):
+                    session["active_session_lease"] = lease
+                    installed = True
+        elif session.get("active_session_lease") is None and not session.get("_finalized"):
+            session["active_session_lease"] = lease
+            installed = True
+
+        if not installed:
+            _release_unowned_active_session_lease(lease, sid=sid)
+            return None, None
+        return None, lease
+
+
 def _ensure_active_session_slot(sid: str, session: dict) -> str | None:
     """Claim this session's cap slot on its first real turn; None when ok.
 
@@ -612,29 +761,129 @@ def _ensure_active_session_slot(sid: str, session: dict) -> str | None:
     contract _ensure_session_db_row already uses for the row itself, and keeps
     the invariant that anything holding a slot is something the user can see.
     """
-    if session.get("active_session_lease") is not None:
-        return None
-    lease, limit_message = _claim_active_session_slot(
-        str(session.get("session_key") or ""),
-        live_session_id=sid,
-        surface=_session_source(session),
-    )
-    if limit_message is not None:
-        return limit_message
-    session["active_session_lease"] = lease
-    return None
+    limit_message, _lease = _claim_active_session_slot_for_prompt(sid, session)
+    return limit_message
 
 
-def _release_active_session_slot(session: dict | None) -> None:
+def _release_active_session_slot(
+    session: dict | None,
+    *,
+    sid: str | None = None,
+    expected_lease=None,
+    expected_lease_token=None,
+    reject_active: bool = False,
+) -> bool:
+    """Release an active-session slot, optionally with exact ownership checks.
+
+    The legacy no-argument form releases the session's current lease.  The
+    exact form is used by prompt rejection cleanup and validates the object,
+    lease identity/token, idle state, and registry mapping in separate lock
+    phases.  It never performs the global/file release while ``history_lock``
+    or ``_sessions_lock`` is held.
+    """
     if not session:
-        return
-    lease = session.pop("active_session_lease", None)
-    if lease is None:
-        return
+        return False
+
+    if expected_lease is None:
+        lease = session.pop("active_session_lease", None)
+        if lease is None:
+            return True
+        try:
+            lease.release()
+        except BaseException as exc:
+            logger.warning("Failed to release active session slot: %s", exc)
+            return False
+        return True
+
+    history_lock = session.get("history_lock")
+    if history_lock is None:
+        return False
     try:
-        lease.release()
-    except Exception:
-        logger.debug("Failed to release active session slot", exc_info=True)
+        with history_lock:
+            current = session.get("active_session_lease")
+            token_matches = (
+                expected_lease_token is None
+                or getattr(current, "lease_id", None) == expected_lease_token
+            )
+            if current is not expected_lease or not token_matches:
+                return False
+            if reject_active and session.get("running"):
+                return False
+            session_key = str(session.get("session_key") or "")
+
+        # This is a lock-free registry phase.  In particular, never acquire
+        # _sessions_lock while history_lock is held (or vice versa).
+        if reject_active and _child_run_active(session_key):
+            return False
+        if sid is not None:
+            with _sessions_lock:
+                if _sessions.get(sid) is not session:
+                    return False
+
+        with history_lock:
+            current = session.get("active_session_lease")
+            token_matches = (
+                expected_lease_token is None
+                or getattr(current, "lease_id", None) == expected_lease_token
+            )
+            if current is not expected_lease or not token_matches:
+                return False
+            if reject_active and session.get("running"):
+                return False
+            session.pop("active_session_lease", None)
+
+        try:
+            expected_lease.release()
+        except BaseException as exc:
+            # Keep the exact lease attached when the canonical global release
+            # fails so teardown/orphan reconciliation can retry it.  This is
+            # outside both coordination locks and never masks a prompt error.
+            with history_lock:
+                if session.get("active_session_lease") is None:
+                    session["active_session_lease"] = expected_lease
+            logger.warning(
+                "Failed to release prompt active-session lease: sid=%s error=%s",
+                sid,
+                exc,
+            )
+            return False
+        return True
+    except BaseException as exc:
+        logger.warning(
+            "Prompt active-session lease validation failed: sid=%s error=%s",
+            sid,
+            exc,
+        )
+        return False
+
+
+def _release_prompt_active_session_slot(
+    sid: str,
+    session: dict,
+    lease,
+    *,
+    lease_token=None,
+) -> bool:
+    """Best-effort exact cleanup for a prompt rejected by live control."""
+    if lease is None:
+        return True
+    try:
+        return _release_active_session_slot(
+            session,
+            sid=sid,
+            expected_lease=lease,
+            expected_lease_token=lease_token,
+            reject_active=True,
+        )
+    except BaseException as exc:
+        # A patched/canonical helper must not turn the stable 4009 busy result
+        # into a provider/history mutation or mask an original BaseException.
+        logger.warning(
+            "Prompt active-session lease cleanup failed: sid=%s error=%s",
+            sid,
+            exc,
+        )
+        return False
 
 
 def _transfer_active_session_slot(
@@ -954,7 +1203,7 @@ def _attach_worker(sid: str, session: dict, worker) -> None:
     worker.close()
 
 
-def _pop_session_by_id(sid: str) -> dict | None:
+def _pop_session_by_id(sid: str, *, respect_control: bool = True):
     """Atomically detach one live session from the registry.
 
     Detaching is the ownership claim for teardown: once the record is no
@@ -966,9 +1215,20 @@ def _pop_session_by_id(sid: str) -> dict | None:
     """
     with _sessions_lock:
         session = _sessions.get(sid)
-        if session is not None:
-            session["_closing"] = True
-            _sessions.pop(sid, None)
+        if session is None:
+            return None
+        if respect_control:
+            history_lock = session.get("history_lock")
+            if history_lock is not None:
+                with history_lock:
+                    if session.get("_session_control_inflight") is not None:
+                        return _SESSION_CONTROL_BUSY
+                    # Reserve the exact object before detaching it.  A concurrent
+                    # micro claim can therefore not pass its history-lock check
+                    # between the busy check and the registry pop.
+                    session["_session_control_inflight"] = object()
+        session["_closing"] = True
+        session = _sessions.pop(sid, None)
     if session is None:
         return None
     # The session is already out of _sessions here, so downstream teardown
@@ -982,7 +1242,7 @@ def _teardown_popped_session(
     session: dict | None, *, end_reason: str = "tui_close"
 ) -> bool:
     """Finish a close after the caller has atomically detached the session."""
-    if session is None:
+    if session is None or session is _SESSION_CONTROL_BUSY:
         return False
     run_thread = session.get("_run_thread")
     if (
@@ -1023,13 +1283,15 @@ def _close_session_by_id(
     delegated work before teardown.
     """
     if predicate is None:
-        session = _pop_session_by_id(sid)
+        session = _pop_session_by_id(sid, respect_control=True)
     else:
         with _sessions_lock:
             current = _sessions.get(sid)
             if current is None or not predicate(current):
                 return False
-            session = _pop_session_by_id(sid)
+            session = _pop_session_by_id(sid, respect_control=True)
+    if session is _SESSION_CONTROL_BUSY:
+        return False
     return _teardown_popped_session(session, end_reason=end_reason)
 
 
@@ -1153,6 +1415,9 @@ def _schedule_ws_orphan_reap(sid: str) -> None:
                 reschedule = True
             else:
                 session = _pop_session_by_id(sid)
+                if session is _SESSION_CONTROL_BUSY:
+                    reschedule = True
+                    session = None
         if reschedule:
             _schedule_ws_orphan_reap(sid)
             return
@@ -1414,7 +1679,7 @@ def _get_db():
     return _db
 
 
-def _db_for_profile(profile: str | None = None):
+def _db_for_profile(profile: object | None = None):
     """Return SessionDB for ``params.profile`` when it differs from launch.
 
     App-global remote mode passes ``profile`` on session.* RPCs so history/list/
@@ -1475,9 +1740,7 @@ def _profile_db(params: dict | None = None):
     Closes dedicated profile handles; leaves the launch-profile shared handle open.
     Yields None when the db is unavailable.
     """
-    profile = None
-    if isinstance(params, dict):
-        profile = (params.get("profile") or "").strip() or None
+    profile = _requested_profile(params)
     db, owns = _db_for_profile(profile)
     try:
         yield db
@@ -1487,15 +1750,23 @@ def _profile_db(params: dict | None = None):
                 db.close()
 
 
-def _response_profile_name(profile: str | None = None) -> str:
+def _response_profile_name(profile: object | None = None) -> str:
     """Profile name to report on session.* payloads.
 
     Prefer the RPC's requested profile when it is a real non-launch profile;
     otherwise the process launch profile.
     """
-    name = (profile or "").strip()
-    if name and _profile_home(name) is not None:
-        return name
+    if isinstance(profile, str) and profile.strip():
+        try:
+            from hermes_cli import profiles as profiles_mod
+
+            name = profiles_mod.normalize_profile_name(profile.strip())
+            if _profile_home(name) is not None:
+                return name
+        except TUIProfileSelectionError:
+            pass
+        except Exception:
+            pass
     return _current_profile_name()
 
 
@@ -1512,21 +1783,71 @@ def _db_unavailable_error(rid, *, code: int):
 # (a ContextVar override) for the duration of the call so config/skills/model and
 # message persistence all resolve to the right profile. Omitted/own profile → the
 # launch profile (unchanged for single-profile and per-profile-remote setups).
-def _profile_home(profile: str | None) -> Path | None:
-    """Resolve a named profile's home on THIS host, or None for the launch profile."""
-    name = (profile or "").strip()
-    if not name:
+_TUI_PROFILE_SELECTION_MESSAGE = "invalid or unavailable profile"
+_TUI_PROFILE_SELECTION_RPC_CODE = 4026
+
+
+class TUIProfileSelectionError(ValueError):
+    """Private fail-closed error for an explicit unavailable TUI profile."""
+
+    def __init__(self):
+        super().__init__(_TUI_PROFILE_SELECTION_MESSAGE)
+
+    def __str__(self) -> str:
+        return _TUI_PROFILE_SELECTION_MESSAGE
+
+
+def _requested_profile(params: dict | None = None) -> object | None:
+    """Return the raw requested profile without coercing explicit bad values."""
+    if not isinstance(params, dict):
         return None
+    return params.get("profile")
+
+
+def _profile_selection(profile: object | None) -> tuple[str | None, Path | None]:
+    """Return ``(canonical_name, home)`` for a safe explicit profile.
+
+    ``(None, None)`` is the launch scope for an omitted or blank value, and for
+    an explicit profile resolving to the launch home. Every other explicit
+    selection must be a canonical, existing profile that the multiplex TUI is
+    authoritative to serve.
+    """
+    if profile is None:
+        return None, None
+    if not isinstance(profile, str):
+        raise TUIProfileSelectionError
+    name = profile.strip()
+    if not name:
+        return None, None
+
     try:
         from hermes_cli import profiles as profiles_mod
 
-        home = Path(profiles_mod.get_profile_dir(name))
+        canonical = profiles_mod.normalize_profile_name(name)
+        home = Path(
+            profiles_mod.resolve_profile_home(canonical, require_exists=True)
+        ).resolve()
+        launch_name = profiles_mod.normalize_profile_name(_current_profile_name())
+        if canonical == launch_name or home == Path(_hermes_home).resolve():
+            return canonical, None
+
+        served = {}
+        for served_name, served_home in profiles_mod.profiles_to_serve(multiplex=True):
+            served[profiles_mod.normalize_profile_name(served_name)] = Path(
+                served_home
+            ).resolve()
+        if served.get(canonical) != home:
+            raise ValueError
+    except TUIProfileSelectionError:
+        raise
     except Exception:
-        return None
-    # Already the launch profile? No override needed.
-    if home.resolve() == Path(_hermes_home).resolve():
-        return None
-    return home if (home / "state.db").exists() or home.exists() else None
+        raise TUIProfileSelectionError from None
+    return canonical, home
+
+
+def _profile_home(profile: object | None) -> Path | None:
+    """Resolve a named profile's safe existing home, or None for launch home."""
+    return _profile_selection(profile)[1]
 
 
 def _profile_scoped(handler):
@@ -1540,7 +1861,10 @@ def _profile_scoped(handler):
     """
 
     def wrapper(rid, params):
-        home = _profile_home(params.get("profile") if isinstance(params, dict) else None)
+        try:
+            home = _profile_home(_requested_profile(params))
+        except TUIProfileSelectionError:
+            return _profile_selection_rpc_error(rid)
         if home is None:
             return handler(rid, params)
         token = set_hermes_home_override(home)
@@ -2026,6 +2350,10 @@ def _err(rid, code: int, msg: str, data=None) -> dict:
     if data is not None:
         error["data"] = data
     return {"jsonrpc": "2.0", "id": rid, "error": error}
+
+
+def _profile_selection_rpc_error(rid) -> dict:
+    return _err(rid, _TUI_PROFILE_SELECTION_RPC_CODE, _TUI_PROFILE_SELECTION_MESSAGE)
 
 
 def method(name: str):
@@ -3088,8 +3416,8 @@ def _persist_branch_seed(session: dict) -> None:
 
 
 @contextlib.contextmanager
-def _session_db(session: dict):
-    """Yield the SessionDB that owns this session's row (profile-aware).
+def _session_db_for_profile(profile_home: str | None):
+    """Yield the SessionDB selected by an immutable profile-home snapshot.
 
     Mirrors :func:`_ensure_session_db_row`: a remote/profile session persists
     into its own profile's ``state.db`` (a fresh handle we close on exit);
@@ -3097,7 +3425,6 @@ def _session_db(session: dict):
     None when the db is unavailable.
     """
     db, close_db = None, False
-    profile_home = session.get("profile_home")
     if profile_home:
         from hermes_state import SessionDB
 
@@ -3113,6 +3440,396 @@ def _session_db(session: dict):
         if close_db and db is not None:
             with contextlib.suppress(Exception):
                 db.close()
+
+@contextlib.contextmanager
+def _session_db(session: dict):
+    """Yield the SessionDB that owns this session's row (profile-aware)."""
+    with _session_db_for_profile(session.get("profile_home")) as db:
+        yield db
+
+
+def _session_micro_config_loader_for_profile(profile_home: str | None):
+    """Return a readonly micro config loader bound to one profile path."""
+    from hermes_cli.config import load_config_readonly
+
+    profile_home = str(profile_home or "").strip()
+    if not profile_home:
+        return load_config_readonly
+
+    def load_profile_config():
+        token = set_hermes_home_override(profile_home)
+        try:
+            return load_config_readonly()
+        finally:
+            reset_hermes_home_override(token)
+
+    return load_profile_config
+
+
+def _session_micro_config_loader(session: dict):
+    """Return the readonly micro policy config loader for this session.
+
+    A TUI gateway can host sessions from more than one profile.  The shared
+    micro command service intentionally accepts a loader so its global value
+    cannot accidentally come from the gateway launch profile.  Bind the
+    session's stored profile home only for the read; the ContextVar is restored
+    before the RPC thread handles another session.
+    """
+    return _session_micro_config_loader_for_profile(session.get("profile_home"))
+
+
+def _claim_live_micro_control(sid: str, session: dict | None):
+    """Atomically claim an idle live session for one direct ``/micro`` call.
+
+    The claim is the only part that runs under ``history_lock``.  It snapshots
+    every mutable routing identity needed by the command and leaves all config,
+    SessionDB, ensure, and runtime-setter work to the caller after the lock is
+    released.  The second return value is ``_SESSION_CONTROL_BUSY`` for a
+    concurrent control, a string for a non-mutating identity error, or ``None``
+    when the session is cold and must use the unchanged slash worker fallback.
+    """
+    if session is None:
+        return None, None
+    history_lock = session.get("history_lock")
+    if history_lock is None:
+        return None, None
+
+    with history_lock:
+        active = bool(session.get("running"))
+        session_key = str(session.get("session_key") or "")
+        if not active:
+            active = _child_run_active(session_key)
+        if active:
+            return None, _MICRO_TURN_BUSY
+        if session.get("_session_control_inflight") is not None:
+            return None, _SESSION_CONTROL_BUSY
+
+        agent = session.get("agent")
+        if agent is None:
+            return None, None
+        agent_key = str(getattr(agent, "session_id", "") or "")
+        if not session_key.strip() or not agent_key.strip():
+            return (
+                None,
+                "Micro-compaction error: live session identity is incomplete; refusing to mutate",
+            )
+        if session_key != agent_key:
+            return (
+                None,
+                "Micro-compaction error: live session identity mismatch; refusing to mutate",
+            )
+
+        token = object()
+        target = _MicroControlTarget(
+            sid=str(sid or ""),
+            session=session,
+            session_key=session_key,
+            agent=agent,
+            agent_session_id=agent_key,
+            profile_home=(
+                str(session.get("profile_home"))
+                if session.get("profile_home") is not None
+                else None
+            ),
+            generation=int(session.get("session_generation", 0) or 0),
+            token=token,
+        )
+        session["_session_control_inflight"] = token
+        # This is one bounded mutable record for the command's C-path audit;
+        # it is overwritten by the next claim and never grows per turn.
+        session[_MICRO_CONTROL_STATE_KEY] = {}
+        return target, None
+
+
+def _claim_manual_compression_control(session: dict):
+    """Reserve the exact session before any direct manual compression work."""
+    history_lock = session.get("history_lock")
+    if history_lock is None:
+        return None, _SESSION_CONTROL_BUSY
+    with history_lock:
+        active = bool(session.get("running"))
+        session_key = str(session.get("session_key") or "")
+        if not active:
+            active = _child_run_active(session_key)
+        if active:
+            return None, _MICRO_TURN_BUSY
+        if session.get("_session_control_inflight") is not None:
+            return None, _SESSION_CONTROL_BUSY
+        token = object()
+        session["_session_control_inflight"] = token
+        # _sync_session_key_after_compress accepts the optional token for
+        # production callers, but this field keeps older TUI test seams and
+        # split handlers that call it positionally safe.
+        session[_MANUAL_COMPRESSION_CONTROL_KEY] = token
+        return token, None
+
+
+def _manual_compression_busy_text(claim_error) -> str:
+    if claim_error is _MICRO_TURN_BUSY:
+        return _MANUAL_COMPRESSION_TURN_BUSY_MESSAGE
+    return _MICRO_CONTROL_BUSY_MESSAGE
+
+
+def _marker_matches_micro_target(marker: dict | None, target: _MicroControlTarget) -> bool:
+    if not isinstance(marker, dict) or marker.get("control_token") is not target.token:
+        return False
+    try:
+        return int(marker.get("generation", -1)) == target.generation
+    except (TypeError, ValueError):
+        return False
+
+
+def _micro_rotation_override_warning(
+    target: _MicroControlTarget,
+    marker: dict,
+    state: dict | None,
+) -> str | None:
+    """Fail closed if a forced rotation left /micro's exact override on old row."""
+    if not isinstance(state, dict) or not state.get("mutation_succeeded"):
+        return None
+    if "requested_override" not in state:
+        return None
+    requested = state["requested_override"]
+    new_session_id = str(marker.get("agent_session_id") or "")
+    if not new_session_id:
+        return (
+            "Micro-compaction warning: forced compression rotation produced no "
+            "current session id; retry /micro on the current session"
+        )
+    try:
+        with _session_db(target.session) as db:
+            row = db.get_session(new_session_id) if db is not None else None
+            if row is None:
+                return (
+                    "Micro-compaction warning: /micro changed only the old row "
+                    "because compression rotated the session; retry /micro on the current session"
+                )
+            getter = getattr(db, "session_micro_compact_override", None)
+            actual = getter(row) if callable(getter) else None
+    except Exception as exc:
+        return (
+            "Micro-compaction warning: could not verify the current continuation "
+            f"override after rotation ({exc}); retry /micro on the current session"
+        )
+    if actual is not requested:
+        return (
+            "Micro-compaction warning: /micro changed only the old row because "
+            "compression rotated the session; retry /micro on the current session"
+        )
+    live_override = getattr(
+        target.agent, "micro_compact_override", _MICRO_OVERRIDE_UNKNOWN
+    )
+    if live_override is not _MICRO_OVERRIDE_UNKNOWN and live_override is not requested:
+        return (
+            "Micro-compaction warning: the current Agent policy did not retain "
+            "the requested override after rotation; retry /micro on the current session"
+        )
+    return None
+
+
+def _release_live_micro_control(
+    target: _MicroControlTarget,
+) -> _MicroControlReleaseResult:
+    """Release one live ``/micro`` claim, retaining it through re-anchor I/O.
+
+    A deferred rotation is a continuation of the control command, not a new
+    unowned operation.  Keep the exact micro token installed until canonical
+    sync has completed so production close/resume/reuse cannot replace the
+    session in the middle of the re-anchor.  Every external call still runs
+    outside both coordination locks; the sync entry guard handles an injected
+    registry replacement in the small gap before it starts.
+    """
+    session = target.session
+    marker = None
+    state = None
+    reanchor_token = None
+    expected_reanchor = None
+
+    def _identity_warning() -> _MicroControlReleaseResult:
+        return _MicroControlReleaseResult(
+            False,
+            "Micro-compaction warning: live session changed (identity changed) during "
+            "deferred re-anchor; refusing to mutate the replacement",
+        )
+
+    def _canonical_state() -> bool:
+        # Do not nest _sessions_lock and history_lock.  The exact control token
+        # is still held, so production transition code cannot mutate these
+        # fields between this lock-free snapshot and the next stage.
+        with _sessions_lock:
+            return (
+                _sessions.get(target.sid) is session
+                and session.get("_session_control_inflight") is target.token
+                and session.get("_deferred_compression_rotation") is None
+                and session.get("session_key") == str(marker.get("agent_session_id") or "")
+                and session.get("agent") is target.agent
+                and str(getattr(target.agent, "session_id", "") or "")
+                == str(marker.get("agent_session_id") or "")
+                and int(session.get("session_generation", 0) or 0) >= target.generation + 1
+            )
+
+    try:
+        with session["history_lock"]:
+            lease_matches = (
+                session.get("_session_control_inflight") is target.token
+                and session.get("agent") is target.agent
+                and int(session.get("session_generation", 0) or 0) == target.generation
+                and (
+                    str(session.get("profile_home"))
+                    if session.get("profile_home") is not None
+                    else None
+                )
+                == target.profile_home
+            )
+            if not lease_matches:
+                return _MicroControlReleaseResult(
+                    False,
+                    "Micro-compaction warning: live session changed before the "
+                    "completion could clear its control lease",
+                )
+            candidate = session.get(_DEFERRED_COMPRESSION_ROTATION_KEY)
+            if _marker_matches_micro_target(candidate, target):
+                marker = candidate
+                # Retain the exact micro token even if the marker's continuation
+                # identity has already changed; the finally path must still
+                # release this old reservation without touching an ABA token.
+                reanchor_token = target.token
+                new_session_id = str(marker.get("agent_session_id") or "")
+                if not new_session_id or str(
+                    getattr(target.agent, "session_id", "") or ""
+                ) != new_session_id:
+                    return _identity_warning()
+                # Retain the exact micro token.  It is deliberately not popped
+                # until the finally block after sync and final verification.
+                expected_reanchor = _CompressionReanchorIdentity(
+                    sid=target.sid,
+                    session=session,
+                    generation=target.generation,
+                    agent=target.agent,
+                    new_session_id=new_session_id,
+                    control_token=target.token,
+                    marker=marker,
+                    old_session_key=target.session_key,
+                    profile_home=target.profile_home,
+                )
+            state = session.get(_MICRO_CONTROL_STATE_KEY)
+            if marker is None:
+                # No deferred work: only this exact token may be cleared.  An
+                # ABA/new token is never touched by an old finally path.
+                session.pop("_session_control_inflight", None)
+
+        # This first registry barrier is intentionally separate from the sync
+        # entry guard.  A forced replacement may be injected after this check;
+        # the guarded sync must then return before DB/config/live mutation.
+        with _sessions_lock:
+            registry_same = _sessions.get(target.sid) is session
+        if not registry_same:
+            return _identity_warning()
+
+        if marker is None:
+            with session["history_lock"]:
+                unchanged = (
+                    session.get("session_key") == target.session_key
+                    and session.get("agent") is target.agent
+                    and str(getattr(target.agent, "session_id", "") or "")
+                    == target.agent_session_id
+                    and int(session.get("session_generation", 0) or 0)
+                    == target.generation
+                )
+                if session.get(_MICRO_CONTROL_STATE_KEY) is state:
+                    session.pop(_MICRO_CONTROL_STATE_KEY, None)
+            if unchanged:
+                return _MicroControlReleaseResult(True)
+            return _MicroControlReleaseResult(
+                False,
+                "Micro-compaction warning: live session changed while /micro "
+                "was running; refusing to report a new target mutation",
+            )
+
+        try:
+            sync_status = _sync_session_key_after_compress(
+                target.sid,
+                session,
+                control_token=reanchor_token,
+                expected_reanchor=expected_reanchor,
+            )
+        except BaseException as exc:
+            return _MicroControlReleaseResult(
+                False,
+                "Micro-compaction warning: deferred compression rotation remains "
+                f"pending after release ({exc}); retry /micro on the current session",
+            )
+        if sync_status == _COMPRESSION_SYNC_IDENTITY_CHANGED:
+            return _identity_warning()
+        if sync_status not in {_COMPRESSION_SYNC_APPLIED, _COMPRESSION_SYNC_UNCHANGED}:
+            return _MicroControlReleaseResult(
+                False,
+                "Micro-compaction warning: deferred compression rotation remains "
+                "pending after release; retry /micro on the current session",
+            )
+
+        # The marker must have been cleared by the guarded sync while the exact
+        # re-anchor token was still held.  This is a pure in-memory check; it
+        # deliberately does not acquire history_lock while holding the registry
+        # lock.
+        if not _canonical_state():
+            return _identity_warning()
+
+        warning = _micro_rotation_override_warning(target, marker, state)
+        # The verification above is a pre-read barrier.  Verify once more after
+        # the DB read before clearing the bounded control-state audit record.
+        if not _canonical_state():
+            return _identity_warning()
+        with _sessions_lock:
+            if session.get(_MICRO_CONTROL_STATE_KEY) is state:
+                session.pop(_MICRO_CONTROL_STATE_KEY, None)
+        if warning:
+            return _MicroControlReleaseResult(
+                False,
+                warning,
+                reanchored=True,
+            )
+        return _MicroControlReleaseResult(True, reanchored=True)
+    except BaseException as exc:
+        # Cleanup must not mask the command's original Exception or BaseException.
+        return _MicroControlReleaseResult(
+            False,
+            "Micro-compaction warning: could not complete live-control release "
+            f"({exc}); retry /micro on the current session",
+        )
+    finally:
+        if reanchor_token is not None:
+            # Clear only the exact token retained for this re-anchor.  If an
+            # injected/ABA path installed another token, leave it untouched.
+            try:
+                with session["history_lock"]:
+                    if session.get("_session_control_inflight") is reanchor_token:
+                        session.pop("_session_control_inflight", None)
+            except BaseException:
+                pass
+
+
+def _try_claim_session_control(session: dict):
+    """Reserve one session-wide control transition without holding I/O locks."""
+    with session["history_lock"]:
+        if session.get("_session_control_inflight") is not None:
+            return None
+        token = object()
+        session["_session_control_inflight"] = token
+        return token
+
+
+def _release_session_control(session: dict, token) -> None:
+    """Release a non-micro transition reservation, best effort."""
+    try:
+        with session["history_lock"]:
+            if session.get("_session_control_inflight") is token:
+                session.pop("_session_control_inflight", None)
+            if session.get(_MANUAL_COMPRESSION_CONTROL_KEY) is token:
+                session.pop(_MANUAL_COMPRESSION_CONTROL_KEY, None)
+    except BaseException:
+        # Transition cleanup must not replace the operation's original failure.
+        pass
 
 
 def _persist_session_git_meta(session: dict, cwd: str, generation: int) -> None:
@@ -5163,12 +5880,24 @@ def _compress_session_history(
     return len(history) - len(compressed), usage
 
 
-def _sync_session_key_after_compress(
+@contextlib.contextmanager
+def _session_history_context(session: dict):
+    """Use a session history lock, or a lockless legacy test seam."""
+    history_lock = session.get("history_lock")
+    if history_lock is None:
+        yield
+        return
+    with history_lock:
+        yield
+
+
+def _sync_session_key_after_compress_legacy(
     sid: str,
     session: dict,
     *,
     clear_pending_title: bool = True,
     restart_slash_worker: bool = True,
+    control_token=None,
 ) -> None:
     """Re-anchor session_key when AIAgent._compress_context rotates session_id.
 
@@ -5188,6 +5917,14 @@ def _sync_session_key_after_compress(
             if the caller manages the worker lifecycle separately.
     """
     agent = session.get("agent")
+    with _session_history_context(session):
+        active_control = session.get("_session_control_inflight")
+        if active_control is not None and active_control is not control_token:
+            logger.warning(
+                "Compression rotation skipped while session control is active: sid=%s",
+                sid,
+            )
+            return
     new_session_id = getattr(agent, "session_id", None) or ""
     old_key = session.get("session_key", "") or ""
     if not new_session_id or new_session_id == old_key:
@@ -5219,7 +5956,18 @@ def _sync_session_key_after_compress(
             unregister_gateway_notify(old_key)
         except Exception:
             pass
-        session["session_key"] = new_session_id
+        with _session_history_context(session):
+            active_control = session.get("_session_control_inflight")
+            if active_control is not None and active_control is not control_token:
+                logger.warning(
+                    "Compression rotation skipped while session control is active: sid=%s",
+                    sid,
+                )
+                return
+            session["session_key"] = new_session_id
+            session["session_generation"] = int(
+                session.get("session_generation", 0) or 0
+            ) + 1
         try:
             yolo_was_on = is_session_yolo_enabled(old_key)
         except Exception:
@@ -5241,7 +5989,18 @@ def _sync_session_key_after_compress(
         # Even if the approval module fails to import, still anchor the
         # session_key on the new continuation id so downstream lookups
         # don't keep targeting the ended row.
-        session["session_key"] = new_session_id
+        with _session_history_context(session):
+            active_control = session.get("_session_control_inflight")
+            if active_control is not None and active_control is not control_token:
+                logger.warning(
+                    "Compression rotation skipped while session control is active: sid=%s",
+                    sid,
+                )
+                return
+            session["session_key"] = new_session_id
+            session["session_generation"] = int(
+                session.get("session_generation", 0) or 0
+            ) + 1
 
     # #84417 (belt): invalidate any in-flight ``_drain_queued_prompt`` claim
     # that captured generation under the pre-rotation session_key. A raced
@@ -5262,7 +6021,465 @@ def _sync_session_key_after_compress(
             pass
 
 
-def _get_usage(agent) -> dict:
+def _reanchor_registry_fields_match(
+    identity: _CompressionReanchorIdentity,
+    *,
+    require_marker: bool = True,
+) -> bool:
+    """Check canonical fields while ``_sessions_lock`` is held.
+
+    This helper never acquires another coordination lock.  Production session
+    replacement is blocked by ``identity.control_token``; an injected mapping
+    replacement is therefore detected atomically before the next pure-memory
+    mutation stage.
+    """
+    session = identity.session
+    if session.get("_session_control_inflight") is not identity.control_token:
+        return False
+    if session.get("agent") is not identity.agent:
+        return False
+    if (
+        str(session.get("profile_home")) if session.get("profile_home") is not None else None
+    ) != identity.profile_home:
+        return False
+    current_key = str(session.get("session_key") or "")
+    current_generation = int(session.get("session_generation", 0) or 0)
+    if current_key not in {identity.old_session_key, identity.new_session_id}:
+        return False
+    # A retry after a failure may already have committed the canonical key and
+    # generation.  Accept that idempotent state only when the key is the exact
+    # expected continuation; an unrelated generation change remains stale.
+    if current_generation != identity.generation and not (
+        current_key == identity.new_session_id
+        and current_generation > identity.generation
+    ):
+        return False
+    if str(getattr(identity.agent, "session_id", "") or "") != identity.new_session_id:
+        return False
+    marker = session.get(_DEFERRED_COMPRESSION_ROTATION_KEY)
+    if require_marker:
+        if marker is not identity.marker or not isinstance(marker, dict):
+            return False
+        try:
+            marker_generation = int(marker.get("generation", -1))
+        except (TypeError, ValueError):
+            return False
+        if (
+            marker_generation != identity.generation
+            or str(marker.get("agent_session_id") or "") != identity.new_session_id
+        ):
+            return False
+    return True
+
+
+def _reanchor_identity_matches(identity: _CompressionReanchorIdentity) -> bool:
+    """Validate history identity, then registry identity, with no I/O."""
+    session = identity.session
+    history_lock = session.get("history_lock")
+    if history_lock is None:
+        return False
+    with history_lock:
+        if not _reanchor_registry_fields_match(identity):
+            return False
+    # Never acquire _sessions_lock while history_lock is held.  The two phases
+    # are deliberately separate so a blocked DB/config/live seam cannot starve
+    # either coordination lock.
+    with _sessions_lock:
+        return _sessions.get(identity.sid) is session and _reanchor_registry_fields_match(
+            identity
+        )
+
+
+def _reanchor_apply_in_memory(
+    identity: _CompressionReanchorIdentity,
+    *,
+    clear_pending_title: bool,
+) -> bool:
+    """Atomically apply only pure canonical session fields under registry lock."""
+    with _sessions_lock:
+        if _sessions.get(identity.sid) is not identity.session:
+            return False
+        if not _reanchor_registry_fields_match(identity):
+            return False
+        current_key = str(identity.session.get("session_key") or "")
+        if current_key == identity.old_session_key:
+            identity.session["session_key"] = identity.new_session_id
+            identity.session["session_generation"] = int(
+                identity.session.get("session_generation", 0) or 0
+            ) + 1
+        elif current_key != identity.new_session_id:
+            return False
+        if clear_pending_title:
+            identity.session["pending_title"] = None
+        return True
+
+
+def _reanchor_clear_marker(identity: _CompressionReanchorIdentity) -> bool:
+    """Clear a deferred marker only after the final exact identity check."""
+    with _sessions_lock:
+        if _sessions.get(identity.sid) is not identity.session:
+            return False
+        if not _reanchor_registry_fields_match(identity):
+            return False
+        identity.session.pop(_DEFERRED_COMPRESSION_ROTATION_KEY, None)
+        return True
+
+
+def _sync_session_key_after_compress(
+    sid: str,
+    session: dict,
+    *,
+    clear_pending_title: bool = True,
+    restart_slash_worker: bool = True,
+    control_token=None,
+    expected_reanchor: _CompressionReanchorIdentity | None = None,
+) -> str:
+    """Re-anchor a compression continuation with an entry identity barrier.
+
+    Deferred retries pass ``expected_reanchor``.  The entry path snapshots the
+    exact session object, sid, generation, agent, continuation id, marker, and
+    reservation under ``history_lock``; after releasing it, the registry mapping
+    is checked under ``_sessions_lock`` before any lease, approval, worker, DB,
+    config, or session mutation.  Every later live/in-memory stage repeats the
+    same guard.  No coordination lock is held across external I/O.
+
+    A session without ``history_lock`` is accepted only for the legacy,
+    non-deferred, unregistered test/compatibility seam.  Deferred work fails
+    closed instead of silently bypassing the identity reservation.
+    """
+    history_lock = session.get("history_lock")
+    pending_marker = session.get(_DEFERRED_COMPRESSION_ROTATION_KEY)
+    active_control_hint = session.get("_session_control_inflight")
+    if history_lock is None:
+        if (
+            expected_reanchor is not None
+            or pending_marker is not None
+            or active_control_hint is not None
+            or control_token is not None
+        ):
+            logger.warning(
+                "Compression re-anchor requires history_lock; refusing deferred/controlled sync: sid=%s",
+                sid,
+            )
+            return _COMPRESSION_SYNC_FAILED
+        with _sessions_lock:
+            if any(candidate is session for candidate in _sessions.values()):
+                logger.warning(
+                    "Compression re-anchor requires history_lock for a live registry session: sid=%s",
+                    sid,
+                )
+                return _COMPRESSION_SYNC_FAILED
+        old_key = str(session.get("session_key", "") or "")
+        _sync_session_key_after_compress_legacy(
+            sid,
+            session,
+            clear_pending_title=clear_pending_title,
+            restart_slash_worker=restart_slash_worker,
+            control_token=None,
+        )
+        return (
+            _COMPRESSION_SYNC_APPLIED
+            if str(session.get("session_key", "") or "") != old_key
+            else _COMPRESSION_SYNC_UNCHANGED
+        )
+
+    agent = session.get("agent")
+    if agent is None:
+        return (
+            _COMPRESSION_SYNC_IDENTITY_CHANGED
+            if expected_reanchor is not None
+            else _COMPRESSION_SYNC_UNCHANGED
+        )
+
+    def record_marker(
+        *,
+        active_token,
+        new_session_id: str,
+        old_session_key: str,
+        generation: int,
+        clear_title: bool,
+        restart_worker: bool,
+    ) -> None:
+        existing = session.get(_DEFERRED_COMPRESSION_ROTATION_KEY)
+        existing_generation = (
+            int(existing.get("generation", -1))
+            if isinstance(existing, dict)
+            else -1
+        )
+        same_marker = bool(
+            isinstance(existing, dict)
+            and existing.get("control_token") is active_token
+            and existing_generation == generation
+        )
+        if not same_marker:
+            session[_DEFERRED_COMPRESSION_ROTATION_KEY] = {
+                "agent_session_id": str(new_session_id),
+                "old_session_key": str(old_session_key),
+                "generation": int(generation),
+                "control_token": active_token,
+                "clear_pending_title": bool(clear_title),
+                "restart_slash_worker": bool(restart_worker),
+            }
+            return
+        # One bounded record: repeated forced rotations replace the latest
+        # observed continuation instead of accumulating stale history.
+        existing["agent_session_id"] = str(new_session_id)
+        existing["old_session_key"] = str(old_session_key)
+        existing["generation"] = int(generation)
+        existing["control_token"] = active_token
+        existing["clear_pending_title"] = bool(clear_title)
+        existing["restart_slash_worker"] = bool(restart_worker)
+
+    # This snapshot phase performs no I/O.  For a deferred retry the caller's
+    # exact reservation/marker must already be present; no replacement is
+    # accepted by falling back to a fresh unguarded operation.
+    with history_lock:
+        if expected_reanchor is not None:
+            if (
+                expected_reanchor.session is not session
+                or expected_reanchor.sid != sid
+                or (
+                    control_token is not None
+                    and control_token is not expected_reanchor.control_token
+                )
+            ):
+                return _COMPRESSION_SYNC_IDENTITY_CHANGED
+            control_token = expected_reanchor.control_token
+        implicit_token = session.get(_MANUAL_COMPRESSION_CONTROL_KEY)
+        if control_token is None and implicit_token is not None:
+            control_token = implicit_token
+        active_control = session.get("_session_control_inflight")
+        live_session_id = str(getattr(agent, "session_id", "") or "")
+        old_key = str(session.get("session_key", "") or "")
+        generation = int(session.get("session_generation", 0) or 0)
+        pending = session.get(_DEFERRED_COMPRESSION_ROTATION_KEY)
+        pending_generation = (
+            int(pending.get("generation", -1))
+            if isinstance(pending, dict)
+            else -1
+        )
+        pending_matches = bool(
+            isinstance(pending, dict)
+            and pending.get("control_token") is not None
+            and pending_generation >= 0
+            and pending_generation <= generation
+            and str(pending.get("agent_session_id") or "") == live_session_id
+        )
+        if expected_reanchor is not None:
+            if pending is not expected_reanchor.marker or not pending_matches:
+                return _COMPRESSION_SYNC_IDENTITY_CHANGED
+            if active_control is not expected_reanchor.control_token:
+                return _COMPRESSION_SYNC_IDENTITY_CHANGED
+            if live_session_id != expected_reanchor.new_session_id:
+                return _COMPRESSION_SYNC_IDENTITY_CHANGED
+            # The expected identity owns the original generation.  A retry may
+            # observe an already-canonical key/generation from a prior failed
+            # attempt, which the stage guard accepts idempotently.
+            new_session_id = expected_reanchor.new_session_id
+        else:
+            new_session_id = live_session_id
+        rotation_needed = bool(new_session_id and new_session_id != old_key)
+        retry_pending = bool(pending_matches and new_session_id)
+
+        if expected_reanchor is None and active_control is not None and active_control is not control_token:
+            if rotation_needed:
+                record_marker(
+                    active_token=active_control,
+                    new_session_id=new_session_id,
+                    old_session_key=old_key,
+                    generation=generation,
+                    clear_title=clear_pending_title,
+                    restart_worker=restart_slash_worker,
+                )
+                logger.warning(
+                    "Compression rotation deferred while session control is active: sid=%s",
+                    sid,
+                )
+                return _COMPRESSION_SYNC_DEFERRED
+            if retry_pending:
+                logger.warning(
+                    "Deferred compression rotation still blocked by session control: sid=%s",
+                    sid,
+                )
+                return _COMPRESSION_SYNC_DEFERRED
+            return _COMPRESSION_SYNC_UNCHANGED
+
+        if not rotation_needed and not retry_pending:
+            return (
+                _COMPRESSION_SYNC_IDENTITY_CHANGED
+                if expected_reanchor is not None
+                else _COMPRESSION_SYNC_UNCHANGED
+            )
+
+        owns_internal_token = False
+        operation_token = control_token
+        if expected_reanchor is not None:
+            operation_token = expected_reanchor.control_token
+            if active_control is not operation_token:
+                return _COMPRESSION_SYNC_IDENTITY_CHANGED
+        elif operation_token is None:
+            operation_token = object()
+            session["_session_control_inflight"] = operation_token
+            owns_internal_token = True
+        elif active_control is not operation_token:
+            return _COMPRESSION_SYNC_FAILED
+
+        old_key_for_updates = old_key
+        clear_title_for_updates = clear_pending_title
+        restart_worker_for_updates = restart_slash_worker
+        if retry_pending:
+            old_key_for_updates = str(pending.get("old_session_key") or old_key)
+            clear_title_for_updates = bool(
+                pending.get("clear_pending_title", clear_pending_title)
+            )
+            restart_worker_for_updates = bool(
+                pending.get("restart_slash_worker", restart_slash_worker)
+            )
+
+        if expected_reanchor is None and retry_pending:
+            expected_reanchor = _CompressionReanchorIdentity(
+                sid=sid,
+                session=session,
+                generation=pending_generation,
+                agent=agent,
+                new_session_id=new_session_id,
+                control_token=operation_token,
+                marker=pending,
+                old_session_key=old_key_for_updates,
+                profile_home=(
+                    str(session.get("profile_home"))
+                    if session.get("profile_home") is not None
+                    else None
+                ),
+            )
+
+    def guard() -> bool:
+        return expected_reanchor is None or _reanchor_identity_matches(expected_reanchor)
+
+    try:
+        # Lease/DB/config/live work begins only after the entry identity and
+        # registry barrier.  The exact reservation remains active throughout.
+        if not guard():
+            return _COMPRESSION_SYNC_IDENTITY_CHANGED
+        lease_reanchored = _transfer_active_session_slot(
+            sid,
+            session,
+            new_session_id=new_session_id,
+        )
+        if not lease_reanchored:
+            raise RuntimeError(
+                "active session lease could not be transferred to the continuation"
+            )
+
+        from tools.approval import (
+            disable_session_yolo,
+            enable_session_yolo,
+            is_session_yolo_enabled,
+            register_gateway_notify,
+            unregister_gateway_notify,
+        )
+
+        if not guard():
+            return _COMPRESSION_SYNC_IDENTITY_CHANGED
+        unregister_gateway_notify(old_key_for_updates)
+        if not guard():
+            return _COMPRESSION_SYNC_IDENTITY_CHANGED
+        yolo_was_on = is_session_yolo_enabled(old_key_for_updates)
+        if yolo_was_on:
+            if not guard():
+                return _COMPRESSION_SYNC_IDENTITY_CHANGED
+            enable_session_yolo(new_session_id)
+            if not guard():
+                return _COMPRESSION_SYNC_IDENTITY_CHANGED
+            disable_session_yolo(old_key_for_updates)
+        if not guard():
+            return _COMPRESSION_SYNC_IDENTITY_CHANGED
+        register_gateway_notify(
+            new_session_id,
+            lambda data: _emit_approval_request(sid, data),
+        )
+
+        if expected_reanchor is not None:
+            if not _reanchor_apply_in_memory(
+                expected_reanchor,
+                clear_pending_title=clear_title_for_updates,
+            ):
+                return _COMPRESSION_SYNC_IDENTITY_CHANGED
+        else:
+            with _session_history_context(session):
+                if session.get("_session_control_inflight") is not operation_token:
+                    return _COMPRESSION_SYNC_FAILED
+                current_key = str(session.get("session_key") or "")
+                if current_key != new_session_id:
+                    session["session_key"] = new_session_id
+                    session["session_generation"] = int(
+                        session.get("session_generation", 0) or 0
+                    ) + 1
+                if clear_title_for_updates:
+                    session["pending_title"] = None
+
+        if restart_worker_for_updates:
+            if not guard():
+                return _COMPRESSION_SYNC_IDENTITY_CHANGED
+            _restart_slash_worker(sid, session)
+
+        if expected_reanchor is not None:
+            if not _reanchor_clear_marker(expected_reanchor):
+                return _COMPRESSION_SYNC_IDENTITY_CHANGED
+        else:
+            with _session_history_context(session):
+                if session.get("_session_control_inflight") is not operation_token:
+                    return _COMPRESSION_SYNC_FAILED
+                marker = session.get(_DEFERRED_COMPRESSION_ROTATION_KEY)
+                if isinstance(marker, dict) and str(
+                    marker.get("agent_session_id") or ""
+                ) == new_session_id:
+                    session.pop(_DEFERRED_COMPRESSION_ROTATION_KEY, None)
+        return _COMPRESSION_SYNC_APPLIED
+    except BaseException as exc:
+        # An identity mismatch is not a retryable I/O failure: do not rewrite
+        # the detached marker or touch the replacement.  For a real stage
+        # failure retain one bounded marker so a later safe trigger can claim it.
+        if expected_reanchor is not None:
+            try:
+                if not _reanchor_identity_matches(expected_reanchor):
+                    return _COMPRESSION_SYNC_IDENTITY_CHANGED
+            except BaseException:
+                return _COMPRESSION_SYNC_IDENTITY_CHANGED
+        with _session_history_context(session):
+            marker = session.get(_DEFERRED_COMPRESSION_ROTATION_KEY)
+            current_generation = int(session.get("session_generation", 0) or 0)
+            if isinstance(marker, dict):
+                marker["agent_session_id"] = str(new_session_id)
+                marker["old_session_key"] = str(
+                    marker.get("old_session_key") or old_key_for_updates
+                )
+                marker["generation"] = current_generation
+                marker["clear_pending_title"] = bool(clear_title_for_updates)
+                marker["restart_slash_worker"] = bool(restart_worker_for_updates)
+            else:
+                record_marker(
+                    active_token=operation_token,
+                    new_session_id=new_session_id,
+                    old_session_key=old_key_for_updates,
+                    generation=current_generation,
+                    clear_title=clear_title_for_updates,
+                    restart_worker=restart_worker_for_updates,
+                )
+        logger.warning(
+            "Compression rotation re-anchor failed; deferred marker retained: sid=%s error=%s",
+            sid,
+            exc,
+        )
+        return _COMPRESSION_SYNC_FAILED
+    finally:
+        if owns_internal_token:
+            with session["history_lock"]:
+                if session.get("_session_control_inflight") is operation_token:
+                    session.pop("_session_control_inflight", None)
+
+
+def _get_usage(agent, *, include_account: bool = False) -> dict:
     g = lambda k, fb=None: getattr(agent, k, 0) or (getattr(agent, fb, 0) if fb else 0)
     usage = {
         "model": getattr(agent, "model", "") or "",
@@ -5317,6 +6534,22 @@ def _get_usage(agent) -> dict:
             spent = agent.get_credits_spent_micros()
             if spent is not None:
                 usage["dev_credits_spent_micros"] = int(spent)
+        except Exception:
+            pass
+    if include_account:
+        try:
+            from agent.account_usage import fetch_account_usage, render_account_usage_lines
+
+            provider = getattr(agent, "provider", None)
+            if provider:
+                account_snapshot = fetch_account_usage(
+                    provider,
+                    base_url=getattr(agent, "base_url", None),
+                    api_key=getattr(agent, "api_key", None),
+                )
+                account_lines = render_account_usage_lines(account_snapshot)
+                if account_lines:
+                    usage["account_lines"] = account_lines
         except Exception:
             pass
     return usage
@@ -5396,13 +6629,25 @@ def _current_profile_name() -> str:
 DESKTOP_BACKEND_CONTRACT = 6
 
 
-def _session_usage_snapshot(session: dict | None) -> dict:
+def _session_usage_snapshot(
+    session: dict | None,
+    *,
+    include_account: bool = False,
+) -> dict:
     agent = (session or {}).get("agent")
     mirror_usage = _metadata_mirror(session).get("usage")
     if (session or {}).get("_compute_host_active") and isinstance(mirror_usage, dict):
         return dict(mirror_usage)
     if agent is not None:
-        return _get_usage(agent)
+        try:
+            return _get_usage(agent, include_account=include_account)
+        except TypeError as exc:
+            # Keep narrow test/adaptor seams compatible with the historical
+            # one-argument usage helper while production helpers receive the
+            # account-detail flag.
+            if "include_account" not in str(exc):
+                raise
+            return _get_usage(agent)
     return dict(mirror_usage) if isinstance(mirror_usage, dict) else {}
 
 
@@ -6966,6 +8211,7 @@ def _init_session(
             "history": history,
             "history_lock": threading.Lock(),
             "history_version": 0,
+            "session_generation": 0,
             "inflight_turn": None,
             "created_at": now,
             "last_active": now,
@@ -7724,6 +8970,16 @@ def _auto_continue_note(prompt: str) -> str:
     )
 
 
+def _api_outage_recovery_note() -> str:
+    return (
+        "[System note: The previous turn was interrupted while waiting for "
+        "an API outage to recover. Review the conversation history and "
+        "current workspace state, then CONTINUE the interrupted task to "
+        "completion. Do not repeat tool calls whose results are already "
+        "recorded.]"
+    )
+
+
 def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> dict | None:
     """Kick off a continuation turn for a crash-interrupted session.
 
@@ -7749,7 +9005,11 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
         return None
     session["_auto_continue_scheduled"] = True
     attempt = marker["attempts"] + 1
-    text = _auto_continue_note(marker["prompt"])
+    text = (
+        _api_outage_recovery_note()
+        if marker.get("resume_reason") == API_OUTAGE_RECOVERY_RESUME_REASON
+        else _auto_continue_note(marker["prompt"])
+    )
 
     def kickoff() -> None:
         rid = f"__auto_continue__{int(time.time() * 1000)}"
@@ -8338,6 +9598,7 @@ def _deferred_session_record(
         "history": history,
         "history_lock": threading.Lock(),
         "history_version": 0,
+        "session_generation": 0,
         "image_counter": 0,
         "inflight_turn": None,
         "last_active": now,
@@ -8360,13 +9621,19 @@ def _deferred_session_record(
 
 def _claim_or_reuse_live(
     sid: str, session_key: str, record: dict, lease
-) -> tuple[str, dict] | None:
+) -> tuple[str, dict] | object | None:
     """Register ``record`` as the live session for ``session_key`` under the
     resume lock, or — if a concurrent resume already won — release ``lease`` and
-    return the winner for the caller to reuse."""
+    return the winner for the caller to reuse. A live control lease returns the
+    stable busy sentinel instead of mutating/attaching that session.
+    """
     with _session_resume_lock:
         live = _find_live_session_by_key(session_key)
         if live is not None:
+            live_session = live[1]
+            with live_session["history_lock"]:
+                if live_session.get("_session_control_inflight") is not None:
+                    return _SESSION_CONTROL_BUSY
             if lease is not None:
                 lease.release()
             return live
@@ -8545,6 +9812,13 @@ def _find_live_session_by_key(session_key: str) -> tuple[str, dict] | None:
             continue
         if _session_lookup_key(session, fallback=sid) == session_key:
             return sid, session
+        # During a deferred compression re-anchor the agent already points at
+        # the continuation while the canonical session_key still names the old
+        # row.  Resume/reuse by either identity must see the reserved live
+        # object and return the stable busy result instead of registering a
+        # duplicate session for the old key.
+        if str(session.get("session_key") or "") == session_key:
+            return sid, session
     return None
 
 
@@ -8656,8 +9930,11 @@ def _live_session_payload(
     touch: bool = False,
     transport: Transport | None = None,
     omit_messages: bool = False,
-) -> dict:
+    reject_session_control: bool = False,
+) -> dict | None:
     with session["history_lock"]:
+        if reject_session_control and session.get("_session_control_inflight") is not None:
+            return None
         if cols is not None:
             session["cols"] = cols
         if transport is not None:
@@ -10467,6 +11744,8 @@ def _run_prompt_submit(
         secret_token = None
         goal_followup = None  # set by the post-turn goal hook below
         result = None  # turn outcome; read after the finally for leftover /steer
+        api_recovery_auto_continue = False
+        api_recovery_marker_key = ""
         tts_queue = None  # streaming-TTS feed for this turn (voice mode)
         thinking_started = False  # ambient thinking sound armed for this turn
         one_turn_restore = session.pop("one_turn_model_restore", None)
@@ -10739,7 +12018,17 @@ def _run_prompt_submit(
             )
             _usage_stop, _usage_thread = _start_usage_ticker(sid, agent)
             try:
-                result = agent.run_conversation(run_message, **run_kwargs)
+                try:
+                    result = agent.run_conversation(run_message, **run_kwargs)
+                except TypeError as exc:
+                    # Older adapters/test doubles may not expose the optional
+                    # persisted-user-message hook. Retry only for that exact
+                    # signature mismatch; real TypeErrors from the turn must
+                    # still reach the normal error path.
+                    if "persist_user_message" not in str(exc):
+                        raise
+                    run_kwargs.pop("persist_user_message", None)
+                    result = agent.run_conversation(run_message, **run_kwargs)
             finally:
                 # Stop AND join before anything below emits: an in-flight tick
                 # surviving past message.complete would roll the client's final
@@ -10900,6 +12189,7 @@ def _run_prompt_submit(
                     if result.get("interrupted")
                     else "error" if result.get("error") else "complete"
                 )
+                api_recovery_auto_continue = should_auto_resume_api_outage_result(result)
                 # When the backend produced no visible response AND reported a
                 # real error (e.g. invalid model slug → provider 4xx), surface
                 # that error as the visible text instead of shipping an empty
@@ -10963,7 +12253,22 @@ def _run_prompt_submit(
                     (result.get("error") if isinstance(result, dict) else "") or raw
                 )
                 payload["recoverable"] = True
-            _retire_turn_marker(session, marker_key)
+            if api_recovery_auto_continue:
+                # This interruption is a resumable boundary, not a concluded
+                # user cancellation. Keep a reason-aware marker and schedule
+                # it after ``running`` is released in the finally below.
+                api_recovery_marker_key = str(session.get("session_key") or marker_key)
+                record_turn_start(
+                    marker_home,
+                    api_recovery_marker_key,
+                    marker_text,
+                    attempts=marker_attempt,
+                    resume_reason=API_OUTAGE_RECOVERY_RESUME_REASON,
+                )
+                if marker_key and marker_key != api_recovery_marker_key:
+                    clear_turn_marker(marker_home, marker_key)
+            else:
+                _retire_turn_marker(session, marker_key)
             _emit("message.complete", sid, payload)
 
             # ── /goal continuation (Ralph-style loop) ─────────────────
@@ -11242,7 +12547,8 @@ def _run_prompt_submit(
             )
             # Backstop for turns that never reached a terminal frame (the
             # frame paths retire the marker as they emit).
-            _retire_turn_marker(session, marker_key)
+            if not api_recovery_auto_continue:
+                _retire_turn_marker(session, marker_key)
             session.pop("_auto_continue_scheduled", None)
             _emit_settled_session_info(sid, session, agent)
 
@@ -11260,6 +12566,14 @@ def _run_prompt_submit(
             with session["history_lock"]:
                 _enqueue_prompt(session, _leftover_steer, session.get("transport"))
         if _drain_queued_prompt(rid, sid, session):
+            return
+
+        if api_recovery_auto_continue:
+            _maybe_schedule_auto_continue(
+                sid,
+                session,
+                api_recovery_marker_key or marker_key,
+            )
             return
 
         # Chain a goal-continuation turn if the judge said so. We do
@@ -13458,8 +14772,10 @@ _LIVE_SESSION_DIRECT_COMMANDS = frozenset(
     {
         "clear",
         "compress",
+        "compact",
         "effort",
         "history",
+        "micro",
         "models",
         "prompt",
         "rename",
@@ -13646,9 +14962,83 @@ def _format_live_model_output(session: dict) -> str:
     return "Current model: (unknown)"
 
 
-def _live_slash_command_output(sid: str, session: Optional[dict], name: str, arg: str) -> Optional[str]:
+def _live_slash_command_output(
+    sid: str,
+    session: Optional[dict],
+    name: str,
+    arg: str,
+    *,
+    micro_target: _MicroControlTarget | None = None,
+    compression_control_token=None,
+) -> Optional[str]:
     name = (name or "").lstrip("/").lower()
     arg = arg or ""
+    if name == "micro":
+        # A cold TUI session deliberately stays cold: slash.exec must use the
+        # normal profile-aware slash worker, whose classic CLI path persists
+        # the row for the later agent hydration.  Only an already-built main
+        # agent is eligible for direct live application.
+        if micro_target is None and (session is None or session.get("agent") is None):
+            return None
+        if micro_target is not None:
+            # The lease holder owns this exact object/agent/key snapshot.  Do
+            # not re-read mutable session fields after releasing history_lock.
+            agent = micro_target.agent
+            session_key = micro_target.session_key
+            agent_key = micro_target.agent_session_id
+            profile_home = micro_target.profile_home
+        else:
+            agent = session["agent"]
+            session_key = str(session.get("session_key") or "")
+            agent_key = str(getattr(agent, "session_id", "") or "")
+            profile_home = session.get("profile_home")
+        if not session_key.strip() or not agent_key.strip():
+            return (
+                "Micro-compaction error: live session identity is incomplete; "
+                "refusing to mutate"
+            )
+        if session_key != agent_key:
+            return (
+                "Micro-compaction error: live session identity mismatch; "
+                "refusing to mutate"
+            )
+        from hermes_cli.micro_command import execute_micro_command
+
+        target_session_view = (
+            MappingProxyType({"profile_home": profile_home})
+            if micro_target is not None
+            else session
+        )
+        micro_state = (
+            micro_target.session.get(_MICRO_CONTROL_STATE_KEY)
+            if micro_target is not None
+            else None
+        )
+        micro_subcommand = (arg or "").strip().lower().split(maxsplit=1)[0]
+        if isinstance(micro_state, dict) and micro_subcommand in {
+            "on",
+            "off",
+            "inherit",
+        }:
+            micro_state["requested_override"] = {
+                "on": True,
+                "off": False,
+                "inherit": None,
+            }[micro_subcommand]
+            micro_state["mutation_succeeded"] = False
+        db_context = _session_db(target_session_view)
+        with db_context as db:
+            result = execute_micro_command(
+                agent=agent,
+                session_db=db,
+                session_id=session_key,
+                raw_args=arg,
+                ensure_session=getattr(agent, "_ensure_db_session", None),
+                config_loader=_session_micro_config_loader(target_session_view),
+            )
+        if isinstance(micro_state, dict) and "requested_override" in micro_state:
+            micro_state["mutation_succeeded"] = "override saved:" in str(result).lower()
+        return result
     if name == "model" and not arg.strip():
         return _format_live_model_output(session or {})
     if name not in _LIVE_SESSION_DIRECT_COMMANDS:
@@ -13663,10 +15053,15 @@ def _live_slash_command_output(sid: str, session: Optional[dict], name: str, arg
         session is not None and _session_uses_compute_host(session)
     ):
         return None
-    if name == "compress":
+    if name in {"compress", "compact"}:
         if session is None:
             return "no active session for /compress"
-        return _mirror_slash_side_effects(sid, session, f"/compress {arg}".strip())
+        return _mirror_slash_side_effects(
+            sid,
+            session,
+            f"/{name} {arg}".strip(),
+            compression_control_token=compression_control_token,
+        )
     if name == "usage":
         if session is None:
             return "(._.) No active agent -- send a message first."
@@ -13706,7 +15101,13 @@ def _live_slash_command_output(sid: str, session: Optional[dict], name: str, arg
 
 
 
-def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
+def _mirror_slash_side_effects(
+    sid: str,
+    session: dict,
+    command: str,
+    *,
+    compression_control_token=None,
+) -> str:
     """Apply side effects that must also hit the gateway's live agent."""
     parts = command.lstrip("/").split(None, 1)
     if not parts:
@@ -13723,6 +15124,26 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
         # session never compresses and the deferred context-engine
         # notification wiring below is never exercised for that route.
         name = "compress"
+
+    # Reserve the exact session before compute-host forwarding, worker-side
+    # mirror effects, or any local compressor call.  The recursive second
+    # entry keeps the existing body flat while ensuring every slash alias uses
+    # the same ABA-safe release path.
+    if name == "compress" and compression_control_token is None:
+        compression_control_token, claim_error = _claim_manual_compression_control(
+            session
+        )
+        if claim_error is not None:
+            return _manual_compression_busy_text(claim_error)
+        try:
+            return _mirror_slash_side_effects(
+                sid,
+                session,
+                command,
+                compression_control_token=compression_control_token,
+            )
+        finally:
+            _release_session_control(session, compression_control_token)
 
     # Reject agent-mutating commands during an in-flight turn.  These
     # all do read-then-mutate on live agent/session state that the
@@ -13802,6 +15223,10 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
                     describe_compression_lock_skip,
                 )
                 return describe_compression_lock_skip(e.holder)
+            # Keep the ordinary manual-compression seam positional: legacy
+            # callers/tests may replace the canonical helper with its original
+            # two-argument callable.  The active manual token remains installed
+            # on ``session`` and is discovered by the canonical helper itself.
             _sync_session_key_after_compress(sid, session)
 
             with session["history_lock"]:

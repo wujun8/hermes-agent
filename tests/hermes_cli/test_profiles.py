@@ -23,6 +23,8 @@ from hermes_cli.profiles import (
     normalize_profile_name,
     validate_profile_name,
     get_profile_dir,
+    resolve_profile_home,
+    profile_exists,
     create_profile,
     delete_profile,
     list_profiles,
@@ -105,6 +107,68 @@ class TestGetProfileDir:
         tmp_path = profile_env
         result = get_profile_dir("default")
         assert result == tmp_path / ".hermes"
+
+
+class TestProfilePathSecurity:
+    """Profile path helpers fail closed at the lexical and filesystem edges."""
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "../escape",
+            "../../existing",
+            "/absolute/profile",
+            "foo/bar",
+            r"foo\bar",
+            r"C:\\profile",
+            r"\\\\server\\share",
+            ".",
+            "..",
+            "a\x00b",
+            "a\nb",
+            "a" * 65,
+        ],
+    )
+    def test_get_profile_dir_rejects_adversarial_names_before_path_lookup(
+        self, profile_env, name
+    ):
+        with patch.object(profiles, "_get_profiles_root") as root:
+            with pytest.raises(ValueError):
+                get_profile_dir(name)
+        root.assert_not_called()
+
+    def test_non_string_profile_name_is_rejected_strictly(self, profile_env):
+        with pytest.raises(ValueError):
+            normalize_profile_name(None)  # type: ignore[arg-type]
+        with pytest.raises(ValueError):
+            get_profile_dir(123)  # type: ignore[arg-type]
+
+    def test_mixed_case_profile_and_default_are_canonicalized(self, profile_env):
+        named = create_profile("MiXeD", no_alias=True)
+
+        assert get_profile_dir("MIXED") == named
+        assert resolve_profile_home("mIxEd") == named.resolve()
+        assert get_profile_dir("DeFaUlT") == get_profile_dir("default")
+        assert resolve_profile_home("DEFAULT") == get_profile_dir("default").resolve()
+
+    def test_symlink_escape_is_not_a_profile(self, profile_env):
+        outside = profile_env / "outside"
+        outside.mkdir()
+        (outside / "config.yaml").write_text("outside-config", encoding="utf-8")
+        (outside / ".env").write_text("OUTSIDE_SECRET=sentinel\n", encoding="utf-8")
+        (outside / "state.db").write_bytes(b"outside-state")
+
+        candidate = get_profile_dir("escape")
+        candidate.parent.mkdir(parents=True, exist_ok=True)
+        candidate.symlink_to(outside, target_is_directory=True)
+
+        with pytest.raises(ValueError, match="outside"):
+            resolve_profile_home("escape")
+        assert profile_exists("escape") is False
+        assert "escape" not in dict(profiles_to_serve(multiplex=True))
+        assert (outside / "config.yaml").read_text(encoding="utf-8") == "outside-config"
+        assert (outside / ".env").read_text(encoding="utf-8") == "OUTSIDE_SECRET=sentinel\n"
+        assert (outside / "state.db").read_bytes() == b"outside-state"
 
 
 # ===================================================================

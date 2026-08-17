@@ -39,6 +39,7 @@ from agent.context_engine import automatic_compaction_status_message
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.message_metadata import append_message
+from agent.api_outage_recovery import ApiOutageRecoveryWaiter
 from agent.turn_context import (
     _compression_warrants_another_preflight_pass,
     build_turn_context,
@@ -169,6 +170,22 @@ _HANDOFF_SKIP_FINAL_RESPONSE = (
 # cancelled while waiting on the provider. Surfaces (ACP, TUI) match on this
 # to treat it as cancellation metadata rather than assistant prose.
 INTERRUPT_WAITING_FOR_MODEL_PREFIX = "Operation interrupted: waiting for model response ("
+API_OUTAGE_RECOVERY_RESUME_REASON = "api_outage_recovery"
+
+
+def should_auto_resume_api_outage_result(result: Any) -> bool:
+    """Return whether an interrupted API recovery wait is system-owned.
+
+    A populated ``interrupt_message`` means a user command/message or another
+    explicit control action ended the turn. Those interruptions must retain
+    their normal stop/redirect semantics instead of being replayed.
+    """
+    return bool(
+        isinstance(result, dict)
+        and result.get("interrupted")
+        and result.get("resume_reason") == API_OUTAGE_RECOVERY_RESUME_REASON
+        and not result.get("interrupt_message")
+    )
 
 
 def _should_rearm_compression_budget(
@@ -522,6 +539,105 @@ def _is_nous_inference_route(provider: str, base_url: str) -> bool:
     return (
         base_url_host_matches(base, "inference-api.nousresearch.com")
     )
+
+
+# Codex Responses ``response.failed`` codes that are transient capacity /
+# upstream hiccups. These should exhaust ``api_max_retries`` on the primary
+# before eager fallback — unlike rate-limit / quota / billing terminals.
+_CODEX_TRANSIENT_TERMINAL_ERROR_CODES = frozenset({
+    "upstream_error",
+    "overloaded",
+    "server_error",
+})
+
+
+def _codex_response_error_code(error_obj: Any) -> str:
+    """Extract a lowercase error code from a Responses ``response.error`` payload."""
+    code = None
+    if isinstance(error_obj, dict):
+        code = error_obj.get("code")
+    elif error_obj is not None:
+        code = getattr(error_obj, "code", None)
+    if code is None:
+        return ""
+    return str(code).strip().lower()
+
+
+def _is_codex_transient_terminal_failure(status: str, error_obj: Any) -> bool:
+    """True when a Codex terminal failure should exhaust primary retries first.
+
+    Only ``status=failed`` with known-transient codes defers eager fallback.
+    ``cancelled``, unknown codes, and rate-limit/quota/billing codes keep
+    the prior immediate-fallback behaviour.
+    """
+    if status != "failed":
+        return False
+    return _codex_response_error_code(error_obj) in _CODEX_TRANSIENT_TERMINAL_ERROR_CODES
+
+
+_STALE_CIRCUIT_BREAKER_ERROR_RE = re.compile(
+    r"^Provider has been unresponsive \(no response received\) for "
+    r"\d+ consecutive stale attempts — aborting this call to avoid an indefinite stall\. "
+    r"Switch models or start a new session, then retry\.$"
+)
+
+
+def _is_stale_circuit_breaker_error(error: Any) -> bool:
+    """Identify only the RuntimeError emitted by the stale-call breaker."""
+    return isinstance(error, RuntimeError) and bool(
+        _STALE_CIRCUIT_BREAKER_ERROR_RE.fullmatch(str(error))
+    )
+
+
+def _park_for_api_outage_recovery(
+    agent: Any,
+    messages: List[Dict[str, Any]],
+    conversation_history: Any,
+) -> Optional[Dict[str, Any]]:
+    """Park the exact active API boundary, or return an interrupt result.
+
+    ``None`` means the external probe recovered and the caller should reset its
+    retry counter and continue the existing inner API loop.
+    """
+    config = getattr(agent, "_api_outage_recovery_config", None)
+    if not config or not config.enabled:
+        return None
+    waiter = getattr(agent, "_api_outage_recovery_waiter", None)
+    if not isinstance(waiter, ApiOutageRecoveryWaiter) and not hasattr(waiter, "wait"):
+        waiter = ApiOutageRecoveryWaiter(config)
+        agent._api_outage_recovery_waiter = waiter
+    endpoint_key = "|".join(
+        str(value or "")
+        for value in (agent.provider, agent.model, agent.base_url, agent.api_mode)
+    )
+    outcome = waiter.wait(
+        agent,
+        endpoint_key,
+        agent._emit_status,
+        agent._emit_status,
+    )
+    if outcome == "recovered":
+        return None
+
+    interrupt_text = "Operation interrupted while waiting for API outage recovery."
+    interrupt_message = getattr(agent, "_interrupt_message", None)
+    close_interrupted_tool_sequence(messages, interrupt_text)
+    agent._persist_session(messages, conversation_history)
+    agent.clear_interrupt()
+    result = {
+        "final_response": interrupt_text,
+        "messages": messages,
+        "api_calls": agent._api_call_count,
+        "completed": False,
+        "interrupted": True,
+        "resume_reason": API_OUTAGE_RECOVERY_RESUME_REASON,
+    }
+    if interrupt_message:
+        # Preserve the source of an external interrupt so the gateway can
+        # distinguish a system-owned recovery wait interruption from a user
+        # command/message that intentionally ended the turn.
+        result["interrupt_message"] = interrupt_message
+    return result
 
 
 def _billing_or_entitlement_message(
@@ -3015,6 +3131,7 @@ def run_conversation(
                 
                 # Validate response shape before proceeding
                 response_invalid = False
+                _codex_transient_terminal_failure = False
                 error_details = []
                 if agent.api_mode == "codex_responses":
                     _ct_v = agent._get_transport()
@@ -3029,14 +3146,25 @@ def run_conversation(
                             _codex_resp_status = str(getattr(response, "status", "") or "").strip().lower()
                             if _codex_resp_status in {"failed", "cancelled"}:
                                 _codex_error_obj = getattr(response, "error", None)
+                                _codex_transient_terminal_failure = (
+                                    _is_codex_transient_terminal_failure(
+                                        _codex_resp_status, _codex_error_obj
+                                    )
+                                )
                                 _codex_error_msg = (
                                     _codex_error_obj.get("message") if isinstance(_codex_error_obj, dict)
                                     else str(_codex_error_obj) if _codex_error_obj
                                     else f"Responses API returned status '{_codex_resp_status}'"
                                 )
                                 logger.warning(
-                                    "Codex response status='%s' (error=%s). Routing to fallback. %s",
-                                    _codex_resp_status, _codex_error_msg,
+                                    "Codex response status='%s' (error=%s). %s %s",
+                                    _codex_resp_status,
+                                    _codex_error_msg,
+                                    (
+                                        "Retrying primary before fallback."
+                                        if _codex_transient_terminal_failure
+                                        else "Routing to fallback."
+                                    ),
                                     agent._client_log_context(),
                                 )
                                 response_invalid = True
@@ -3121,19 +3249,21 @@ def run_conversation(
                     # upstream server error, or malformed response.
                     retry_count += 1
                     
-                    # Eager fallback: empty/malformed responses are a common
-                    # rate-limit symptom.  Switch to fallback immediately
-                    # rather than retrying with extended backoff.
-                    if agent._fallback_index < len(agent._fallback_chain):
-                        agent._buffer_status("⚠️ Empty/malformed response — switching to fallback...")
-                    if agent._try_activate_fallback():
-                        active_system_prompt = _sync_failover_system_message(
-                            agent, api_messages, active_system_prompt)
-                        retry_count = 0
-                        compression_attempts = 0
-                        _retry.primary_recovery_attempted = False
-                        _retry.restart_with_rebuilt_messages = True
-                        break
+                    # rate-limit symptom. Known transient Codex terminal errors
+                    # instead exhaust api_max_retries on the primary first.
+                    if not _codex_transient_terminal_failure:
+                        if agent._fallback_index < len(agent._fallback_chain):
+                            agent._buffer_status("⚠️ Empty/malformed response — switching to fallback...")
+                        if agent._try_activate_fallback():
+                            active_system_prompt = _sync_failover_system_message(
+                                agent, api_messages, active_system_prompt)
+                            retry_count = 0
+                            compression_attempts = 0
+                            _retry.primary_recovery_attempted = False
+                            # Upstream failover requires the outer loop to rebuild
+                            # provider messages before issuing the fallback call.
+                            _retry.restart_with_rebuilt_messages = True
+                            break
 
                     # Check for error field in response (some providers include this)
                     error_msg = "Unknown"
@@ -3208,6 +3338,22 @@ def run_conversation(
                             _retry.primary_recovery_attempted = False
                             _retry.restart_with_rebuilt_messages = True
                             break
+                        if (
+                            _codex_transient_terminal_failure
+                            and getattr(
+                                getattr(agent, "_api_outage_recovery_config", None),
+                                "enabled",
+                                False,
+                            )
+                        ):
+                            _park_result = _park_for_api_outage_recovery(
+                                agent, messages, conversation_history
+                            )
+                            if _park_result is not None:
+                                return _park_result
+                            retry_count = 0
+                            response = None
+                            continue
                         # Terminal — flush buffered retry trace so user sees what happened.
                         agent._flush_status_buffer()
                         agent._emit_status(f"❌ Max retries ({max_retries}) exceeded for invalid responses. Giving up.")
@@ -5118,8 +5264,8 @@ def run_conversation(
                 # and transport errors (connection failure / timeout / provider
                 # overloaded).  Rate limits and billing: switch immediately —
                 # the primary provider won't recover within the retry window.
-                # Transport errors: allow 1 retry first (transient hiccups
-                # recover), then fall back if the provider is truly unreachable.
+                # Transport errors: wait until api_max_retries is exhausted
+                # before falling back (transient hiccups may recover).
                 is_rate_limited = classified.reason in {
                     FailoverReason.rate_limit,
                     FailoverReason.billing,
@@ -5143,7 +5289,7 @@ def run_conversation(
                     max_retries = max(max_retries, zai_coding_overload_retry_ceiling())
                 _should_fallback = (
                     is_rate_limited
-                    or (_is_transport_failure and retry_count >= 2)
+                    or (_is_transport_failure and retry_count >= max_retries)
                 )
                 if _should_fallback and agent._fallback_index < len(agent._fallback_chain):
                     # Don't eagerly fallback if credential pool rotation may
@@ -5838,6 +5984,29 @@ def run_conversation(
                         _retry.primary_recovery_attempted = False
                         _retry.restart_with_rebuilt_messages = True
                         break
+                    if (
+                        _is_stale_circuit_breaker_error(api_error)
+                        and getattr(
+                            getattr(agent, "_api_outage_recovery_config", None),
+                            "enabled",
+                            False,
+                        )
+                    ):
+                        _park_result = _park_for_api_outage_recovery(
+                            agent, messages, conversation_history
+                        )
+                        if _park_result is not None:
+                            return _park_result
+                        # A successful external probe proves the endpoint is
+                        # responsive again. Clear the agent-scoped streak before
+                        # retrying, otherwise the next helper call immediately
+                        # reopens the stale circuit.
+                        from agent.chat_completion_helpers import _reset_stale_streak
+
+                        _reset_stale_streak(agent)
+                        retry_count = 0
+                        response = None
+                        continue
                     if api_kwargs is not None:
                         agent._dump_api_request_debug(
                             api_kwargs, reason="non_retryable_client_error", error=api_error,
@@ -6052,6 +6221,26 @@ def run_conversation(
                         _retry.primary_recovery_attempted = False
                         _retry.restart_with_rebuilt_messages = True
                         break
+                    if (
+                        classified.reason in {
+                            FailoverReason.server_error,
+                            FailoverReason.overloaded,
+                            FailoverReason.timeout,
+                        }
+                        and getattr(
+                            getattr(agent, "_api_outage_recovery_config", None),
+                            "enabled",
+                            False,
+                        )
+                    ):
+                        _park_result = _park_for_api_outage_recovery(
+                            agent, messages, conversation_history
+                        )
+                        if _park_result is not None:
+                            return _park_result
+                        retry_count = 0
+                        response = None
+                        continue
                     # Terminal — flush buffered retry/fallback trace.
                     agent._flush_status_buffer()
                     _final_summary = agent._summarize_api_error(api_error)

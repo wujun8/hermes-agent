@@ -1463,6 +1463,40 @@ def test_tui_tool_output_risk_event_exposes_metadata_without_raw_output(monkeypa
     assert "result" not in events[0][2]
 
 
+def test_tui_session_usage_includes_account_limit_lines(monkeypatch):
+    class Agent:
+        model = "gpt-5.5"
+        provider = "openai-codex"
+        base_url = "https://chatgpt.com/backend-api/codex"
+        api_key = "unused"
+        session_input_tokens = 100
+        session_output_tokens = 20
+        session_prompt_tokens = 100
+        session_completion_tokens = 20
+        session_total_tokens = 120
+        session_api_calls = 1
+
+    monkeypatch.setattr(
+        "agent.account_usage.fetch_account_usage",
+        lambda provider, base_url=None, api_key=None: object(),
+    )
+    monkeypatch.setattr(
+        "agent.account_usage.render_account_usage_lines",
+        lambda snapshot, markdown=False: [
+            "📈 Account limits",
+            "Provider: openai-codex (Pro)",
+            "Session: 79% remaining (21% used)",
+        ],
+    )
+
+    usage = server._get_usage(Agent(), include_account=True)
+
+    assert usage["account_lines"] == [
+        "📈 Account limits",
+        "Provider: openai-codex (Pro)",
+        "Session: 79% remaining (21% used)",
+    ]
+
 def test_tui_clarify_lifecycle_events_emit_when_tool_progress_off(monkeypatch):
     events: list[tuple[str, str, dict]] = []
     monkeypatch.setattr(

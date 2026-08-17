@@ -45,7 +45,7 @@ from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
-from typing import Awaitable, Callable, Dict, Optional, Any, List, Tuple, Union, cast
+from typing import Awaitable, Callable, Dict, Optional, Any, List, Tuple, Union, cast, NoReturn
 
 from agent.async_utils import consume_detached_task_result, safe_schedule_threadsafe
 from agent.conversation_compression import (
@@ -58,7 +58,11 @@ from agent.conversation_compression import (
     PRE_API_COMPRESSION_STATUS_TEMPLATE,
     PREFLIGHT_COMPRESSION_STATUS_TEMPLATE,
 )
-from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
+from agent.conversation_loop import (
+    API_OUTAGE_RECOVERY_RESUME_REASON,
+    INTERRUPT_WAITING_FOR_MODEL_PREFIX,
+    should_auto_resume_api_outage_result,
+)
 from agent.i18n import t
 from agent.interrupt_compat import request_hard_interrupt
 from agent.turn_context import (
@@ -1181,8 +1185,11 @@ def build_resume_recovery_note(
     silently abandoned behind a "restored" acknowledgement that goes
     nowhere (#57056).
     """
+    is_api_recovery = reason == API_OUTAGE_RECOVERY_RESUME_REASON
     reason_phrase = (
-        "a gateway restart"
+        "an API outage recovery wait interruption"
+        if is_api_recovery
+        else "a gateway restart"
         if reason == "restart_timeout"
         else "a gateway shutdown"
         if reason == "shutdown_timeout"
@@ -1196,6 +1203,15 @@ def build_resume_recovery_note(
         tail_guidance = (
             "Do NOT re-execute old tool calls — skip any "
             "unfinished work from the conversation history."
+        )
+    elif is_api_recovery:
+        resume_guidance = (
+            "Review the conversation history and CONTINUE the interrupted "
+            "task to completion."
+        )
+        tail_guidance = (
+            "Do NOT re-run tool calls whose results already appear in the "
+            "history — resume from the first step that has no recorded result."
         )
     elif interactive:
         resume_guidance = (
@@ -2063,6 +2079,42 @@ def _multiplex_profile_homes(config: object) -> list[tuple[str, "Path"]]:
     )
 
 
+class ProfileRouteRejectedError(ValueError):
+    """A routed profile is invalid, unavailable, or not served by this runner.
+
+    The message is intentionally stable and path-free.  Callers may surface a
+    refusal through a remote transport, so profile filesystem details must not
+    escape this boundary.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("profile route rejected")
+
+
+def _canonicalize_source_profile(source: "SessionSource") -> Optional[str]:
+    """Normalize and validate a profile stamped on an inbound source.
+
+    This is intentionally only the lexical boundary check.  Existence and
+    runner authorization belong to ``GatewayRunner``'s served-profile resolver;
+    keeping those concerns separate lets relay decode reject malformed input
+    before constructing ``SessionSource`` without opening the filesystem.
+    """
+    raw = getattr(source, "profile", None)
+    if raw is None:
+        return None
+    if not isinstance(raw, str) or not raw.strip():
+        raise ProfileRouteRejectedError()
+    try:
+        from hermes_cli.profiles import normalize_profile_name, validate_profile_name
+
+        canon = normalize_profile_name(raw)
+        validate_profile_name(canon)
+    except (TypeError, ValueError, AttributeError):
+        raise ProfileRouteRejectedError() from None
+    source.profile = canon
+    return canon
+
+
 @_contextmanager
 def _profile_runtime_scope(profile_home: "Path"):
     """Scope config/skills/memory AND credentials to a profile for one turn.
@@ -2091,13 +2143,32 @@ def _profile_runtime_scope(profile_home: "Path"):
     from hermes_cli.env_loader import hydrate_profile_secret_sources
 
     home_token = set_hermes_home_override(str(profile_home))
-    hydrate_profile_secret_sources(Path(profile_home))
-    secret_token = set_secret_scope(build_profile_secret_scope(Path(profile_home)))
+    secret_token = None
     try:
+        # Keep every operation after installing the home override inside this
+        # try/finally.  Hydration and secret-scope construction can both fail;
+        # neither failure is allowed to strand the caller in the profile home.
+        hydrate_profile_secret_sources(Path(profile_home))
+        secret_token = set_secret_scope(build_profile_secret_scope(Path(profile_home)))
         yield
     finally:
-        reset_secret_scope(secret_token)
-        reset_hermes_home_override(home_token)
+        # Teardown is deliberately reverse-order.  A broken cleanup hook must
+        # not prevent the remaining token from being reset, and must not mask an
+        # exception raised by hydration, scope construction, or the body.
+        active_exception = sys.exc_info()[1]
+        cleanup_error = None
+        if secret_token is not None:
+            try:
+                reset_secret_scope(secret_token)
+            except BaseException as exc:  # noqa: BLE001 - preserve context cleanup
+                cleanup_error = exc
+        try:
+            reset_hermes_home_override(home_token)
+        except BaseException as exc:  # noqa: BLE001 - preserve context cleanup
+            if cleanup_error is None:
+                cleanup_error = exc
+        if cleanup_error is not None and active_exception is None:
+            raise cleanup_error
 
 
 def load_gateway_config_for_runner() -> "GatewayConfig":
@@ -3899,6 +3970,16 @@ def _should_clear_resume_pending_after_turn(agent_result: dict) -> bool:
     if agent_result.get("completed") is False:
         return False
     return True
+
+
+def _should_auto_resume_after_turn(agent_result: dict) -> bool:
+    """Return True for system-owned interruptions that must be replayed.
+
+    User control interrupts intentionally end a turn. API recovery waits are
+    different: the agent has persisted the exact boundary and should be
+    scheduled through the normal durable resume queue after its slot releases.
+    """
+    return should_auto_resume_api_outage_result(agent_result)
 
 
 def _preserve_queued_followup_history_offset(
@@ -6541,11 +6622,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.debug("could not set multiplex-active flag", exc_info=True)
         self.adapters: Dict[Platform, BasePlatformAdapter] = {}
         # Multi-profile multiplexing: adapters for NON-default profiles live
-        # here, keyed by profile name then Platform. self.adapters stays the
-        # default/active profile's map so the ~93 existing self.adapters[...]
-        # sites are untouched when multiplexing is off (this dict is empty).
         # Populated by _start_secondary_profile_adapters().
         self._profile_adapters: Dict[str, Dict[Platform, BasePlatformAdapter]] = {}
+        # ``None`` means startup has not published the authoritative served set
+        # yet; once set, profile resolution must use this snapshot rather than
+        # trusting any merely existing directory.
+        self._served_profile_names: Optional[set[str]] = None
         self._warn_if_docker_media_delivery_is_risky()
         _gateway_runner_ref = _weakref.ref(self)
 
@@ -7363,6 +7445,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     def _session_key_for_source(self, source: SessionSource) -> str:
         """Resolve the current session key for a source, honoring gateway config when available."""
+        # Canonicalize before either the durable SessionStore or the local
+        # fallback derives a namespace.  Relay already performs this at decode,
+        # but local/HTTP ingress can construct a SessionSource directly.
+        _canonicalize_source_profile(source)
         if hasattr(self, "session_store") and self.session_store is not None:
             try:
                 session_key = self.session_store._generate_session_key(source)
@@ -11424,7 +11510,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # .clean_shutdown marker).  All three mean "the agent was mid-turn and
     # we killed it" — eligible for startup auto-resume.
     _AUTO_RESUME_REASONS = frozenset(
-        {"restart_timeout", "shutdown_timeout", "restart_interrupted"}
+        {
+            "restart_timeout",
+            "shutdown_timeout",
+            "restart_interrupted",
+            API_OUTAGE_RECOVERY_RESUME_REASON,
+        }
     )
 
     async def _run_startup_resume_event(
@@ -11679,7 +11770,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
         return redelivered
 
-    def _schedule_resume_pending_sessions(self, platform=None) -> int:
+    def _schedule_resume_pending_sessions(
+        self,
+        platform=None,
+        *,
+        session_key: Optional[str] = None,
+        record_restart_guard: bool = True,
+    ) -> int:
         """Auto-continue fresh restart-interrupted sessions after startup.
 
         ``resume_pending`` already preserves the transcript AND the existing
@@ -11713,6 +11810,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     and entry.origin is not None
                     and entry.resume_reason in self._AUTO_RESUME_REASONS
                     and (platform is None or entry.origin.platform == platform)
+                    and (session_key is None or entry.session_key == session_key)
                 ]
         except Exception as exc:
             logger.warning("Failed to enumerate resume-pending sessions: %s", exc)
@@ -11728,7 +11826,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # is now in the loop). Defenses 1-2 cover the cron/CLI/terminal paths;
         # this catches every other SIGTERM source (e.g. a raw `terminal(
         # "launchctl kickstart ai.hermes.gateway")`).
-        if candidates:
+        if candidates and record_restart_guard:
             try:
                 from gateway import restart_loop_guard as _rlg
 
@@ -14685,6 +14783,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return 0
 
         active = get_active_profile_name() or "default"
+        profile_homes = []
+        try:
+            profile_homes = _multiplex_profile_homes(self.config)
+            from hermes_cli.profiles import normalize_profile_name, validate_profile_name
+
+            served_names = set()
+            for profile_name, _profile_home in profile_homes:
+                canon = normalize_profile_name(profile_name)
+                validate_profile_name(canon)
+                served_names.add(canon)
+            # The active profile is authoritative even when a direct/test
+            # enumeration omitted it; the default profile is always the shared
+            # multiplex listener's owner.
+            served_names.add(normalize_profile_name(active))
+            served_names.add("default")
+            self._served_profile_names = served_names
+        except Exception:
+            # Do not turn a profile enumeration problem into an open-ended
+            # "any existing directory" policy.  The active/default entries are
+            # still explicit and the resolver will refuse other routes until a
+            # later startup pass publishes a set.
+            self._served_profile_names = {"default"}
+            try:
+                from hermes_cli.profiles import normalize_profile_name
+
+                self._served_profile_names.add(normalize_profile_name(active))
+            except Exception:
+                pass
         connected = 0
         # Resource claim -> profile that owns it. Credential claims prevent two
         # profiles polling the same account; listener claims prevent sidecars
@@ -14706,7 +14832,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if isinstance(retry_claim, tuple):
                     claimed[retry_claim] = active
 
-        profile_homes = _multiplex_profile_homes(self.config)
         for profile_name, profile_home in profile_homes:
             if profile_name == active:
                 continue  # handled by the primary startup loop
@@ -15806,6 +15931,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # is truly hung — the executor thread is blocked and never checks
         # _interrupt_requested.  Force-clean _running_agents so the session
         # is unlocked and subsequent messages are processed normally.
+        try:
+            await self.async_session_store.clear_resume_pending(quick_key)
+        except Exception as exc:
+            logger.debug("clear_resume_pending on /stop failed for %s: %s", quick_key, exc)
         await self._interrupt_and_clear_session(
             quick_key,
             source,
@@ -16887,6 +17016,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if canonical == "status":
             return await self._handle_status_command(event)
 
+        if canonical == "micro":
+            return await self._handle_micro_command(event)
+
         if canonical == "egress":
             from hermes_cli.proxy_cli import format_status_text
 
@@ -17483,6 +17615,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _claim_state.turn.started_ts = time.time()
         self._persist_active_agents()
         _run_generation = self._begin_session_run_generation(_quick_key)
+        _auto_resume_after_release = False
 
         try:
             try:
@@ -17505,13 +17638,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "protect the transcript, this message was not processed. "
                     "Wait for the active turn to finish, then resend it."
                 )
+            if _should_auto_resume_after_turn(_agent_result):
+                try:
+                    await self.async_session_store.mark_resume_pending(
+                        _quick_key, _agent_result["resume_reason"]
+                    )
+                    _auto_resume_after_release = True
+                except Exception as _resume_exc:
+                    logger.warning(
+                        "Failed to persist API recovery auto-resume for %s: %s",
+                        _quick_key,
+                        _resume_exc,
+                    )
             try:
-                await self._run_post_turn_hooks(
-                    agent_result=_agent_result,
-                    source=source,
-                    is_internal=is_internal,
-                    event=event,
-                )
+                # A recovery interruption is a durable continuation boundary,
+                # not a completed turn: do not let /goal or /loop consume its
+                # status text before the scheduled resume runs.
+                if not _auto_resume_after_release:
+                    await self._run_post_turn_hooks(
+                        agent_result=_agent_result,
+                        source=source,
+                        is_internal=is_internal,
+                        event=event,
+                    )
             except Exception as _goal_exc:
                 logger.debug("post-turn hook failed: %s", _goal_exc)
             return _agent_result
@@ -17542,6 +17691,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # (routing key, run generation) so this unwind can only ever free
             # the lease its own turn acquired, never a newer turn's.
             self._release_turn_lease(_quick_key, _run_generation)
+            if _auto_resume_after_release:
+                # Schedule only after the current slot is released; otherwise
+                # the resume scanner correctly treats this session as active.
+                def _schedule_api_recovery_resume() -> None:
+                    self._schedule_resume_pending_sessions(
+                        platform=source.platform,
+                        session_key=_quick_key,
+                        record_restart_guard=False,
+                    )
+
+                asyncio.get_running_loop().call_soon(_schedule_api_recovery_resume)
 
     def _restore_moa_one_shot(self, event: "MessageEvent", quick_key: str) -> None:
         """Revert a ``/moa <prompt>`` one-shot model override after its turn.
@@ -27370,64 +27530,137 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         return None
 
-    def _resolve_profile_home_for_source(self, source: SessionSource) -> "Path":
-        """Resolve which profile's HERMES_HOME should serve this inbound source.
+    def _served_profile_names_for_source(self) -> set[str]:
+        """Return the runner's authoritative profile allowlist.
 
-        Resolution order:
-          1. ``source.profile`` — set by /p/<profile>/ URL prefix, per-credential
-             adapter ownership, OR profile_routes matching at ``build_source`` time.
-          2. ``_profile_name_for_source`` — re-run routing here as a defensive
-             fallback for sources that bypass ``build_source``.
-          3. The active profile (the multiplexer's own home).
+        Startup publishes the exact names returned by ``profiles_to_serve``
+        before secondary adapters are created.  That snapshot intentionally
+        includes profiles whose Relay adapter is skipped: the shared primary
+        Relay can still stamp and serve those profiles.  Before startup (or in
+        a focused direct-method test), fall back only to explicit adapter-map,
+        route-config, and active-profile state — never to an arbitrary
+        filesystem directory.
+        """
+        published = self.__dict__.get("_served_profile_names")
+        if published is not None:
+            return {str(name) for name in published}
+
+        from hermes_cli.profiles import (
+            get_active_profile_name,
+            normalize_profile_name,
+            validate_profile_name,
+        )
+
+        names: set[str] = set()
+        adapters = self.__dict__.get("_profile_adapters")
+        if isinstance(adapters, dict):
+            for name in adapters:
+                try:
+                    canon = normalize_profile_name(name)
+                    validate_profile_name(canon)
+                except (TypeError, ValueError):
+                    continue
+                names.add(canon)
+
+        config = getattr(self, "config", None)
+        for route in getattr(config, "profile_routes", None) or []:
+            raw = route.get("profile") if isinstance(route, dict) else getattr(route, "profile", None)
+            if raw is None:
+                continue
+            try:
+                canon = normalize_profile_name(raw)
+                validate_profile_name(canon)
+            except (TypeError, ValueError):
+                continue
+            names.add(canon)
+
+        try:
+            active = normalize_profile_name(get_active_profile_name() or "default")
+            validate_profile_name(active)
+            if active != "custom":
+                names.add(active)
+        except (TypeError, ValueError):
+            names.add("default")
+        return names
+
+    def _resolve_profile_home_for_source(self, source: SessionSource) -> "Path":
+        """Resolve a safe, runner-authorized home for an inbound source.
+
+        Explicit source/route profiles must be both in the runner's published
+        served set and present as safe existing directories.  Invalid,
+        nonexistent, symlink-escaping, and unserved profiles all raise the same
+        path-free refusal instead of falling back to the global home.  An
+        unscoped single-profile source retains the historical current-home
+        behavior; multiplexed unscoped sources resolve only the active/default
+        authoritative profile.
         """
         from gateway.profile_routing import ProfileRouteRejected
         from hermes_cli.profiles import (
             get_active_profile_name,
-            get_profile_dir,
-            profile_exists,
+            normalize_profile_name,
+            resolve_profile_home,
+            validate_profile_name,
         )
         from hermes_constants import get_hermes_home
-        
-        # Track whether a profile was explicitly requested (vs. falling back to default)
-        explicit_profile = None
+
+        config = getattr(self, "config", None)
+        multiplex = bool(getattr(config, "multiplex_profiles", False))
+        served = self._served_profile_names_for_source()
+
+        def reject() -> "NoReturn":
+            logger.warning(
+                "Rejected profile route for source %s/%s",
+                getattr(getattr(source, "platform", None), "value", "unknown"),
+                getattr(source, "chat_id", "unknown"),
+            )
+            raise ProfileRouteRejectedError()
+
         try:
-            name = (source.profile or "").strip()
-            if name:
-                explicit_profile = name  # User explicitly set this profile
-            if not name:
+            raw_source_profile = getattr(source, "profile", None)
+            if raw_source_profile is not None:
+                name = _canonicalize_source_profile(source)
+            else:
                 name = self._profile_name_for_source(source)
                 if name:
-                    explicit_profile = name  # Routing explicitly set this profile
-            if not name:
-                name = get_active_profile_name() or "default"
-            
-            profile_dir = get_profile_dir(name)
-            # Warn if an explicit profile doesn't exist on disk
-            if explicit_profile and not profile_exists(name):
-                logger.warning(
-                    "Profile %r does not exist for source %s/%s (guild_id=%s), "
-                    "falling back to global HERMES_HOME",
-                    explicit_profile,
-                    source.platform.value,
-                    source.chat_id,
-                    getattr(source, "guild_id", None),
-                )
-                return get_hermes_home()
-            return profile_dir
+                    # Route parsers already canonicalize, but this is also the
+                    # defensive boundary for direct SessionSource callers.
+                    source.profile = name
+                    name = _canonicalize_source_profile(source)
+
+            if name:
+                if name not in served:
+                    reject()
+                try:
+                    return resolve_profile_home(name, require_exists=True)
+                except Exception:
+                    reject()
+
+            if not multiplex:
+                # Single-profile gateways have always used their authoritative
+                # current home when no route is selected.
+                return Path(get_hermes_home())
+
+            try:
+                active = normalize_profile_name(get_active_profile_name() or "default")
+                validate_profile_name(active)
+            except (TypeError, ValueError):
+                active = "default"
+            if active == "custom":
+                return Path(get_hermes_home())
+            if active not in served:
+                reject()
+            try:
+                return resolve_profile_home(active, require_exists=True)
+            except Exception:
+                reject()
         except ProfileRouteRejected:
             raise
+        except ProfileRouteRejectedError:
+            raise
         except Exception:
-            # Catch normalization errors, path errors, etc.
-            logger.warning(
-                "Failed to resolve profile directory for source %s/%s (guild_id=%s), "
-                "falling back to global HERMES_HOME: %s",
-                source.platform.value,
-                source.chat_id,
-                getattr(source, "guild_id", None),
-                explicit_profile or "(no profile)",
-                exc_info=True,
-            )
-            return get_hermes_home()
+            # Do not expose resolver/path details through a remote error and do
+            # not fall back to a potentially cross-profile global home.
+            reject()
 
     async def _run_agent_inner(
         self,

@@ -98,19 +98,26 @@ def turn_env(monkeypatch, tmp_path, marker_home):
     monkeypatch.setattr(server, "_register_session_cwd", lambda session: None)
     monkeypatch.setattr(server, "_tts_stream_begin", lambda: None)
     monkeypatch.setattr(server, "_sync_session_key_after_compress", lambda *a, **k: None)
-    monkeypatch.setattr(server, "_get_usage", lambda agent: {})
+    monkeypatch.setattr(server, "_get_usage", lambda agent, **_kwargs: {})
 
 
 # ── Marker module ──────────────────────────────────────────────────────
 
 
 def test_marker_roundtrip(tmp_path):
-    record_turn_start(tmp_path, "abc", "fix the bug", attempts=1)
+    record_turn_start(
+        tmp_path,
+        "abc",
+        "fix the bug",
+        attempts=1,
+        resume_reason="api_outage_recovery",
+    )
 
     marker = read_turn_marker(tmp_path, "abc")
     assert marker is not None
     assert marker["prompt"] == "fix the bug"
     assert marker["attempts"] == 1
+    assert marker["resume_reason"] == "api_outage_recovery"
     assert marker["started_at"] == pytest.approx(time.time(), abs=5)
 
     clear_turn_marker(tmp_path, "abc")
@@ -166,6 +173,67 @@ def test_handled_failure_still_clears_marker(emits, turn_env, marker_home):
 
     server._run_prompt_submit("rid", "sid", session, "do the thing")
 
+    assert read_turn_marker(marker_home, "session-key") is None
+
+
+def test_api_recovery_interrupt_schedules_runtime_continuation(
+    emits, turn_env, marker_home, monkeypatch
+):
+    scheduled: list[tuple[str, str]] = []
+
+    def _run(message, **kwargs):
+        return {
+            "final_response": "Operation interrupted while waiting for API outage recovery.",
+            "interrupted": True,
+            "completed": False,
+            "resume_reason": "api_outage_recovery",
+        }
+
+    monkeypatch.setattr(
+        server,
+        "_maybe_schedule_auto_continue",
+        lambda sid, session, key: scheduled.append((sid, key)) or {"attempt": 1},
+    )
+    agent = types.SimpleNamespace(
+        session_id="session-key", run_conversation=_run, clear_interrupt=lambda: None
+    )
+    session = _session(agent=agent, running=True)
+
+    server._run_prompt_submit("rid", "sid", session, "do the thing")
+
+    assert scheduled == [("sid", "session-key")]
+    marker = read_turn_marker(marker_home, "session-key")
+    assert marker is not None
+    assert marker["resume_reason"] == "api_outage_recovery"
+
+
+def test_explicit_interrupt_does_not_schedule_runtime_continuation(
+    emits, turn_env, marker_home, monkeypatch
+):
+    scheduled: list = []
+
+    def _run(message, **kwargs):
+        return {
+            "final_response": "Operation interrupted while waiting for API outage recovery.",
+            "interrupted": True,
+            "completed": False,
+            "resume_reason": "api_outage_recovery",
+            "interrupt_message": "Stop requested",
+        }
+
+    monkeypatch.setattr(
+        server,
+        "_maybe_schedule_auto_continue",
+        lambda *args, **kwargs: scheduled.append((args, kwargs)),
+    )
+    agent = types.SimpleNamespace(
+        session_id="session-key", run_conversation=_run, clear_interrupt=lambda: None
+    )
+    session = _session(agent=agent, running=True)
+
+    server._run_prompt_submit("rid", "sid", session, "do the thing")
+
+    assert scheduled == []
     assert read_turn_marker(marker_home, "session-key") is None
 
 
@@ -261,6 +329,23 @@ def test_fresh_marker_schedules_continuation(emits, schedule_env, marker_home):
     assert "fix the flaky test" in text
     assert kwargs["display_kind"] == "auto_continue"
     assert ("message.start", "sid", None) in [(e, s, p) for e, s, p in emits]
+
+
+def test_api_recovery_marker_uses_continue_note(emits, schedule_env, marker_home):
+    record_turn_start(
+        marker_home,
+        "session-key",
+        "fix the flaky test",
+        resume_reason="api_outage_recovery",
+    )
+
+    result = server._maybe_schedule_auto_continue("sid", _session(), "session-key")
+
+    assert result is not None
+    (text, kwargs), = schedule_env
+    assert text == server._api_outage_recovery_note()
+    assert "CONTINUE the interrupted task" in text
+    assert kwargs["display_kind"] == "auto_continue"
 
 
 def test_stale_marker_is_cleared_not_continued(schedule_env, marker_home, monkeypatch):
@@ -372,5 +457,3 @@ def test_failed_agent_build_leaves_marker_for_retry(
 
 
 # ── End to end: continuation runs a real turn and clears the marker ────
-
-

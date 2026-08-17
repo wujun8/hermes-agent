@@ -48,7 +48,11 @@ from agent.tool_guardrails import (
     ToolCallGuardrailController,
     ToolGuardrailDecision,
 )
-from hermes_cli.config import cfg_get
+from hermes_cli.config import cfg_get, load_config_readonly
+from hermes_cli.micro_compaction import (
+    MICRO_COMPACT_OVERRIDE_KEY,
+    effective_micro_compact,
+)
 from hermes_cli.route_identity import normalize_route_base_url
 from hermes_cli.timeouts import get_provider_request_timeout
 from hermes_constants import get_hermes_home
@@ -102,6 +106,125 @@ def _ra():
     """
     import run_agent
     return run_agent
+
+
+def apply_micro_compact_policy(
+    agent: Any,
+    *,
+    session_override: bool | None,
+    global_value: Any,
+) -> bool:
+    """Apply the durable tri-state policy to an agent and its engine.
+
+    The agent owns the durable/effective/source bookkeeping.  Context engines
+    are optional capabilities: only a public setter is invoked, so plugin
+    implementations without micro-compaction support are left untouched.
+    """
+    override = (
+        session_override
+        if session_override is True or session_override is False
+        else None
+    )
+    enabled, source = effective_micro_compact(global_value, override)
+
+    agent.micro_compact_override = override
+    agent.micro_compact_enabled = enabled
+    agent.micro_compact_source = source
+    agent._micro_compact_global_value = global_value
+
+    model_config = getattr(agent, "_session_init_model_config", None)
+    if not isinstance(model_config, dict):
+        model_config = {}
+        agent._session_init_model_config = model_config
+    if override is None:
+        model_config.pop(MICRO_COMPACT_OVERRIDE_KEY, None)
+    else:
+        model_config[MICRO_COMPACT_OVERRIDE_KEY] = override
+
+    supported = False
+    engine = getattr(agent, "context_compressor", None)
+    setter = getattr(engine, "set_micro_compact_enabled", None)
+    if callable(setter):
+        try:
+            setter(enabled)
+            supported = True
+        except Exception as exc:
+            logger.warning(
+                "Micro-compaction engine capability update failed: %s", exc
+            )
+    agent.micro_compact_runtime_supported = supported
+    return supported
+
+
+def hydrate_micro_compact_policy(
+    agent: Any,
+    *,
+    session_db: Any,
+    session_id: str,
+    global_value: Any,
+) -> bool:
+    """Read a session override when possible, then apply the effective policy."""
+    session_override = None
+    if (
+        not getattr(agent, "_persist_disabled", False)
+        and session_db is not None
+        and session_id
+    ):
+        try:
+            session_meta = session_db.get_session(session_id)
+            getter = getattr(session_db, "session_micro_compact_override", None)
+            if callable(getter):
+                session_override = getter(session_meta)
+        except Exception as exc:
+            # Missing rows and unavailable stores are normal during lazy
+            # session creation.  They mean "inherit", never "enable".
+            logger.debug(
+                "Micro-compaction session policy hydration unavailable for %s: %s",
+                session_id,
+                exc,
+            )
+    return apply_micro_compact_policy(
+        agent,
+        session_override=session_override,
+        global_value=global_value,
+    )
+
+
+def refresh_micro_compact_policy(agent: Any) -> bool:
+    """Refresh inherited policy from config while preserving explicit policy."""
+    raw_override = getattr(agent, "micro_compact_override", None)
+    session_override = (
+        raw_override if raw_override is True or raw_override is False else None
+    )
+    if session_override is not None:
+        # Explicit session policy has precedence and must not cause a config
+        # read on every completed turn.
+        global_value = getattr(agent, "_micro_compact_global_value", False)
+        return apply_micro_compact_policy(
+            agent,
+            session_override=session_override,
+            global_value=global_value,
+        )
+
+    try:
+        config = load_config_readonly()
+        compression = config.get("compression", {}) if isinstance(config, dict) else {}
+        if not isinstance(compression, dict):
+            compression = {}
+        global_value = compression.get("micro_compact", False)
+    except Exception as exc:
+        logger.warning(
+            "Micro-compaction policy refresh could not load config; retaining "
+            "last effective value: %s",
+            exc,
+        )
+        return getattr(agent, "micro_compact_enabled", False) is True
+
+    return apply_micro_compact_policy(
+        agent,
+        session_override=None,
+        global_value=global_value,
+    )
 
 
 def _moa_reference_output_allowed(agent: Any) -> bool:
@@ -1933,6 +2056,33 @@ def init_agent(
         _api_retries = 3
     agent._api_max_retries = _api_retries
 
+    # Optional active-turn outage parking. Keep the waiter on the agent so its
+    # per-endpoint probe throttle survives false-positive probe/API cycles.
+    from agent.api_outage_recovery import (
+        ApiOutageRecoveryConfig,
+        ApiOutageRecoveryWaiter,
+    )
+    agent._api_outage_recovery_config = ApiOutageRecoveryConfig.from_mapping(
+        _agent_section.get("api_outage_recovery", {})
+    )
+    agent._api_outage_recovery_waiter = ApiOutageRecoveryWaiter(
+        agent._api_outage_recovery_config
+    )
+    # Delegation timeout accounting reads this explicit marker.  The waiter
+    # owns all transitions and refreshes activity while it is true.
+    agent._api_outage_waiting = False
+
+    # Retry/fallback status is buffered by default to avoid noisy transient
+    # failure chatter. Opt in to live status when operators need immediate
+    # visibility into each API retry attempt.
+    _raw_show_retry_status = _agent_section.get("show_retry_status", False)
+    agent._show_retry_status = str(_raw_show_retry_status).strip().lower() in {
+        "true",
+        "1",
+        "yes",
+        "on",
+    }
+
     # Initialize context compressor for automatic context management
     # Compresses conversation when approaching model's context limit
     # Configuration via config.yaml (compression section)
@@ -2632,10 +2782,29 @@ def init_agent(
             pass
     agent.compression_enabled = compression_enabled
     agent.compression_in_place = compression_in_place
-    # Apply micro-compaction settings to the compressor (feature is opt-in)
+    # Apply micro-compaction settings after the selected context engine and
+    # session state are ready.  Durable session overrides take precedence over
+    # the global config; a missing/lazy row inherits the global value.
     _cc = getattr(agent, "context_compressor", None)
-    if _cc is not None and hasattr(_cc, "_micro_compact_enabled"):
-        _cc._micro_compact_enabled = compression_micro_compact
+    agent.micro_compact_override = None
+    agent.micro_compact_enabled = False
+    agent.micro_compact_source = "global"
+    agent._micro_compact_global_value = compression_micro_compact
+    agent.micro_compact_runtime_supported = False
+    agent._refresh_micro_compact_policy = lambda: refresh_micro_compact_policy(agent)
+    if getattr(agent, "_persist_disabled", False):
+        apply_micro_compact_policy(
+            agent,
+            session_override=None,
+            global_value=compression_micro_compact,
+        )
+    else:
+        hydrate_micro_compact_policy(
+            agent,
+            session_db=session_db,
+            session_id=agent.session_id,
+            global_value=compression_micro_compact,
+        )
     if _cc is not None and hasattr(_cc, "_micro_compact_every_n_turns"):
         _cc._micro_compact_every_n_turns = compression_micro_compact_every_n_turns
     if _cc is not None and hasattr(_cc, "_micro_compact_defrag_threshold_tokens"):

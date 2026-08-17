@@ -6046,7 +6046,11 @@ class DiscordAdapter(BasePlatformAdapter):
         slot_cap = _DISCORD_MAX_APP_COMMANDS - 1
         dropped_over_cap = 0
         try:
-            from hermes_cli.commands import COMMAND_REGISTRY, _is_gateway_available, _resolve_config_gates
+            from hermes_cli.commands import (
+                COMMAND_REGISTRY,
+                _is_gateway_menu_advertised,
+                _resolve_config_gates,
+            )
 
             try:
                 already_registered = {cmd.name for cmd in tree.get_commands()}
@@ -6056,7 +6060,7 @@ class DiscordAdapter(BasePlatformAdapter):
             config_overrides = _resolve_config_gates()
 
             for cmd_def in COMMAND_REGISTRY:
-                if not _is_gateway_available(cmd_def, config_overrides):
+                if not _is_gateway_menu_advertised(cmd_def, config_overrides):
                     continue
                 # Discord command names: lowercase, hyphens OK, max 32 chars.
                 discord_name = cmd_def.name.lower()[:32]

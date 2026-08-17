@@ -115,6 +115,65 @@ You can also set `providers.<id>.stale_timeout_seconds` for the non-streaming st
 
 Leaving these unset keeps the legacy defaults (`HERMES_API_TIMEOUT=1800`s, `HERMES_API_CALL_STALE_TIMEOUT=90`s, native Anthropic 900s). The non-streaming stale detector is auto-disabled for local endpoints when left implicit and can scale upward for very large contexts. Not currently wired for AWS Bedrock (both `bedrock_converse` and AnthropicBedrock SDK paths use boto3 with its own timeout configuration). See the commented example in [`cli-config.yaml.example`](https://github.com/NousResearch/hermes-agent/blob/main/cli-config.yaml.example).
 
+### API Retry Status
+
+Hermes retries transient API failures according to `agent.api_max_retries` and normally buffers retry/fallback status messages unless all recovery attempts fail. To display every retry status immediately while the request is still running, enable:
+
+```yaml
+agent:
+  show_retry_status: true   # default: false
+```
+
+You can also run `hermes config set agent.show_retry_status true`. Live messages are not buffered, so a final failure does not display the same retry status twice.
+
+### Active-turn API outage recovery
+
+Hermes can optionally keep an active turn parked in memory when transient
+provider failures (`server_error`, overload, or timeout) exhaust retries and
+all configured fallbacks. It periodically runs an external readiness command;
+after that command exits successfully, Hermes retries the same model boundary
+without adding a synthetic message or replaying completed tool calls.
+
+```yaml
+agent:
+  api_outage_recovery:
+    enabled: true                 # default: false
+    probe_command: /path/to/check-provider --ready
+    probe_interval_seconds: 600   # minimum: 10
+    probe_timeout_seconds: 60     # minimum: 1
+```
+
+`enabled: true` requires a nonempty `probe_command`. If the command is empty or
+only whitespace, outage recovery is effectively disabled and exhausted API
+failures keep their existing terminal behavior.
+
+The probe command is executed directly with `shell=False`; shell syntax is not
+interpreted, so pipes, redirection, globbing, and operators such as `&&` do not
+work. Put multi-step logic in an executable script. To supply environment
+variables without a shell, use a command such as
+`/usr/bin/env FOO=bar /path/to/check-provider --ready`. Probe stdout and stderr
+are discarded and never added to the conversation or normal logs.
+
+The probe must test the endpoint for the provider/runtime that is active when
+Hermes parks. After a fallback chain is exhausted, that is currently the last
+active fallback, not automatically the primary provider. A single probe command
+may therefore be unable to represent every endpoint in a heterogeneous fallback
+chain; use a script that checks the relevant routes or leave this feature
+disabled for that chain.
+
+Parked turns and probe-throttle timestamps exist only in process memory and are
+**not durable**. Restarting the Hermes process, gateway, or machine discards the
+parked turn rather than resuming it.
+
+Probe throttling is per Agent instance, not process-global. Concurrent sessions
+and subagents each have an independent Agent and may therefore run the same
+read-only probe during the same interval; Hermes does not coordinate or dedupe
+probes across Agents.
+
+Authentication, billing, rate-limit, request-format, content-policy, and unknown
+failures keep their existing terminal behavior. Interrupting a parked turn
+cancels it as an interruption rather than an API failure.
+
 ## Update Behavior
 
 `hermes update` settings live under `updates` in `config.yaml`:

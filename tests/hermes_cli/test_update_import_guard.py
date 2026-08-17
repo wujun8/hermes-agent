@@ -70,26 +70,30 @@ def test_import_guard_passes_on_consistent_tree(monkeypatch, tmp_path):
     assert hermes_main._validate_critical_modules_import(tmp_path) == (True, None, None)
 
 
-def test_import_guard_ignores_non_import_errors(monkeypatch, tmp_path):
-    """A module that raises at import time for config/env reasons is not
-    update breakage -- the guard must not roll back a good update."""
+def test_import_guard_rejects_import_time_exceptions(monkeypatch, tmp_path):
+    """Any candidate import exception is unsafe before release promotion."""
     (tmp_path / "consumer.py").write_text(
         "raise RuntimeError('no API key configured')\n"
     )
     monkeypatch.setattr(update_cmd, "_UPDATE_CRITICAL_MODULES", ("consumer",))
 
-    ok, _, _ = hermes_main._validate_critical_modules_import(tmp_path)
-    assert ok is True
+    ok, module, error = hermes_main._validate_critical_modules_import(tmp_path)
+    assert ok is False
+    assert module == "consumer"
+    assert error and "no API key configured" in error
 
 
-def test_import_guard_is_non_fatal_when_probe_cannot_run(monkeypatch, tmp_path):
-    """If we can't spawn the probe, don't block the user's update."""
+def test_import_guard_fails_closed_when_probe_cannot_run(monkeypatch, tmp_path):
+    """A release cannot be promoted when its import probe cannot run."""
 
     def boom(*_a, **_kw):
         raise OSError("cannot spawn")
 
     monkeypatch.setattr(update_cmd.subprocess, "run", boom)
-    assert update_cmd._validate_critical_modules_import(tmp_path) == (True, None, None)
+    ok, module, error = update_cmd._validate_critical_modules_import(tmp_path)
+    assert ok is False
+    assert module == "candidate import probe"
+    assert error and "cannot spawn" in error
 
 
 # ---------------------------------------------------------------------------
@@ -164,7 +168,11 @@ def test_import_guard_ignores_missing_third_party_dependency(monkeypatch, tmp_pa
     (tmp_path / "consumer.py").write_text("import totally_not_installed_pkg\n")
     monkeypatch.setattr(update_cmd, "_UPDATE_CRITICAL_MODULES", ("consumer",))
 
-    assert update_cmd._validate_critical_modules_import(tmp_path) == (True, None, None)
+    ok, module, diagnostic = update_cmd._validate_critical_modules_import(tmp_path)
+
+    assert ok is True
+    assert module is None
+    assert diagnostic and "totally_not_installed_pkg" in diagnostic
 
 
 def test_import_guard_flags_missing_first_party_module(monkeypatch, tmp_path):

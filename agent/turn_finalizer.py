@@ -401,6 +401,24 @@ def finalize_turn(
         # exchange into the rolling summary.  This amortizes compression
         # across turns rather than batching it into one big pause.
         if not interrupted and not failed:
+            # Inherited policy follows the current global config at the turn
+            # boundary; explicit session policy is reapplied without a config
+            # read.  Persistence-isolated background forks must not touch the
+            # canonical session state, and a refresh failure must never lose a
+            # completed response.
+            if not getattr(agent, "_persist_disabled", False):
+                _refresh_policy = getattr(
+                    agent, "_refresh_micro_compact_policy", None
+                )
+                if callable(_refresh_policy):
+                    try:
+                        _refresh_policy()
+                    except Exception as _refresh_err:
+                        logger.warning(
+                            "Micro-compaction policy refresh failed: %s",
+                            _refresh_err,
+                            exc_info=True,
+                        )
             try:
                 _compressor = getattr(agent, "context_compressor", None)
                 # Strict `is True` + isinstance gates: plugin context engines
@@ -410,6 +428,8 @@ def finalize_turn(
                 # iterating) return value over the transcript, wiping it.
                 if (
                     _compressor
+                    and getattr(agent, "micro_compact_runtime_supported", True)
+                    is not False
                     and getattr(_compressor, '_micro_compact_enabled', False) is True
                     and callable(getattr(_compressor, '_micro_compact', None))
                     and final_response

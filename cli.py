@@ -9286,6 +9286,21 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # First session or empty history — still finalize the old session
             self._notify_session_boundary("on_session_finalize")
 
+        _preserve_old_micro_override = False
+        if self._session_db and old_session_id:
+            try:
+                _old_meta = self._session_db.get_session(old_session_id)
+                _old_getter = getattr(
+                    self._session_db, "session_micro_compact_override", None
+                )
+                if callable(_old_getter):
+                    _old_override = _old_getter(_old_meta)
+                    _preserve_old_micro_override = (
+                        _old_override is True or _old_override is False
+                    )
+            except Exception:
+                _preserve_old_micro_override = False
+
         if self._session_db and old_session_id:
             # Flush any un-persisted messages from the current turn to the
             # old session *before* rotating.  /new can be called mid-turn
@@ -9306,7 +9321,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 pass
             # Don't let immediately-rotated empty sessions pile up in
             # /resume and `hermes sessions list` (gemini-cli#27770 port).
-            self._discard_session_if_empty(old_session_id)
+            if not _preserve_old_micro_override:
+                self._discard_session_if_empty(old_session_id)
 
         self.session_start = datetime.now()
         timestamp_str = self.session_start.strftime("%Y%m%d_%H%M%S")
@@ -9389,6 +9405,21 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self.agent.session_start = self.session_start
             self.agent.reasoning_config = self.reasoning_config
             self.agent.reset_session_state()
+            # /new is a conversation boundary: clear the prior session's
+            # micro policy from the live agent before creating the new row.
+            # The helper is deliberately DB-free, so the old row remains
+            # resumable with its explicit override intact.
+            try:
+                from hermes_cli.micro_command import (
+                    reset_micro_compact_policy_for_new_session,
+                )
+
+                reset_micro_compact_policy_for_new_session(agent=self.agent)
+            except Exception:
+                logger.debug(
+                    "Could not reset micro policy at /new boundary",
+                    exc_info=True,
+                )
             if hasattr(self.agent, "_last_flushed_db_idx"):
                 self.agent._last_flushed_db_idx = 0
             if hasattr(self.agent, "_todo_store"):
@@ -11311,6 +11342,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self._handle_resume_command(cmd_original)
         elif canonical == "sessions":
             self._handle_sessions_command(cmd_original)
+        elif canonical == "micro":
+            self._handle_micro_command(cmd_original)
         elif canonical == "model":
             self._handle_model_switch(cmd_original)
         elif canonical == "codex-runtime":

@@ -1082,6 +1082,27 @@ class CLICommandsMixin:
         if self.agent:
             self.agent.session_id = target_id
             self.agent.reset_session_state()
+            # reset_session_state() does not clear policy fields.  Rehydrate the
+            # exact target row now so an in-process /resume cannot retain the
+            # previous session's explicit override (A/B isolation).
+            try:
+                from hermes_cli.micro_command import (
+                    hydrate_micro_compact_policy_for_session,
+                )
+
+                hydrate_micro_compact_policy_for_session(
+                    agent=self.agent,
+                    session_db=self._session_db,
+                    session_id=target_id,
+                )
+            except Exception:
+                import logging
+
+                logging.getLogger(__name__).debug(
+                    "Could not hydrate micro policy for resumed session %s",
+                    target_id,
+                    exc_info=True,
+                )
             if hasattr(self.agent, "_last_flushed_db_idx"):
                 self.agent._last_flushed_db_idx = len(self.conversation_history)
             if hasattr(self.agent, "_todo_store"):
@@ -3193,6 +3214,37 @@ class CLICommandsMixin:
         requested = parts[1] if len(parts) > 1 else None
         result = run_approval_mode_command(requested)
         _cprint(f"  {result.message}")
+
+    def _handle_micro_command(self, raw_args: str) -> None:
+        """Handle the DB-first session-scoped ``/micro`` policy command."""
+        from hermes_cli.micro_command import execute_micro_command
+
+        agent = getattr(self, "agent", None)
+        if agent is None:
+            self._console_print(
+                "Micro-compaction error: the foreground agent is not initialized"
+            )
+            return
+
+        session_id = getattr(agent, "session_id", None)
+        session_db = getattr(self, "_session_db", None)
+        if session_db is None:
+            session_db = getattr(agent, "_session_db", None)
+        ensure_session = getattr(agent, "_ensure_db_session", None)
+
+        parts = (raw_args or "").strip().split(None, 1)
+        args = parts[1] if parts and parts[0].lstrip("/").lower() == "micro" and len(parts) == 2 else (
+            "" if parts and parts[0].lstrip("/").lower() == "micro" else (raw_args or "")
+        )
+        result = execute_micro_command(
+            agent=agent,
+            session_db=session_db,
+            session_id=session_id,
+            raw_args=args,
+            ensure_session=ensure_session,
+        )
+        # The service is deliberately silent; the classic CLI owns rendering.
+        self._console_print(result)
 
     def _handle_footer_command(self, cmd_original: str) -> None:
         """Toggle or inspect ``display.runtime_footer.enabled`` from the CLI.

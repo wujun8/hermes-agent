@@ -4,6 +4,8 @@ Handler bodies are byte-identical to their pre-split server.py form; they
 are rebound onto server.py's globals at install time — see method_ctx.py.
 """
 
+import types
+
 from .method_ctx import HandlerRegistry
 
 _registry = HandlerRegistry()
@@ -13,6 +15,12 @@ _profile_scoped = _registry.profile_scoped
 
 @method("session.create")
 def _(rid, params: dict) -> dict:
+    profile = _requested_profile(params)
+    try:
+        profile_home = _profile_home(profile)
+    except TUIProfileSelectionError:
+        return _profile_selection_rpc_error(rid)
+
     sid = uuid.uuid4().hex[:8]
     key = _new_session_key()
     cols = int(params.get("cols", 80))
@@ -34,13 +42,6 @@ def _(rid, params: dict) -> dict:
     resolved_cwd = _completion_cwd(params)
     source = _resolve_session_source(str(params.get("source") or "").strip() or None)
     _enable_gateway_prompts()
-
-    # ``profile`` (app-global remote mode): a new chat started under a non-launch
-    # profile must build its agent + persist against THAT profile's home/state.db,
-    # not the dashboard's launch profile. Stored on the session so _start_agent_build
-    # and each turn re-bind HERMES_HOME. None/own profile → launch (unchanged).
-    profile = (params.get("profile") or "").strip() or None
-    profile_home = _profile_home(profile)
 
     # The desktop composer owns its model/effort/fast as plain UI state and ships
     # it on every session.create. Honor each as a PER-SESSION override (built into
@@ -89,6 +90,7 @@ def _(rid, params: dict) -> dict:
             "history": history,
             "history_lock": threading.Lock(),
             "history_version": 0,
+            "session_generation": 0,
             "image_counter": 0,
             "cwd": resolved_cwd,
             "inflight_turn": None,
@@ -162,6 +164,11 @@ def _(rid, params: dict) -> dict:
 
 @method("session.list")
 def _(rid, params: dict) -> dict:
+    try:
+        _profile_home(_requested_profile(params))
+    except TUIProfileSelectionError:
+        return _profile_selection_rpc_error(rid)
+
     with _profile_db(params) as db:
         if db is None:
             return _db_unavailable_error(rid, code=5006)
@@ -230,6 +237,11 @@ def _(rid, params: dict) -> dict:
     Honors ``params.profile`` so app-global remote mode lists from the
     focused profile's ``state.db`` (mirrors ``session.resume``).
     """
+    try:
+        _profile_home(_requested_profile(params))
+    except TUIProfileSelectionError:
+        return _profile_selection_rpc_error(rid)
+
     with _profile_db(params) as db:
         if db is None:
             return _ok(rid, {"session_id": None})
@@ -306,6 +318,12 @@ def _(rid, params: dict) -> dict:
 
 @method("session.resume")
 def _(rid, params: dict) -> dict:
+    profile = _requested_profile(params)
+    try:
+        profile_home = _profile_home(profile)
+    except TUIProfileSelectionError:
+        return _profile_selection_rpc_error(rid)
+
     target = params.get("session_id", "")
     if not target:
         return _err(rid, 4006, "session_id required")
@@ -313,10 +331,6 @@ def _(rid, params: dict) -> dict:
         cols = int(params.get("cols", 80))
     except (TypeError, ValueError):
         cols = 80
-    # ``profile`` (app-global remote mode): resume a session that lives in another
-    # local profile's state.db. None/own profile → the launch profile (unchanged).
-    profile = (params.get("profile") or "").strip() or None
-    profile_home = _profile_home(profile)
     defer_history = is_truthy_value(params.get("defer_history", False))
     # Desktop hydrates persisted transcripts through the authenticated REST
     # route in parallel. Suppress the duplicate WebSocket transcript only when
@@ -415,7 +429,7 @@ def _(rid, params: dict) -> dict:
             profile_home
         )
 
-        def _reuse_live_payload(sid: str, session: dict) -> dict:
+        def _reuse_live_payload(sid: str, session: dict) -> dict | None:
             payload = _live_session_payload(
                 sid,
                 session,
@@ -423,7 +437,10 @@ def _(rid, params: dict) -> dict:
                 touch=True,
                 transport=current_transport() or _stdio_transport,
                 omit_messages=omit_messages,
+                reject_session_control=True,
             )
+            if payload is None:
+                return None
             payload["resumed"] = target
             if defer_history:
                 payload["messages"] = []
@@ -442,8 +459,11 @@ def _(rid, params: dict) -> dict:
         # Fast path: if the session is already live, reuse it under the lock.
         with _session_resume_lock:
             live = _find_live_session_by_key(target)
-            if live is not None:
-                return _ok(rid, _reuse_live_payload(*live))
+        if live is not None:
+            payload = _reuse_live_payload(*live)
+            if payload is None:
+                return _err(rid, 4009, _MICRO_CONTROL_BUSY_MESSAGE)
+            return _ok(rid, payload)
 
         # Lazy/watch resume: register the live session WITHOUT building an agent.
         # Used by the desktop's subagent windows — the child runs inside the
@@ -483,8 +503,14 @@ def _(rid, params: dict) -> dict:
                 profile_home=profile_home,
                 lazy=True,
             )
-            if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
-                return _ok(rid, _reuse_live_payload(*live))
+            live = _claim_or_reuse_live(sid, target, record, lease)
+            if live is _SESSION_CONTROL_BUSY:
+                return _err(rid, 4009, _MICRO_CONTROL_BUSY_MESSAGE)
+            if live is not None:
+                payload = _reuse_live_payload(*live)
+                if payload is None:
+                    return _err(rid, 4009, _MICRO_CONTROL_BUSY_MESSAGE)
+                return _ok(rid, payload)
             # A delegated child mid-run emits no session events of its own — report
             # its liveness from the relay registry so the window shows a busy turn.
             child_running = _child_run_active(target)
@@ -554,8 +580,14 @@ def _(rid, params: dict) -> dict:
             record["resume_history_ready"] = threading.Event()
             record["resume_hydrating"] = True
             record["resume_message_count"] = int(found.get("message_count") or 0)
-            if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
-                return _ok(rid, _reuse_live_payload(*live))
+            live = _claim_or_reuse_live(sid, target, record, lease)
+            if live is _SESSION_CONTROL_BUSY:
+                return _err(rid, 4009, _MICRO_CONTROL_BUSY_MESSAGE)
+            if live is not None:
+                payload = _reuse_live_payload(*live)
+                if payload is None:
+                    return _err(rid, 4009, _MICRO_CONTROL_BUSY_MESSAGE)
+                return _ok(rid, payload)
 
             _schedule_resume_hydration(sid, target, db, close_db=owns_db)
             # The hydration worker now owns a profile-scoped handle and closes it
@@ -647,8 +679,14 @@ def _(rid, params: dict) -> dict:
                 model_override=overrides.get("model_override"),
                 resume_runtime_overrides=overrides or None,
             )
-            if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
-                return _ok(rid, _reuse_live_payload(*live))
+            live = _claim_or_reuse_live(sid, target, record, lease)
+            if live is _SESSION_CONTROL_BUSY:
+                return _err(rid, 4009, _MICRO_CONTROL_BUSY_MESSAGE)
+            if live is not None:
+                payload = _reuse_live_payload(*live)
+                if payload is None:
+                    return _err(rid, 4009, _MICRO_CONTROL_BUSY_MESSAGE)
+                return _ok(rid, payload)
 
             _schedule_agent_build(sid)
             _schedule_session_cap_enforcement()  # trim detached idle sessions over the cap
@@ -766,7 +804,10 @@ def _(rid, params: dict) -> dict:
                     touch=True,
                     transport=current_transport() or _stdio_transport,
                     omit_messages=omit_messages,
+                    reject_session_control=True,
                 )
+                if payload is None:
+                    return _err(rid, 4009, _MICRO_CONTROL_BUSY_MESSAGE)
                 payload["resumed"] = target
                 return _ok(rid, payload)
             try:
@@ -1060,6 +1101,12 @@ def _(rid, params: dict) -> dict:
     Honors ``params.profile`` so app-global remote mode deletes from the
     focused profile's ``state.db`` + sessions dir (mirrors ``session.resume``).
     """
+    profile = _requested_profile(params)
+    try:
+        profile_home = _profile_home(profile)
+    except TUIProfileSelectionError:
+        return _profile_selection_rpc_error(rid)
+
     target = params.get("session_id", "")
     if not target:
         return _err(rid, 4006, "session_id required")
@@ -1078,8 +1125,6 @@ def _(rid, params: dict) -> dict:
     active = {s.get("session_key") for s in snapshot if s.get("session_key")}
     if target in active:
         return _err(rid, 4023, "cannot delete an active session")
-    profile = (params.get("profile") or "").strip() or None
-    profile_home = _profile_home(profile)
     with _profile_db(params) as db:
         if db is None:
             return _db_unavailable_error(rid, code=5036)
@@ -2627,12 +2672,13 @@ def _(rid, params: dict) -> dict:
     return _ok(rid, {"removed": removed})
 
 
-@method("session.compress")
-def _(rid, params: dict) -> dict:
-    session, err = _sess_nowait(params, rid)
-    if err:
-        return err
-    assert session is not None
+def _run_session_compression(
+    rid,
+    params: dict,
+    session: dict,
+    control_token,
+) -> dict:
+    """Run session compression after its exact control lease is held."""
     if _session_uses_compute_host(session):
         sid = str(params.get("session_id") or "")
         focus_topic = str(params.get("focus_topic", "") or "").strip()
@@ -2653,16 +2699,10 @@ def _(rid, params: dict) -> dict:
         host_result = ack.get("result")
         if isinstance(host_result, dict):
             # The host owns the isolated session's agent/history, so preserve
-            # its structured compression result verbatim. In particular this
-            # carries `status: aborted` and `summary.aborted`; flattening the
-            # old text-only acknowledgement made Desktop show aborted work as a
-            # success toast.
+            # its structured compression result verbatim.
             return _ok(rid, {**host_result, "turn_isolation": True})
         host_info = ack.get("session_info") if isinstance(ack.get("session_info"), dict) else {}
         host_messages = _history_to_messages(ack.get("messages")) if isinstance(ack.get("messages"), list) else []
-        # `messages` is returned at top level for the desktop transcript
-        # replacement. Keep the host acknowledgement metadata, but do not send
-        # the same (potentially large) transcript a second time inside it.
         host_ack = {key: value for key, value in ack.items() if key != "messages"}
         return _ok(
             rid,
@@ -2675,13 +2715,7 @@ def _(rid, params: dict) -> dict:
                 "usage": host_info.get("usage") if isinstance(host_info.get("usage"), dict) else {},
             },
         )
-    session, err = _sess(params, rid)
-    if err:
-        return err
-    if session.get("running"):
-        return _err(
-            rid, 4009, "session busy — /interrupt the current turn before /compress"
-        )
+
     from agent.conversation_compression import (
         finalize_context_engine_compression_notification,
     )
@@ -2727,8 +2761,6 @@ def _(rid, params: dict) -> dict:
             with session["history_lock"]:
                 messages = list(session.get("history", []))
             after_count = len(messages)
-            # Re-read system prompt + tools after compression — _compress_context
-            # may have rebuilt the system prompt (_cached_system_prompt=None).
             _sys_prompt_after = (
                 getattr(_agent, "_cached_system_prompt", "") or _sys_prompt
             )
@@ -2743,7 +2775,11 @@ def _(rid, params: dict) -> dict:
                 else 0
             )
             agent = session["agent"]
-            _sync_session_key_after_compress(sid, session)
+            _sync_session_key_after_compress(
+                sid,
+                session,
+                control_token=control_token,
+            )
             summary = summarize_manual_compression(
                 before_messages,
                 messages,
@@ -2769,34 +2805,44 @@ def _(rid, params: dict) -> dict:
                     "summary": summary,
                     "usage": usage,
                     "info": info,
-                    # Keep this identical to session.resume / session.history:
-                    # raw tool results can contain large or sensitive payloads
-                    # that belong in persisted history, not the transcript
-                    # replacement response.
                     "messages": _history_to_messages(messages),
                 },
             )
         finally:
-            # Always clear the pinned compressing status so the bar
-            # reverts to neutral whether compaction succeeded, was a
-            # no-op, or raised.
             _status_update(sid, "ready")
     except CompressionLockHeld as e:
         _status_update(sid, "ready")
-        from agent.manual_compression_feedback import (
-            describe_compression_lock_skip,
+        from agent.manual_compression_feedback import describe_compression_lock_skip
+
+        return _ok(
+            rid,
+            {
+                "compressed": False,
+                "lock_held": True,
+                "message": describe_compression_lock_skip(e.holder),
+            },
         )
-        return _ok(rid, {
-            "compressed": False,
-            "lock_held": True,
-            "message": describe_compression_lock_skip(e.holder),
-        })
     except Exception as e:
         finalize_context_engine_compression_notification(
             session["agent"],
             committed=False,
         )
         return _err(rid, 5005, str(e))
+
+
+@method("session.compress")
+def _(rid, params: dict) -> dict:
+    session, err = _sess_nowait(params, rid)
+    if err:
+        return err
+    assert session is not None
+    control_token, claim_error = _claim_manual_compression_control(session)
+    if claim_error is not None:
+        return _err(rid, 4009, _manual_compression_busy_text(claim_error))
+    try:
+        return _run_session_compression(rid, params, session, control_token)
+    finally:
+        _release_session_control(session, control_token)
 
 
 @method("session.save")
@@ -2879,6 +2925,8 @@ def _(rid, params: dict) -> dict:
     # keep every unrelated session.resume waiting behind it.
     with _session_resume_lock:
         session = _pop_session_by_id(sid)
+    if session is _SESSION_CONTROL_BUSY:
+        return _err(rid, 4009, _MICRO_CONTROL_BUSY_MESSAGE)
     closed = _teardown_popped_session(session, end_reason="tui_close")
     return _ok(rid, {"closed": closed})
 
@@ -3467,3 +3515,10 @@ def _(rid, params: dict) -> dict:
 def register(server) -> None:
     """Bind this module's handlers onto ``server``'s globals and registry."""
     _registry.install(server)
+    server._run_session_compression = types.FunctionType(
+        _run_session_compression.__code__,
+        vars(server),
+        _run_session_compression.__name__,
+        _run_session_compression.__defaults__,
+        _run_session_compression.__closure__,
+    )

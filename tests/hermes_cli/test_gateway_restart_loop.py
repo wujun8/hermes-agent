@@ -540,6 +540,34 @@ class TestTerminalToolGatewayLifecycleGuard:
         assert result["exit_code"] == 0
         assert calls == [command]
 
+    def test_binary_executable_with_nul_passes_through(self, monkeypatch, tmp_path):
+        import tools.terminal_tool as tt
+
+        calls = []
+        binary = tmp_path / "binary-tool"
+        binary.write_bytes(b"\x00/not-a-real-path\x00")
+        binary.chmod(0o700)
+
+        class _FakeEnv:
+            env = {}
+            cwd = str(tmp_path)
+
+            def execute(self, command, **kwargs):
+                calls.append(command)
+                return {"output": "executed", "returncode": 0}
+
+        self._patch_env(monkeypatch, _FakeEnv(), inside_gateway=True)
+        monkeypatch.setattr(
+            tt, "_check_all_guards", lambda cmd, env, **kwargs: {"approved": True}
+        )
+        command = f"{binary} --version"
+
+        result = json.loads(tt.terminal_tool(command=command))
+
+        assert result["exit_code"] == 0
+        assert result["output"] == "executed"
+        assert calls == [command]
+
     def test_safe_systemctl_commands_pass_through(self, monkeypatch):
         """Non-hermes systemctl commands must not be blocked by this guard."""
         import tools.terminal_tool as tt
@@ -1065,6 +1093,36 @@ class TestTerminalToolGatewayLifecycleGuardRemote:
         assert result["exit_code"] == 1
         assert "referenced script" in result["error"]
         assert any("head -c" in c for c in calls)
+
+    def test_remote_binary_script_text_is_skipped(self, monkeypatch, tmp_path):
+        import tools.terminal_tool as tt
+
+        script = "/remote/workspace/binary-tool"
+        calls = []
+
+        class _RemoteEnv:
+            env = {}
+            cwd = str(tmp_path)
+
+            def execute(self, command, **kwargs):
+                calls.append(command)
+                if "cat" in command and script in command:
+                    return {"output": "\x00/not-a-real-path\x00", "returncode": 0}
+                return {"output": "executed", "returncode": 0}
+
+        fake_env = _RemoteEnv()
+        fake_env.cwd = "/remote/workspace"
+        self._patch_env(monkeypatch, fake_env, inside_gateway=True)
+        monkeypatch.setattr(
+            tt, "_check_all_guards", lambda cmd, env, **kwargs: {"approved": True}
+        )
+        command = f"{script} --version"
+
+        result = json.loads(tt.terminal_tool(command=command))
+
+        assert result["exit_code"] == 0
+        assert result["output"] == "executed"
+        assert calls == [f"head -c 1048577 < {script}", command]
 
 
 class TestCronCreateLifecycleBlockExtra:

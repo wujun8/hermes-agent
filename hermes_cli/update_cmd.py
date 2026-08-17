@@ -27,19 +27,486 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
+import tempfile
 import time as _time
+import uuid
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import NoReturn, Optional
+from urllib.parse import urlsplit
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows
+    fcntl = None
+
+try:
+    import msvcrt
+except ImportError:  # pragma: no cover - POSIX
+    msvcrt = None
 
 from hermes_cli.config import get_hermes_home
-from hermes_constants import venv_python_path
+from hermes_constants import (
+    FIRST_PARTY_MODULE_ROOTS,
+    is_first_party_module,
+    venv_python_path,
+)
 
 logger = logging.getLogger(__name__)
+
+
+# Release journals are local recovery evidence, not arbitrary payload files.
+# The current strict journal is only a few KiB; keeping a 1 MiB ceiling leaves
+# ample room for schema-compatible additions while bounding parser work.
+_MAX_RELEASE_JOURNAL_BYTES = 1024 * 1024
+_MAX_RELEASE_JOURNAL_JSON_DEPTH = 64
+_RELEASE_JOURNAL_FILENAME = "journal.json"
+_RELEASE_JOURNAL_READ_CHUNK = 64 * 1024
+
+# Keep capability detection stable while tests or callers instrument os.open.
+# ``os.supports_dir_fd`` contains the original built-in function object, not a
+# wrapper installed later by a fault-injection test.
+_RELEASE_OS_OPEN = os.open
+_RELEASE_OS_OPEN_SUPPORTS_DIR_FD = _RELEASE_OS_OPEN in getattr(
+    os, "supports_dir_fd", ()
+)
+
+
+class _ReleaseJournalReadError(RuntimeError):
+    """Stable, content-free failure categories for untrusted journal reads."""
+
+    _MESSAGES = {
+        "missing": "Release transaction journal is missing.",
+        "unsafe": "Release transaction journal path or file is unsafe.",
+        "oversize": "Release transaction journal exceeds the maximum allowed size.",
+        "changed": "Release transaction journal changed while being read.",
+        "invalid": "Release transaction journal is invalid.",
+        "io": "Release transaction journal could not be read.",
+    }
+
+    def __init__(self, kind: str):
+        self.kind = kind
+        super().__init__(self._MESSAGES.get(kind, self._MESSAGES["io"]))
+
+
+def _raise_release_journal_error(
+    kind: str, cause: BaseException | None = None
+) -> NoReturn:
+    error = _ReleaseJournalReadError(kind)
+    if cause is None:
+        raise error
+    raise error from cause
+
+
+def _release_journal_lexical_path(path: Path | str) -> Path:
+    """Normalize an absolute journal path without resolving symlinks."""
+
+    try:
+        value = Path(path)
+    except (TypeError, ValueError) as exc:
+        _raise_release_journal_error("unsafe", exc)
+    if not value.is_absolute():
+        _raise_release_journal_error("unsafe")
+    # abspath/normpath remove lexical ``.``/``..`` components but do not
+    # follow symlinks.  That distinction is required before no-follow opens.
+    return Path(os.path.abspath(os.fspath(value)))
+
+
+def _validate_release_journal_topology(
+    transaction_dir: Path | str,
+    journal_path: Path | str,
+    expected_transactions_dir: Path | str,
+) -> tuple[Path, Path, Path]:
+    """Require ``<transactions>/<child>/journal.json`` exactly."""
+
+    transactions = _release_journal_lexical_path(expected_transactions_dir)
+    transaction = _release_journal_lexical_path(transaction_dir)
+    journal = _release_journal_lexical_path(journal_path)
+    if (
+        transactions.name != "hermes-upgrade-transactions"
+        or transaction.parent != transactions
+        or journal != transaction / _RELEASE_JOURNAL_FILENAME
+        or transaction.name in {"", ".", ".."}
+    ):
+        _raise_release_journal_error("unsafe")
+    return transactions, transaction, journal
+
+
+def _release_lstat(path: Path, *, missing_kind: str = "missing") -> os.stat_result:
+    try:
+        return os.lstat(path)
+    except FileNotFoundError as exc:
+        _raise_release_journal_error(missing_kind, exc)
+    except OSError as exc:
+        _raise_release_journal_error("unsafe", exc)
+
+
+def _release_require_directory(info: os.stat_result) -> None:
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        _raise_release_journal_error("unsafe")
+
+
+def _release_require_regular_file(info: os.stat_result) -> None:
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        _raise_release_journal_error("unsafe")
+
+
+def _release_stat_identity(
+    info: os.stat_result, *, include_size: bool
+) -> tuple[int, int, int, int | None]:
+    return (
+        int(getattr(info, "st_dev", 0)),
+        int(getattr(info, "st_ino", 0)),
+        stat.S_IFMT(info.st_mode),
+        int(getattr(info, "st_size", 0)) if include_size else None,
+    )
+
+
+def _release_same_stat(
+    first: os.stat_result, second: os.stat_result, *, include_size: bool
+) -> bool:
+    return _release_stat_identity(first, include_size=include_size) == _release_stat_identity(
+        second, include_size=include_size
+    )
+
+
+def _release_parent_open_flags() -> int:
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    return flags
+
+
+def _release_journal_open_flags() -> int:
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NONBLOCK", 0)
+    return flags
+
+
+def _release_open_relative(path: str, flags: int, dir_fd: int) -> int:
+    """Call relative ``os.open`` while tolerating legacy test wrappers."""
+
+    current_open = os.open
+    try:
+        return current_open(path, flags, dir_fd=dir_fd)
+    except TypeError:
+        # A few pre-existing lifecycle tests wrap os.open with the historical
+        # ``(path, flags, *args)`` shape.  Do not weaken the real POSIX path or
+        # silently fall back on an actual platform error; bypass only a
+        # replaced wrapper that cannot express the required keyword.
+        if current_open is not _RELEASE_OS_OPEN:
+            return _RELEASE_OS_OPEN(path, flags, dir_fd=dir_fd)
+        raise
+
+
+def _release_close_fd(fd: int) -> None:
+    try:
+        os.close(fd)
+    except OSError:
+        # The read error is authoritative; do not replace it with close noise.
+        logger.debug("Could not close release journal descriptor", exc_info=True)
+
+
+def _release_check_json_depth(text: str) -> None:
+    depth = 0
+    in_string = False
+    escaped = False
+    for char in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char in "[{":
+            depth += 1
+            if depth > _MAX_RELEASE_JOURNAL_JSON_DEPTH:
+                _raise_release_journal_error("invalid")
+        elif char in "]}":
+            depth -= 1
+
+
+def _parse_release_transaction_journal(raw: bytes) -> dict:
+    try:
+        text = raw.decode("utf-8")
+        _release_check_json_depth(text)
+
+        def reject_constant(_value: str):
+            raise ValueError("non-standard JSON constant")
+
+        value = json.loads(text, parse_constant=reject_constant)
+    except _ReleaseJournalReadError:
+        raise
+    except (UnicodeDecodeError, ValueError, RecursionError, MemoryError, OverflowError):
+        _raise_release_journal_error("invalid")
+    if not isinstance(value, dict):
+        _raise_release_journal_error("invalid")
+    return value
+
+
+def _read_release_journal_fd(
+    journal_fd: int,
+    *,
+    expected_info: os.stat_result,
+) -> dict:
+    """Read one already-open journal descriptor with a hard byte ceiling."""
+
+    try:
+        initial_info = os.fstat(journal_fd)
+    except OSError as exc:
+        _raise_release_journal_error("io", exc)
+    _release_require_regular_file(initial_info)
+    if not _release_same_stat(initial_info, expected_info, include_size=True):
+        _raise_release_journal_error("changed")
+    initial_size = int(getattr(initial_info, "st_size", -1))
+    if initial_size < 0 or initial_size > _MAX_RELEASE_JOURNAL_BYTES:
+        _raise_release_journal_error("oversize")
+
+    chunks: list[bytes] = []
+    total = 0
+    while total <= _MAX_RELEASE_JOURNAL_BYTES:
+        remaining = _MAX_RELEASE_JOURNAL_BYTES + 1 - total
+        if remaining <= 0:
+            break
+        try:
+            chunk = os.read(journal_fd, min(_RELEASE_JOURNAL_READ_CHUNK, remaining))
+        except OSError as exc:
+            _raise_release_journal_error("io", exc)
+        if not isinstance(chunk, bytes):
+            _raise_release_journal_error("io")
+        if not chunk:
+            break
+        # os.read honors the requested count.  Keep the guard anyway so a
+        # fault-injected or non-conforming implementation cannot make the
+        # in-memory buffer exceed the max+1 probe bound.
+        if len(chunk) > remaining:
+            chunks.append(chunk[:remaining])
+            total += remaining
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+        if total >= _MAX_RELEASE_JOURNAL_BYTES + 1:
+            break
+
+    raw = b"".join(chunks)
+    try:
+        final_info = os.fstat(journal_fd)
+    except OSError as exc:
+        _raise_release_journal_error("io", exc)
+    _release_require_regular_file(final_info)
+    final_size = int(getattr(final_info, "st_size", -1))
+    if final_size < 0 or final_size > _MAX_RELEASE_JOURNAL_BYTES:
+        _raise_release_journal_error("oversize")
+    if total > _MAX_RELEASE_JOURNAL_BYTES:
+        _raise_release_journal_error("oversize")
+    if final_size != initial_size or total != final_size:
+        _raise_release_journal_error("changed")
+    return _parse_release_transaction_journal(raw)
+
+
+def _read_release_transaction_journal_posix(
+    transactions: Path,
+    transaction: Path,
+    journal: Path,
+    transactions_info: os.stat_result,
+    transaction_info: os.stat_result,
+    journal_info: os.stat_result,
+) -> dict:
+    """Use descriptor-relative no-follow opens for the POSIX path."""
+
+    transactions_fd: int | None = None
+    transaction_fd: int | None = None
+    journal_fd: int | None = None
+    try:
+        try:
+            transactions_fd = os.open(str(transactions), _release_parent_open_flags())
+        except FileNotFoundError as exc:
+            _raise_release_journal_error("missing", exc)
+        except OSError as exc:
+            _raise_release_journal_error("unsafe", exc)
+        assert transactions_fd is not None
+        try:
+            opened_transactions_info = os.fstat(transactions_fd)
+        except OSError as exc:
+            _raise_release_journal_error("io", exc)
+        _release_require_directory(opened_transactions_info)
+        if not _release_same_stat(
+            opened_transactions_info, transactions_info, include_size=False
+        ):
+            _raise_release_journal_error("changed")
+
+        try:
+            transaction_fd = _release_open_relative(
+                transaction.name,
+                _release_parent_open_flags(),
+                transactions_fd,
+            )
+        except FileNotFoundError as exc:
+            _raise_release_journal_error("missing", exc)
+        except OSError as exc:
+            _raise_release_journal_error("unsafe", exc)
+        assert transaction_fd is not None
+        try:
+            opened_transaction_info = os.fstat(transaction_fd)
+        except OSError as exc:
+            _raise_release_journal_error("io", exc)
+        _release_require_directory(opened_transaction_info)
+        if not _release_same_stat(
+            opened_transaction_info, transaction_info, include_size=False
+        ):
+            _raise_release_journal_error("changed")
+
+        try:
+            journal_fd = _release_open_relative(
+                _RELEASE_JOURNAL_FILENAME,
+                _release_journal_open_flags(),
+                transaction_fd,
+            )
+        except FileNotFoundError as exc:
+            _raise_release_journal_error("missing", exc)
+        except OSError as exc:
+            _raise_release_journal_error("unsafe", exc)
+        assert journal_fd is not None
+        return _read_release_journal_fd(journal_fd, expected_info=journal_info)
+    finally:
+        if journal_fd is not None:
+            _release_close_fd(journal_fd)
+        if transaction_fd is not None:
+            _release_close_fd(transaction_fd)
+        if transactions_fd is not None:
+            _release_close_fd(transactions_fd)
+
+
+def _read_release_transaction_journal_portable(
+    transactions: Path,
+    transaction: Path,
+    journal: Path,
+    transactions_info: os.stat_result,
+    transaction_info: os.stat_result,
+    journal_info: os.stat_result,
+) -> dict:
+    """Best-effort portable fallback where dir_fd/no-follow is unavailable.
+
+    The fallback lstat-checks the parent and journal before and after opening,
+    opens with the platform's binary/non-inheritable flags when available, and
+    compares descriptor identity, type, and size.  The stdlib has no portable
+    race-free no-follow equivalent on Windows/reparse-point filesystems; a
+    mismatch fails closed rather than claiming POSIX descriptor anchoring.
+    """
+
+    journal_fd: int | None = None
+    try:
+        try:
+            journal_fd = os.open(
+                str(journal),
+                _release_journal_open_flags()
+                | getattr(os, "O_BINARY", 0)
+                | getattr(os, "O_NOINHERIT", 0),
+            )
+        except FileNotFoundError as exc:
+            _raise_release_journal_error("missing", exc)
+        except OSError as exc:
+            _raise_release_journal_error("unsafe", exc)
+        assert journal_fd is not None
+
+        try:
+            current_transactions_info = os.lstat(transactions)
+            current_transaction_info = os.lstat(transaction)
+            current_journal_info = os.lstat(journal)
+        except FileNotFoundError as exc:
+            _raise_release_journal_error("changed", exc)
+        except OSError as exc:
+            _raise_release_journal_error("unsafe", exc)
+        _release_require_directory(current_transactions_info)
+        _release_require_directory(current_transaction_info)
+        _release_require_regular_file(current_journal_info)
+        if not _release_same_stat(
+            current_transactions_info, transactions_info, include_size=False
+        ) or not _release_same_stat(
+            current_transaction_info, transaction_info, include_size=False
+        ):
+            _raise_release_journal_error("changed")
+        if not _release_same_stat(current_journal_info, journal_info, include_size=True):
+            _raise_release_journal_error("changed")
+        return _read_release_journal_fd(journal_fd, expected_info=journal_info)
+    finally:
+        if journal_fd is not None:
+            _release_close_fd(journal_fd)
+
+
+def _read_release_transaction_journal(
+    transaction_dir: Path | str,
+    *,
+    journal_path: Path | str | None = None,
+    expected_transactions_dir: Path | str | None = None,
+) -> dict:
+    """Read a release journal through one bounded, no-follow descriptor path.
+
+    On POSIX this anchors the transactions root, transaction child, and
+    ``journal.json`` through directory descriptors.  On platforms without
+    ``dir_fd``/``O_NOFOLLOW`` it uses the documented best-effort lstat/fstat
+    fallback above and rejects identity changes.
+    """
+
+    transaction_value = Path(transaction_dir)
+    expected_value = (
+        Path(expected_transactions_dir)
+        if expected_transactions_dir is not None
+        else transaction_value.parent
+    )
+    journal_value = (
+        Path(journal_path)
+        if journal_path is not None
+        else transaction_value / _RELEASE_JOURNAL_FILENAME
+    )
+    transactions, transaction, journal = _validate_release_journal_topology(
+        transaction_value, journal_value, expected_value
+    )
+    transactions_info = _release_lstat(transactions)
+    transaction_info = _release_lstat(transaction)
+    journal_info = _release_lstat(journal)
+    _release_require_directory(transactions_info)
+    _release_require_directory(transaction_info)
+    _release_require_regular_file(journal_info)
+    journal_size = int(getattr(journal_info, "st_size", -1))
+    if journal_size < 0 or journal_size > _MAX_RELEASE_JOURNAL_BYTES:
+        _raise_release_journal_error("oversize")
+
+    if (
+        os.name == "posix"
+        and _RELEASE_OS_OPEN_SUPPORTS_DIR_FD
+        and bool(getattr(os, "O_NOFOLLOW", 0))
+    ):
+        return _read_release_transaction_journal_posix(
+            transactions,
+            transaction,
+            journal,
+            transactions_info,
+            transaction_info,
+            journal_info,
+        )
+    return _read_release_transaction_journal_portable(
+        transactions,
+        transaction,
+        journal,
+        transactions_info,
+        transaction_info,
+        journal_info,
+    )
 
 
 def _m():
@@ -53,6 +520,4078 @@ def _m():
     from hermes_cli import main
 
     return main
+
+
+@dataclass(frozen=True)
+class ReleaseTarget:
+    """An exact, immutable release target resolved from one tag ref."""
+
+    tag: str
+    target_sha: str
+    ref: str
+
+
+@dataclass(frozen=True)
+class ReleaseBaseMetadata:
+    """Validated metadata describing the base of the maintenance delta."""
+
+    tag: str
+    base_sha: str
+    target_sha: str | None = None
+    patch_sha256: str | None = None
+    patch_bytes: int | None = None
+
+
+@dataclass(frozen=True)
+class ReleaseGitSnapshot:
+    """Exact live-checkout identity used to guard release mutations."""
+
+    root: Path
+    common_dir: Path
+    symbolic_head: str | None
+    head_sha: str
+    head_tree_sha: str
+    maintenance_ref: str
+    maintenance_ref_sha: str
+    index_tree_sha: str
+    tracked_diff_sha256: str
+    status_v2_sha256: str
+    # The status digest already commits to the exact untracked names and
+    # bytes.  Keep only a bounded count here so transaction journals do not
+    # persist a potentially sensitive path list.
+    untracked_count: int
+
+    def to_journal(self) -> dict:
+        value = {
+            "root": str(self.root),
+            "common_dir": str(self.common_dir),
+            "symbolic_head": self.symbolic_head,
+            "head_sha": self.head_sha,
+            "head_tree_sha": self.head_tree_sha,
+            "maintenance_ref": self.maintenance_ref,
+            "maintenance_ref_sha": self.maintenance_ref_sha,
+            "index_tree_sha": self.index_tree_sha,
+            "tracked_diff_sha256": self.tracked_diff_sha256,
+            "status_v2_sha256": self.status_v2_sha256,
+            "untracked_count": self.untracked_count,
+        }
+        _validate_release_snapshot_value(value)
+        return dict(value)
+
+    @classmethod
+    def from_journal(cls, value: object) -> "ReleaseGitSnapshot":
+        _validate_release_snapshot_value(value)
+        assert isinstance(value, dict)
+        root = value["root"]
+        common_dir = value["common_dir"]
+        symbolic_head = value["symbolic_head"]
+        assert isinstance(root, str)
+        assert isinstance(common_dir, str)
+        assert symbolic_head is None or isinstance(symbolic_head, str)
+        return cls(
+            root=Path(root),
+            common_dir=Path(common_dir),
+            symbolic_head=symbolic_head,
+            head_sha=value["head_sha"].lower(),
+            head_tree_sha=value["head_tree_sha"].lower(),
+            maintenance_ref=value["maintenance_ref"],
+            maintenance_ref_sha=value["maintenance_ref_sha"].lower(),
+            index_tree_sha=value["index_tree_sha"].lower(),
+            tracked_diff_sha256=value["tracked_diff_sha256"].lower(),
+            status_v2_sha256=value["status_v2_sha256"].lower(),
+            untracked_count=value["untracked_count"],
+        )
+
+
+@dataclass(frozen=True)
+class ReleaseUpgradeResult:
+    """The durable result of a promoted candidate."""
+
+    old_sha: str
+    target_sha: str
+    candidate_sha: str
+    backup_ref: str
+    candidate_path: Path | None = None
+    context: "ReleaseUpgradeContext | None" = None
+
+
+@dataclass
+class ReleaseUpgradeContext:
+    """Durable user-state state carried from promotion to outer finalization."""
+
+    root: Path
+    common_dir: Path
+    transaction_dir: Path
+    journal_path: Path
+    journal: dict
+    final_marker_write_uncertain: bool = False
+    final_marker_candidate: Optional[dict] = None
+    final_marker_prior_digest: str | None = None
+    snapshots: dict[str, ReleaseGitSnapshot] = field(default_factory=dict)
+
+
+def _git_common_dir(git_cmd: list[str], cwd: Path | str) -> Path:
+    """Resolve the repository's common Git directory, including worktrees."""
+
+    result = subprocess.run(
+        git_cmd + ["rev-parse", "--git-common-dir"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        detail = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(
+            "Could not resolve Git common directory for update lock"
+            + (f": {detail.splitlines()[0]}" if detail else "")
+        )
+    common = Path(result.stdout.strip())
+    if not common.is_absolute():
+        common = Path(cwd) / common
+    return common.resolve()
+
+
+def _directory_fsync_is_windows() -> bool:
+    """Return whether directory fsync must use the Windows best-effort path."""
+
+    return os.name == "nt" or sys.platform == "win32"
+
+
+def _fsync_directory(path: Path | str, *, required: bool) -> None:
+    """Fsync a directory entry, failing closed where POSIX requires it.
+
+    POSIX opens use ``O_DIRECTORY`` when the platform provides it, and a
+    required open/fsync failure is propagated.  Windows does not provide a
+    portable directory-fsync contract; it gets an explicit best-effort
+    attempt and a warning rather than a false claim of POSIX-equivalent
+    durability.
+    """
+
+    directory = Path(path)
+    windows = _directory_fsync_is_windows()
+    flags = os.O_RDONLY
+    if not windows:
+        flags |= getattr(os, "O_DIRECTORY", 0)
+    fd: int | None = None
+    try:
+        fd = os.open(str(directory), flags)
+        os.fsync(fd)
+    except (OSError, NotImplementedError) as exc:
+        if required and not windows:
+            raise
+        logger.warning(
+            "Directory fsync is best effort on this platform for %s: %s",
+            directory,
+            exc,
+        )
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError as exc:
+                if required and not windows:
+                    raise
+                logger.warning(
+                    "Could not close best-effort directory fsync handle for %s: %s",
+                    directory,
+                    exc,
+                )
+
+
+def _atomic_write_bytes(
+    path: Path, payload: bytes, *, required_parent_fsync: bool = False
+) -> None:
+    """Write a regular file with fsync + replace, never following symlinks."""
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        existing = path.lstat()
+    except FileNotFoundError:
+        existing = None
+    if existing is not None:
+        if stat.S_ISLNK(existing.st_mode):
+            raise RuntimeError(f"Refusing to write through symlink: {path}")
+        if not stat.S_ISREG(existing.st_mode):
+            raise RuntimeError(f"Refusing to replace non-regular file: {path}")
+
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+        if required_parent_fsync:
+            _fsync_directory(path.parent, required=True)
+        else:
+            try:
+                dir_fd = os.open(str(path.parent), os.O_RDONLY)
+            except OSError:
+                dir_fd = None
+            if dir_fd is not None:
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+    finally:
+        try:
+            tmp_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+class RepositoryUpdateLock:
+    """Cross-process advisory lock scoped to a Git repository common dir.
+
+    On POSIX the lock is held on the Git common-directory inode itself, not on
+    the metadata pathname.  Removing or replacing ``hermes-update.lock`` can
+    therefore never create a new inode that another updater can acquire.  The
+    metadata file is only an atomically-written diagnostic for operators.
+    """
+
+    def __init__(self, repo_root: Path | str, git_cmd: list[str] | None = None):
+        self.repo_root = Path(repo_root)
+        self.git_cmd = list(git_cmd or ["git"])
+        self.lock_path: Path | None = None
+        self._handle = None
+        self._handle_is_fd = False
+        self.acquired = False
+
+    @staticmethod
+    def _holder_text(path: Path) -> str:
+        try:
+            return path.read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            return ""
+
+    @staticmethod
+    def _close_handle(handle, *, is_fd: bool) -> None:
+        try:
+            if is_fd:
+                os.close(handle)
+            else:
+                handle.close()
+        except OSError:
+            logger.debug("Could not close repository update lock", exc_info=True)
+
+    def acquire(self):
+        if self.acquired:
+            return self
+        common = _git_common_dir(self.git_cmd, self.repo_root)
+        self.lock_path = common / "hermes-update.lock"
+
+        # POSIX directory descriptors are stable across metadata unlink/replace
+        # races.  Windows keeps the open regular file because NTFS denies
+        # unlinking an open file and byte-range locking is its compatible
+        # cross-process primitive.
+        handle_is_fd = fcntl is not None
+        try:
+            if handle_is_fd:
+                handle = os.open(str(common), os.O_RDONLY)
+            else:  # pragma: no cover - exercised on Windows
+                handle = self.lock_path.open("a+b")
+        except OSError as exc:
+            raise RuntimeError(
+                f"Cannot open repository update lock {self.lock_path}: {exc}"
+            ) from exc
+
+        try:
+            if handle_is_fd:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            elif msvcrt is not None:  # pragma: no cover - exercised on Windows
+                handle.write(b"0")
+                handle.flush()
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:  # pragma: no cover - unsupported platform
+                raise OSError("no cross-process locking primitive is available")
+        except OSError as exc:
+            holder = self._holder_text(self.lock_path)
+            self._close_handle(handle, is_fd=handle_is_fd)
+            detail = f" ({holder})" if holder else ""
+            raise RuntimeError(
+                "Cannot acquire repository update lock "
+                f"{self.lock_path}: another hermes update/upgrade is already "
+                f"running{detail}. Wait for it to finish; do not delete the lock file."
+            ) from exc
+
+        # Mark ownership before writing diagnostics.  If metadata I/O fails,
+        # release() can see and unlock the acquired kernel handle in this same
+        # exception path instead of leaving it unreachable.
+        self._handle = handle
+        self._handle_is_fd = handle_is_fd
+        self.acquired = True
+        metadata = (
+            f"pid={os.getpid()}\n"
+            f"started={_time.time():.6f}\n"
+            f"cwd={self.repo_root}\n"
+        ).encode("utf-8")
+        try:
+            if handle_is_fd:
+                _atomic_write_bytes(self.lock_path, metadata)
+            else:  # pragma: no cover - exercised on Windows
+                handle.seek(0)
+                handle.truncate()
+                handle.write(metadata)
+                handle.flush()
+                os.fsync(handle.fileno())
+        except BaseException as exc:
+            self.release()
+            raise RuntimeError(
+                f"Could not write repository update lock metadata {self.lock_path}; "
+                "the lock was released."
+            ) from exc
+        return self
+
+    def release(self) -> None:
+        handle = self._handle
+        handle_is_fd = self._handle_is_fd
+        self._handle = None
+        self._handle_is_fd = False
+        self.acquired = False
+        if handle is None:
+            return
+        try:
+            if handle_is_fd:
+                fcntl.flock(handle, fcntl.LOCK_UN)
+            elif msvcrt is not None:  # pragma: no cover - exercised on Windows
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        except OSError:
+            logger.debug("Could not release repository update lock", exc_info=True)
+        finally:
+            self._close_handle(handle, is_fd=handle_is_fd)
+
+    def __enter__(self):
+        return self.acquire()
+
+    def __exit__(self, _exc_type, _exc, _tb):
+        self.release()
+        return False
+
+
+_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
+_RELEASE_SNAPSHOT_FIELDS = frozenset(
+    {
+        "root",
+        "common_dir",
+        "symbolic_head",
+        "head_sha",
+        "head_tree_sha",
+        "maintenance_ref",
+        "maintenance_ref_sha",
+        "index_tree_sha",
+        "tracked_diff_sha256",
+        "status_v2_sha256",
+        "untracked_count",
+    }
+)
+_RELEASE_SNAPSHOT_MAX_PATH = 4096
+_RELEASE_SNAPSHOT_MAX_REF = 1024
+_RELEASE_SNAPSHOT_MAX_UNTRACKED = 100_000
+_RELEASE_EMPTY_DIGEST = hashlib.sha256(b"").hexdigest()
+_RELEASE_MAINTENANCE_REF = "refs/heads/hermes-release"
+
+
+class ReleaseGitStateError(RuntimeError):
+    """The live checkout no longer matches a durable release snapshot."""
+
+
+class ReleaseFinalizationIncompleteError(RuntimeError):
+    """Release user-state finalization did not reach a verified terminal state."""
+
+    def __init__(self, journal_path: Path | str):
+        self.journal_path = Path(journal_path)
+        super().__init__(
+            "Release finalization incomplete; recovery journal retained at "
+            f"{self.journal_path}."
+        )
+
+
+def _release_snapshot_text(value: object, *, label: str, limit: int) -> str:
+    if not isinstance(value, str) or not value or len(value) > limit:
+        raise ReleaseGitStateError(f"Release transaction snapshot has an invalid {label}.")
+    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in value):
+        raise ReleaseGitStateError(f"Release transaction snapshot has an invalid {label}.")
+    return value
+
+
+def _release_snapshot_path(value: object, *, label: str) -> str:
+    path = _release_snapshot_text(value, label=label, limit=_RELEASE_SNAPSHOT_MAX_PATH)
+    if not os.path.isabs(path) or os.path.normpath(path) != path:
+        raise ReleaseGitStateError(f"Release transaction snapshot has an invalid {label}.")
+    return path
+
+
+def _release_snapshot_ref(value: object, *, label: str) -> str:
+    ref = _release_snapshot_text(value, label=label, limit=_RELEASE_SNAPSHOT_MAX_REF)
+    if (
+        not ref.startswith("refs/")
+        or ref.endswith("/")
+        or "//" in ref
+        or ".." in ref
+        or "@{" in ref
+        or any(char in ref for char in " ~^:?*[\\")
+    ):
+        raise ReleaseGitStateError(f"Release transaction snapshot has an invalid {label}.")
+    components = ref.split("/")
+    if len(components) < 2 or any(
+        not component
+        or component in {".", ".."}
+        or component.startswith(".")
+        or component.endswith(".")
+        or component.endswith(".lock")
+        for component in components
+    ):
+        raise ReleaseGitStateError(f"Release transaction snapshot has an invalid {label}.")
+    return ref
+
+
+def _validate_release_snapshot_value(value: object) -> None:
+    """Validate the bounded, exact journal representation of a Git snapshot."""
+    if type(value) is not dict:
+        raise ReleaseGitStateError("Release transaction snapshot is not an object.")
+    if set(value) != _RELEASE_SNAPSHOT_FIELDS:
+        missing = _RELEASE_SNAPSHOT_FIELDS.difference(value)
+        extra = set(value).difference(_RELEASE_SNAPSHOT_FIELDS)
+        details = []
+        if missing:
+            details.append("missing " + ", ".join(sorted(missing)))
+        if extra:
+            details.append("unexpected " + ", ".join(sorted(extra)))
+        raise ReleaseGitStateError(
+            "Release transaction snapshot schema is invalid" +
+            (": " + "; ".join(details) if details else ".")
+        )
+    _release_snapshot_path(value["root"], label="root path")
+    _release_snapshot_path(value["common_dir"], label="common directory")
+    symbolic_head = value["symbolic_head"]
+    if symbolic_head is not None:
+        symbolic_head = _release_snapshot_ref(symbolic_head, label="symbolic HEAD")
+        if not symbolic_head.startswith("refs/heads/"):
+            raise ReleaseGitStateError(
+                "Release transaction snapshot symbolic HEAD is not a local branch."
+            )
+    _release_snapshot_ref(value["maintenance_ref"], label="maintenance ref")
+    for name in (
+        "head_sha",
+        "head_tree_sha",
+        "maintenance_ref_sha",
+        "index_tree_sha",
+    ):
+        if not isinstance(value[name], str) or _SHA_RE.fullmatch(value[name]) is None:
+            raise ReleaseGitStateError(f"Release transaction snapshot has an invalid {name}.")
+    for name in ("tracked_diff_sha256", "status_v2_sha256"):
+        if (
+            not isinstance(value[name], str)
+            or re.fullmatch(r"[0-9a-fA-F]{64}", value[name]) is None
+        ):
+            raise ReleaseGitStateError(f"Release transaction snapshot has an invalid {name}.")
+    count = value["untracked_count"]
+    if (
+        not isinstance(count, int)
+        or isinstance(count, bool)
+        or count < 0
+        or count > _RELEASE_SNAPSHOT_MAX_UNTRACKED
+    ):
+        raise ReleaseGitStateError(
+            "Release transaction snapshot has an invalid untracked count."
+        )
+
+
+def _release_git_detail(result: subprocess.CompletedProcess) -> str:
+    value = result.stderr or result.stdout or b""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace").strip()
+    return str(value).strip()
+
+
+def _release_git_bytes(
+    git_cmd: list[str], root: Path, args: list[str], *, label: str
+) -> bytes:
+    result = subprocess.run(git_cmd + args, cwd=root, capture_output=True)
+    if result.returncode != 0:
+        detail = _release_git_detail(result)
+        raise ReleaseGitStateError(
+            f"Could not inspect release checkout {label}"
+            + (f": {detail.splitlines()[0]}" if detail else "")
+        )
+    output = result.stdout
+    if isinstance(output, str):
+        output = output.encode("utf-8", errors="surrogateescape")
+    if not isinstance(output, bytes):
+        raise ReleaseGitStateError(f"Git returned malformed release checkout output for {label}.")
+    return output
+
+
+def _release_git_text(
+    git_cmd: list[str], root: Path, args: list[str], *, label: str
+) -> str:
+    output = _release_git_bytes(git_cmd, root, args, label=label)
+    try:
+        text = output.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ReleaseGitStateError(f"Git returned malformed text for release checkout {label}.") from exc
+    text = text.rstrip("\n")
+    if not text or "\n" in text or "\r" in text:
+        raise ReleaseGitStateError(f"Git returned malformed release checkout {label}.")
+    return text
+
+
+def _release_git_sha(
+    git_cmd: list[str], root: Path, args: list[str], *, label: str
+) -> str:
+    value = _release_git_text(git_cmd, root, args, label=label).strip()
+    if _SHA_RE.fullmatch(value) is None:
+        raise ReleaseGitStateError(f"Git returned a malformed SHA for release checkout {label}.")
+    return value.lower()
+
+
+def _release_symbolic_head(git_cmd: list[str], root: Path) -> str | None:
+    result = subprocess.run(
+        git_cmd + ["symbolic-ref", "-q", "HEAD"],
+        cwd=root,
+        capture_output=True,
+    )
+    output = result.stdout or b""
+    error = result.stderr or b""
+    if isinstance(output, str):
+        output = output.encode("utf-8", errors="surrogateescape")
+    if isinstance(error, str):
+        error = error.encode("utf-8", errors="surrogateescape")
+    if result.returncode == 1:
+        if output or error:
+            raise ReleaseGitStateError("Git returned malformed detached-HEAD identity.")
+        return None
+    if result.returncode != 0:
+        detail = _release_git_detail(result)
+        raise ReleaseGitStateError(
+            "Could not inspect symbolic HEAD"
+            + (f": {detail.splitlines()[0]}" if detail else "")
+        )
+    try:
+        symbolic = output.decode("utf-8").rstrip("\n")
+    except UnicodeDecodeError as exc:
+        raise ReleaseGitStateError("Git returned malformed symbolic HEAD output.") from exc
+    if (
+        not symbolic
+        or "\n" in symbolic
+        or "\r" in symbolic
+        or not symbolic.startswith("refs/heads/")
+    ):
+        raise ReleaseGitStateError("Git returned an unsupported symbolic HEAD identity.")
+    return symbolic
+
+
+def _capture_release_git_snapshot(
+    git_cmd: list[str],
+    cwd: Path | str,
+    *,
+    maintenance_ref: str = _RELEASE_MAINTENANCE_REF,
+    expected_root: Path | None = None,
+    expected_common_dir: Path | None = None,
+) -> ReleaseGitSnapshot:
+    """Capture every Git identity relevant to a live release mutation."""
+    root = Path(cwd).resolve()
+    expected_root = expected_root.resolve() if expected_root is not None else root
+    if root != expected_root:
+        raise ReleaseGitStateError("Release checkout root changed from its pinned absolute path.")
+    shown_root = Path(
+        _release_git_text(git_cmd, root, ["rev-parse", "--show-toplevel"], label="repository root")
+    ).resolve()
+    if shown_root != expected_root:
+        raise ReleaseGitStateError(
+            f"Release checkout root mismatch: expected {expected_root}, got {shown_root}."
+        )
+    common_dir = _git_common_dir(git_cmd, root)
+    if expected_common_dir is not None and common_dir != expected_common_dir.resolve():
+        raise ReleaseGitStateError(
+            f"Release Git common directory changed: expected {expected_common_dir}, got {common_dir}."
+        )
+    symbolic_head = _release_symbolic_head(git_cmd, root)
+    head_sha = _release_git_sha(
+        git_cmd, root, ["rev-parse", "--verify", "HEAD^{commit}"], label="HEAD"
+    )
+    head_tree_sha = _release_git_sha(
+        git_cmd,
+        root,
+        ["rev-parse", "--verify", f"{head_sha}^{{tree}}"],
+        label="HEAD tree",
+    )
+    maintenance_ref_sha = _release_git_sha(
+        git_cmd,
+        root,
+        ["rev-parse", "--verify", f"{maintenance_ref}^{{commit}}"],
+        label="maintenance ref",
+    )
+    index_tree_sha = _release_git_sha(
+        git_cmd, root, ["write-tree"], label="index tree"
+    )
+    tracked_diff = _release_git_bytes(
+        git_cmd,
+        root,
+        ["diff", "--no-ext-diff", "--binary", "--"],
+        label="tracked worktree diff",
+    )
+    status_v2 = _release_git_bytes(
+        git_cmd,
+        root,
+        ["status", "--porcelain=v2", "--untracked-files=all", "--no-renames", "-z"],
+        label="porcelain-v2 status",
+    )
+    untracked_count = sum(
+        1 for record in status_v2.split(b"\0") if record.startswith(b"? ")
+    )
+    if untracked_count > _RELEASE_SNAPSHOT_MAX_UNTRACKED:
+        raise ReleaseGitStateError(
+            "Release checkout has too many untracked paths to snapshot safely."
+        )
+    return ReleaseGitSnapshot(
+        root=expected_root,
+        common_dir=common_dir,
+        symbolic_head=symbolic_head,
+        head_sha=head_sha,
+        head_tree_sha=head_tree_sha,
+        maintenance_ref=maintenance_ref,
+        maintenance_ref_sha=maintenance_ref_sha,
+        index_tree_sha=index_tree_sha,
+        tracked_diff_sha256=hashlib.sha256(tracked_diff).hexdigest(),
+        status_v2_sha256=hashlib.sha256(status_v2).hexdigest(),
+        untracked_count=untracked_count,
+    )
+
+
+def _release_snapshot_is_clean(snapshot: ReleaseGitSnapshot) -> bool:
+    return (
+        snapshot.index_tree_sha == snapshot.head_tree_sha
+        and snapshot.tracked_diff_sha256 == _RELEASE_EMPTY_DIGEST
+        and snapshot.status_v2_sha256 == _RELEASE_EMPTY_DIGEST
+        and snapshot.untracked_count == 0
+    )
+
+
+def _release_snapshot_branch(snapshot: ReleaseGitSnapshot) -> str | None:
+    if snapshot.symbolic_head is None:
+        return None
+    if not snapshot.symbolic_head.startswith("refs/heads/"):
+        raise ReleaseGitStateError("Release checkout symbolic HEAD is not a local branch.")
+    branch = snapshot.symbolic_head.removeprefix("refs/heads/")
+    if not branch or ".." in branch or "\x00" in branch:
+        raise ReleaseGitStateError("Release checkout branch identity is malformed.")
+    return branch
+
+
+def _validate_release_git_snapshot(
+    git_cmd: list[str], root: Path, expected: ReleaseGitSnapshot, *, label: str
+) -> ReleaseGitSnapshot:
+    """Fail closed unless the live checkout exactly equals ``expected``."""
+    actual = _capture_release_git_snapshot(
+        git_cmd,
+        root,
+        maintenance_ref=expected.maintenance_ref,
+        expected_root=expected.root,
+        expected_common_dir=expected.common_dir,
+    )
+    if actual != expected:
+        differences = [
+            name
+            for name in (
+                "root",
+                "common_dir",
+                "symbolic_head",
+                "head_sha",
+                "head_tree_sha",
+                "maintenance_ref_sha",
+                "index_tree_sha",
+                "tracked_diff_sha256",
+                "status_v2_sha256",
+                "untracked_count",
+            )
+            if getattr(actual, name) != getattr(expected, name)
+        ]
+        raise ReleaseGitStateError(
+            f"Release checkout manual interference at {label}: "
+            + ", ".join(differences or ["snapshot mismatch"])
+        )
+    return actual
+
+
+def _release_validate_no_unmerged_index(git_cmd: list[str], root: Path) -> None:
+    """Require a well-formed, fully merged index before user-state validation."""
+    result = subprocess.run(
+        git_cmd + ["ls-files", "-u", "-z"],
+        cwd=root,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        detail = _release_git_detail(result)
+        raise ReleaseGitStateError(
+            "Could not inspect release checkout unmerged index entries"
+            + (f": {detail.splitlines()[0]}" if detail else "")
+        )
+    output = result.stdout
+    if not isinstance(output, bytes):
+        raise ReleaseGitStateError(
+            "Git returned malformed release checkout unmerged index output."
+        )
+    if output:
+        raise ReleaseGitStateError("Release checkout has unmerged index entries.")
+
+
+def _validate_release_restored_snapshot_identity(
+    git_cmd: list[str],
+    root: Path,
+    expected: ReleaseGitSnapshot,
+    *,
+    label: str,
+) -> ReleaseGitSnapshot:
+    """Capture live user state and compare only immutable checkout identity."""
+    _release_validate_no_unmerged_index(git_cmd, root)
+    actual = _capture_release_git_snapshot(
+        git_cmd,
+        root,
+        maintenance_ref=expected.maintenance_ref,
+        expected_root=expected.root,
+        expected_common_dir=expected.common_dir,
+    )
+    differences = [
+        name
+        for name in (
+            "root",
+            "common_dir",
+            "symbolic_head",
+            "head_sha",
+            "head_tree_sha",
+            "maintenance_ref",
+            "maintenance_ref_sha",
+        )
+        if getattr(actual, name) != getattr(expected, name)
+    ]
+    if differences:
+        raise ReleaseGitStateError(
+            f"Release checkout identity mismatch at {label}: "
+            + ", ".join(differences)
+        )
+    return actual
+
+
+def _release_clean_snapshot(
+    snapshot: ReleaseGitSnapshot,
+    *,
+    symbolic_head: str | None,
+    head_sha: str,
+    maintenance_ref_sha: str,
+    head_tree_sha: str | None = None,
+) -> ReleaseGitSnapshot:
+    tree = head_tree_sha or snapshot.head_tree_sha
+    return replace(
+        snapshot,
+        symbolic_head=symbolic_head,
+        head_sha=head_sha,
+        head_tree_sha=tree,
+        maintenance_ref_sha=maintenance_ref_sha,
+        index_tree_sha=tree,
+        tracked_diff_sha256=_RELEASE_EMPTY_DIGEST,
+        status_v2_sha256=_RELEASE_EMPTY_DIGEST,
+        untracked_count=0,
+    )
+
+
+def _release_snapshot_with_journal(
+    context: ReleaseUpgradeContext,
+    key: str,
+    snapshot: ReleaseGitSnapshot,
+    *,
+    phase: str | None = None,
+    **updates,
+) -> None:
+    context.snapshots[key] = snapshot
+    updates[key] = snapshot.to_journal()
+    _journal_update(context, phase, **updates)
+
+
+def _release_context_snapshot(
+    context: ReleaseUpgradeContext, key: str
+) -> ReleaseGitSnapshot:
+    # The durable journal is the binding record.  Do not let a mutable in-memory
+    # cache silently replace a malformed or tampered on-disk snapshot during
+    # recovery/finalization.
+    snapshot = ReleaseGitSnapshot.from_journal(context.journal.get(key))
+    expected_root = context.root.resolve()
+    expected_common = context.common_dir.resolve()
+    if snapshot.root != expected_root or snapshot.common_dir != expected_common:
+        raise ReleaseGitStateError(
+            f"Release transaction snapshot {key} is bound to a different Git checkout."
+        )
+    return snapshot
+
+
+def _release_mark_manual_interference(
+    context: ReleaseUpgradeContext, reason: object
+) -> None:
+    try:
+        message = str(reason)
+    except BaseException:
+        message = "unexpected live Git state"
+    message = " ".join(
+        " " if (ord(char) < 0x20 or ord(char) == 0x7F) else char
+        for char in message
+    ).strip()[:512] or "unexpected live Git state"
+    context.journal["manual_interference"] = True
+    context.journal["interference_reason"] = message
+    try:
+        _journal_update(
+            context,
+            "manual-interference",
+            manual_interference=True,
+            interference_reason=message,
+        )
+    except BaseException:
+        # The in-memory latch still prevents a finalizer in this process from
+        # issuing a destructive Git command; the original evidence remains on disk.
+        logger.warning("Could not durably mark manual release interference", exc_info=True)
+
+
+def _release_has_manual_interference(context: ReleaseUpgradeContext) -> bool:
+    """Return whether this transaction has latched a live-checkout race."""
+    return bool(
+        context.journal.get("manual_interference")
+        or context.journal.get("phase") == "manual-interference"
+    )
+
+
+def _release_assert_identity(
+    snapshot: ReleaseGitSnapshot,
+    *,
+    symbolic_head: str | None,
+    head_sha: str,
+    maintenance_ref_sha: str,
+    label: str,
+    clean: bool = False,
+) -> None:
+    if (
+        snapshot.symbolic_head != symbolic_head
+        or snapshot.head_sha != head_sha
+        or snapshot.maintenance_ref_sha != maintenance_ref_sha
+    ):
+        raise ReleaseGitStateError(f"Release checkout identity failed at {label}.")
+    if clean and not _release_snapshot_is_clean(snapshot):
+        raise ReleaseGitStateError(f"Release checkout is not clean at {label}.")
+
+
+def _is_official_origin_url(url: str | None) -> bool:
+    """Return whether ``url`` is a strict official repository origin."""
+
+    if not isinstance(url, str) or not url.strip():
+        return False
+    value = url.strip()
+    official_paths = {
+        "NousResearch/hermes-agent",
+        "NousResearch/hermes-agent.git",
+    }
+    if value.startswith("git@"):
+        host, separator, path = value.partition(":")
+        if not separator or host.lower() != "git@github.com":
+            return False
+        if "?" in path or "#" in path:
+            return False
+        return path in official_paths
+
+    try:
+        parsed = urlsplit(value)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return False
+    if hostname is None or hostname.lower() != "github.com":
+        return False
+    if parsed.username not in (None, "git") or parsed.password is not None:
+        return False
+    if parsed.query or parsed.fragment:
+        return False
+    scheme = parsed.scheme.lower()
+    if scheme not in {"https", "ssh"}:
+        return False
+    standard_port = 443 if scheme == "https" else 22
+    if port is not None and port != standard_port:
+        return False
+    if not parsed.path.startswith("/") or parsed.path.startswith("//"):
+        return False
+    return parsed.path[1:] in official_paths
+
+
+def _validate_release_tag_name(
+    git_cmd: list[str], cwd: Path | str, release_tag: str
+) -> None:
+    if (
+        not isinstance(release_tag, str)
+        or not release_tag
+        or release_tag.startswith("refs/")
+        or "\x00" in release_tag
+    ):
+        raise RuntimeError(f"Invalid release tag name: {release_tag!r}")
+    result = subprocess.run(
+        git_cmd + ["check-ref-format", f"refs/tags/{release_tag}"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"Invalid release tag name: {release_tag!r}")
+
+
+def _origin_url_for_release(git_cmd: list[str], cwd: Path | str) -> str | None:
+    """Resolve the configured origin through this module's local helper."""
+
+    return _get_origin_url(git_cmd, cwd)
+
+
+def _resolve_release_target(
+    git_cmd: list[str], cwd: Path | str, release_tag: str
+) -> ReleaseTarget:
+    """Fetch and resolve one exact official tag into a private ref namespace."""
+
+    _validate_release_tag_name(git_cmd, cwd, release_tag)
+    origin_url = _origin_url_for_release(git_cmd, cwd)
+    if not _is_official_origin_url(origin_url):
+        raise RuntimeError(
+            "Release upgrade requires the official origin "
+            "https://github.com/NousResearch/hermes-agent.git; "
+            f"configured origin is {origin_url or '<missing>'}."
+        )
+
+    private_ref = f"refs/hermes-upgrade/tags/{release_tag}"
+    source_ref = f"refs/tags/{release_tag}"
+    fetch = subprocess.run(
+        git_cmd
+        + ["fetch", "--no-tags", "origin", f"+{source_ref}:{private_ref}"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if fetch.returncode != 0:
+        detail = (fetch.stderr or fetch.stdout or "").strip()
+        raise RuntimeError(
+            f"Could not fetch exact release tag {release_tag}: "
+            f"{detail.splitlines()[0] if detail else 'git fetch failed'}"
+        )
+
+    resolved = subprocess.run(
+        git_cmd + ["rev-parse", "--verify", f"{private_ref}^{{commit}}"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    target_sha = resolved.stdout.strip()
+    if resolved.returncode != 0 or not _SHA_RE.fullmatch(target_sha):
+        raise RuntimeError(
+            f"Fetched release tag {release_tag} did not resolve to an immutable commit."
+        )
+    return ReleaseTarget(release_tag, target_sha.lower(), private_ref)
+
+
+def _read_release_base_metadata(cwd: Path | str) -> ReleaseBaseMetadata:
+    """Parse the JSON ``local-patches/.release_base`` contract."""
+
+    path = Path(cwd) / _LOCAL_PATCHES_DIRNAME / ".release_base"
+    try:
+        info = path.lstat()
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            f"Missing {path}; cannot establish the base of local maintenance changes."
+        ) from exc
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise RuntimeError(f"Refusing non-regular release metadata: {path}")
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise RuntimeError(f"Invalid release metadata {path}: {exc}") from exc
+    return _parse_release_base_metadata(raw, str(path))
+
+
+def _parse_release_base_metadata(raw: bytes, source: str) -> ReleaseBaseMetadata:
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Invalid release metadata {source}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Invalid release metadata {source}: expected an object")
+    tag = payload.get("tag")
+    base_sha = payload.get("base_sha")
+    target_sha = payload.get("target_sha")
+    patch_sha256 = payload.get("patch_sha256")
+    patch_bytes = payload.get("patch_bytes")
+    if not isinstance(tag, str) or not tag:
+        raise RuntimeError(f"Invalid release metadata {source}: missing tag")
+    if not isinstance(base_sha, str) or not _SHA_RE.fullmatch(base_sha):
+        raise RuntimeError(f"Invalid release metadata {source}: missing base_sha")
+    if target_sha is not None and (
+        not isinstance(target_sha, str) or not _SHA_RE.fullmatch(target_sha)
+    ):
+        raise RuntimeError(f"Invalid release metadata {source}: invalid target_sha")
+    if patch_sha256 is not None and (
+        not isinstance(patch_sha256, str)
+        or not re.fullmatch(r"[0-9a-fA-F]{64}", patch_sha256)
+    ):
+        raise RuntimeError(f"Invalid release metadata {source}: invalid patch_sha256")
+    if patch_bytes is not None and (
+        not isinstance(patch_bytes, int) or patch_bytes < 0
+    ):
+        raise RuntimeError(f"Invalid release metadata {source}: invalid patch_bytes")
+    return ReleaseBaseMetadata(
+        tag=tag,
+        base_sha=base_sha.lower(),
+        target_sha=target_sha.lower() if isinstance(target_sha, str) else None,
+        patch_sha256=patch_sha256.lower() if isinstance(patch_sha256, str) else None,
+        patch_bytes=patch_bytes,
+    )
+
+
+def _git_resolve_commit(git_cmd: list[str], cwd: Path | str, ref: str) -> str | None:
+    result = subprocess.run(
+        git_cmd + ["rev-parse", "--verify", f"{ref}^{{commit}}"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    value = result.stdout.strip()
+    return value.lower() if result.returncode == 0 and _SHA_RE.fullmatch(value) else None
+
+
+def _validate_release_base_metadata(
+    git_cmd: list[str], cwd: Path | str, metadata: ReleaseBaseMetadata, head_sha: str
+) -> None:
+    if not _SHA_RE.fullmatch(head_sha):
+        raise RuntimeError("Current maintenance HEAD is not an immutable commit SHA.")
+    if _git_resolve_commit(git_cmd, cwd, metadata.base_sha) != metadata.base_sha:
+        raise RuntimeError(
+            f"Release metadata base {metadata.base_sha} is missing from the repository."
+        )
+    ancestry = subprocess.run(
+        git_cmd + ["merge-base", "--is-ancestor", metadata.base_sha, head_sha],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if ancestry.returncode != 0:
+        raise RuntimeError(
+            f"Release metadata base {metadata.tag} ({metadata.base_sha}) is not an "
+            "ancestor of the maintenance branch; refusing to guess a payload base."
+        )
+    known_base = _git_resolve_commit(
+        git_cmd, cwd, f"refs/tags/{metadata.tag}"
+    ) or _git_resolve_commit(
+        git_cmd, cwd, f"refs/hermes-upgrade/tags/{metadata.tag}"
+    )
+    if known_base is None or known_base != metadata.base_sha:
+        raise RuntimeError(
+            f"Release metadata tag {metadata.tag} does not resolve consistently to "
+            f"{metadata.base_sha}; refusing to generate local payload."
+        )
+    if metadata.target_sha and _git_resolve_commit(git_cmd, cwd, metadata.target_sha) != metadata.target_sha:
+        raise RuntimeError(
+            f"Release metadata target {metadata.target_sha} is missing from the repository."
+        )
+
+
+def _maintenance_pathspec() -> str:
+    return f":(exclude){_LOCAL_PATCHES_DIRNAME}"
+
+
+def _reject_gitlink_changes(
+    git_cmd: list[str], cwd: Path | str, base_sha: str, head_sha: str
+) -> None:
+    raw = subprocess.run(
+        git_cmd
+        + ["diff", "--raw", "-z", base_sha, head_sha, "--", ".", _maintenance_pathspec()],
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if raw.returncode != 0:
+        detail = raw.stderr.decode(errors="replace").strip()
+        raise RuntimeError(
+            f"Could not inspect local maintenance delta{': ' + detail if detail else ''}."
+        )
+    for record in raw.stdout.split(b"\0"):
+        if record and (b" 160000 " in record or record.startswith(b":160000 ")):
+            raise RuntimeError(
+                "Local maintenance delta contains a Git submodule/gitlink; "
+                "recursive submodule replay is not supported."
+            )
+
+
+def _validate_patch_artifact(
+    cwd: Path | str, metadata: ReleaseBaseMetadata
+) -> None:
+    """Validate artifact shape, but never use it as the payload source."""
+
+    path = Path(cwd) / _LOCAL_PATCHES_DIRNAME / "0001-local-maintenance.patch"
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        logger.warning("Local patch artifact is missing; using Git history instead: %s", path)
+        return
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise RuntimeError(f"Refusing non-regular local patch artifact: {path}")
+    content = path.read_bytes()
+    if metadata.patch_sha256 and hashlib.sha256(content).hexdigest() != metadata.patch_sha256:
+        logger.warning("Local patch artifact is stale; using Git history instead: %s", path)
+    if metadata.patch_bytes is not None and len(content) != metadata.patch_bytes:
+        logger.warning("Local patch artifact size is stale; using Git history instead: %s", path)
+
+
+def _git_diff_bytes(
+    git_cmd: list[str], cwd: Path | str, base_sha: str, head_sha: str
+) -> bytes:
+    _reject_gitlink_changes(git_cmd, cwd, base_sha, head_sha)
+    result = subprocess.run(
+        git_cmd
+        + [
+            "diff",
+            "--binary",
+            "--full-index",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--find-renames",
+            base_sha,
+            head_sha,
+            "--",
+            ".",
+            _maintenance_pathspec(),
+        ],
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.decode(errors="replace").strip()
+        raise RuntimeError(
+            f"Could not generate Git maintenance payload{': ' + detail if detail else ''}."
+        )
+    return result.stdout
+
+
+def _generate_runtime_local_payload(
+    git_cmd: list[str],
+    cwd: Path | str,
+    metadata: ReleaseBaseMetadata,
+    *,
+    head_sha: str | None = None,
+) -> bytes:
+    """Generate the local payload from committed Git truth, not patch files."""
+
+    root = Path(cwd)
+    if head_sha is None:
+        head_sha = _git_resolve_commit(git_cmd, root, "HEAD")
+    if head_sha is None:
+        raise RuntimeError("Could not resolve the maintenance branch HEAD.")
+    _validate_release_base_metadata(git_cmd, root, metadata, head_sha)
+    _validate_patch_artifact(root, metadata)
+    return _git_diff_bytes(git_cmd, root, metadata.base_sha, head_sha)
+
+
+def _read_release_base_metadata_at_commit(
+    git_cmd: list[str], cwd: Path | str, head_sha: str
+) -> ReleaseBaseMetadata:
+    """Read release metadata from ``head_sha`` without changing the worktree."""
+
+    result = subprocess.run(
+        git_cmd + ["show", f"{head_sha}:{_LOCAL_PATCHES_DIRNAME}/.release_base"],
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.decode(errors="replace").strip()
+        raise RuntimeError(
+            "Could not read committed release metadata from maintenance HEAD"
+            + (f": {detail.splitlines()[0]}" if detail else "")
+        )
+    return _parse_release_base_metadata(
+        result.stdout,
+        f"{head_sha}:{_LOCAL_PATCHES_DIRNAME}/.release_base",
+    )
+
+
+def _capture_release_checkout_identity(
+    git_cmd: list[str], cwd: Path | str
+) -> tuple[str | None, str]:
+    """Capture symbolic branch (if any) and exact HEAD before mutation."""
+
+    root = Path(cwd)
+    head_sha = _git_resolve_commit(git_cmd, root, "HEAD")
+    if head_sha is None:
+        raise RuntimeError("Could not capture the exact original HEAD SHA.")
+    symbolic = subprocess.run(
+        git_cmd + ["symbolic-ref", "--quiet", "--short", "HEAD"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    original_branch = symbolic.stdout.strip() if symbolic.returncode == 0 else None
+    return original_branch or None, head_sha
+
+
+def _write_transaction_journal(
+    common_dir: Path, payload: dict, *, path: Path | None = None
+) -> Path:
+    path = Path(path) if path is not None else common_dir / "hermes-upgrade-transaction.json"
+    _atomic_write_bytes(
+        path,
+        (json.dumps(payload, sort_keys=True, indent=2) + "\n").encode(),
+        required_parent_fsync=True,
+    )
+    return path
+
+
+def _journal_update(
+    context: ReleaseUpgradeContext, phase: str | None = None, **updates
+) -> None:
+    if phase is not None:
+        context.journal["phase"] = phase
+        # Keep the old key for operators/tools that consumed the first journal.
+        context.journal["state"] = phase
+    context.journal.update(updates)
+    _write_transaction_journal(
+        context.common_dir, context.journal, path=context.journal_path
+    )
+
+
+def _find_unfinished_release_transaction(
+    git_cmd: list[str], cwd: Path | str
+) -> tuple[Path, dict] | None:
+    """Return the first durable transaction journal that still requires recovery."""
+
+    common = _git_common_dir(git_cmd, cwd)
+    transactions = common / "hermes-upgrade-transactions"
+    try:
+        transactions_info = transactions.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise RuntimeError(
+            "Could not inspect release transaction recovery state."
+        ) from None
+    if stat.S_ISLNK(transactions_info.st_mode) or not stat.S_ISDIR(
+        transactions_info.st_mode
+    ):
+        raise RuntimeError(
+            "Refusing unsafe release transaction recovery state."
+        )
+    try:
+        entries = sorted(transactions.iterdir())
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise RuntimeError(
+            "Could not inspect release transaction recovery state."
+        ) from None
+    try:
+        current_transactions_info = transactions.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise RuntimeError(
+            "Could not inspect release transaction recovery state."
+        ) from None
+    if (
+        stat.S_ISLNK(current_transactions_info.st_mode)
+        or not stat.S_ISDIR(current_transactions_info.st_mode)
+        or not _release_same_stat(
+            current_transactions_info, transactions_info, include_size=False
+        )
+    ):
+        raise RuntimeError(
+            "Refusing unsafe release transaction recovery state."
+        )
+
+    for entry in entries:
+        try:
+            info = entry.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError:
+            raise RuntimeError(
+                "Could not inspect release transaction recovery state."
+            ) from None
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise RuntimeError(
+                f"Unexpected release transaction entry; refusing to continue: {entry}"
+            )
+        journal_path = entry / _RELEASE_JOURNAL_FILENAME
+        try:
+            journal = _read_release_transaction_journal(
+                entry,
+                journal_path=journal_path,
+                expected_transactions_dir=transactions,
+            )
+        except _ReleaseJournalReadError as exc:
+            if exc.kind == "missing":
+                # Preserve the pre-existing state-machine rule: a transaction
+                # child without a journal is not itself proof of unfinished
+                # recovery.  Every present journal failure is unsafe evidence.
+                continue
+            category = {
+                "oversize": "oversized",
+                "changed": "changed while being read",
+                "invalid": "invalid",
+                "unsafe": "unsafe",
+                "io": "unreadable",
+            }.get(exc.kind, "unreadable")
+            raise RuntimeError(
+                f"Unfinished release transaction journal is {category}: {journal_path}"
+            ) from None
+        return journal_path, journal
+    return None
+
+
+def _recovery_safe_text(value: object, *, limit: int = 4096) -> str | None:
+    """Return journal text that is safe to display, or ``None``.
+
+    Journals survive hard kills and are local input, not trusted program state.
+    In particular, do not let a newline, terminal control, or an overlong value
+    turn recovery output into a second command or an opaque dump of the journal.
+    """
+
+    if not isinstance(value, str) or not value or len(value) > limit:
+        return None
+    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in value):
+        return None
+    return value
+
+
+def _recovery_sha(value: object) -> str | None:
+    if not isinstance(value, str) or not _SHA_RE.fullmatch(value):
+        return None
+    return value.lower()
+
+
+def _recovery_ref(value: object) -> str | None:
+    """Validate a full Git ref without executing Git from the formatter."""
+
+    value = _recovery_safe_text(value)
+    if value is None or not value.startswith("refs/"):
+        return None
+    if value.endswith("/") or "//" in value or ".." in value or "@{" in value:
+        return None
+    if any(char in value for char in " ~^:?*[\\"):
+        return None
+    components = value.split("/")
+    if len(components) < 2:
+        return None
+    for component in components:
+        if (
+            not component
+            or component in {".", ".."}
+            or component.startswith(".")
+            or component.endswith(".")
+            or component.endswith(".lock")
+        ):
+            return None
+    return value
+
+
+def _recovery_branch(value: object) -> str | None:
+    """Validate a short branch name before putting it in a Git command."""
+
+    value = _recovery_safe_text(value)
+    if value is None or value.startswith("-") or value.startswith("refs/"):
+        return None
+    return value if _recovery_ref(f"refs/heads/{value}") else None
+
+
+def _recovery_absolute_path(value: object) -> Path | None:
+    value = _recovery_safe_text(value)
+    if value is None or not os.path.isabs(value):
+        return None
+    return Path(os.path.normpath(value))
+
+
+def _recovery_candidate_root(journal_path: Path) -> Path | None:
+    """Derive the sibling candidate root from the journal's Git common dir."""
+
+    path = _recovery_absolute_path(str(journal_path))
+    if path is None:
+        return None
+    # <common>/hermes-upgrade-transactions/<transaction>/journal.json
+    common = path.parent.parent.parent
+    return common.parent.parent
+
+
+def _recovery_candidate_path(journal_path: Path, value: object) -> Path | None:
+    """Accept only a direct child of the transaction's expected candidate root."""
+
+    candidate = _recovery_absolute_path(value)
+    expected_root = _recovery_candidate_root(journal_path)
+    if candidate is None or expected_root is None:
+        return None
+    if candidate.parent != expected_root or candidate == expected_root:
+        return None
+    return candidate
+
+
+_RECOVERY_PHASES = frozenset(
+    {
+        "prepared",
+        "journal-created",
+        "payload-persisted",
+        "payload-integrity-failed",
+        "stash-capture-started",
+        "stash-capture-verifying",
+        "stash-capture-uncertain",
+        "stash-captured",
+        "stashed",
+        "no-stash",
+        "stash-pending",
+        "backup-failed",
+        "backup-created",
+        "candidate-create-failed",
+        "candidate-created",
+        "candidate-validated",
+        "promoting",
+        "promotion-needs-recovery",
+        "promotion-cas-failed",
+        "promotion-uncertain",
+        "manual-interference",
+        "promoted",
+        "candidate-cleanup",
+        "candidate-cleanup-failed",
+        "finalizing",
+        "stash-restore-conflict",
+        "stash-restore-failed",
+        "stash-drop-failed",
+        "stash-drop-unverified",
+        "finalized",
+    }
+)
+
+
+def _recovery_command(*parts: object) -> str:
+    return "$ " + " ".join(shlex.quote(str(part)) for part in parts)
+
+
+def _recovery_stash_list_command(marker: str) -> str:
+    # Keep the format literal and quote only the journal-derived marker.
+    return (
+        "$ git stash list --format='%gd %H %s' | grep -F -- "
+        + shlex.quote(marker)
+    )
+
+
+def _format_release_transaction_recovery_guidance(
+    journal_path: Path | str,
+    journal: dict,
+    *,
+    repo_root: Path | str,
+) -> str:
+    """Format immutable, phase-aware recovery guidance without side effects.
+
+    This function deliberately performs no Git or filesystem operations.  Every
+    value interpolated into a command is validated locally and shell-quoted;
+    malformed journal fields become ``unavailable`` instead of becoming a
+    recovery command.  The uncertain-capture branch is intentionally terminal:
+    it emits inspection commands only.
+    """
+
+    if not isinstance(journal, dict):
+        return (
+            "Recovery guidance unavailable: the unfinished release journal is "
+            "not a JSON object. Preserve the journal and do not run cleanup."
+        )
+
+    journal_path = Path(journal_path)
+    journal_display = _recovery_safe_text(str(journal_path))
+    journal_display = journal_display or "<unavailable>"
+    journal_command_path = (
+        shlex.quote(journal_display) if journal_display != "<unavailable>" else None
+    )
+    repo_display = _recovery_safe_text(str(repo_root)) or "<unavailable>"
+    phase_raw = journal.get("phase") if "phase" in journal else journal.get("state")
+    phase = _recovery_safe_text(phase_raw)
+    if phase not in _RECOVERY_PHASES:
+        phase = None
+    phase_key = phase or ""
+
+    original_branch = _recovery_branch(journal.get("original_branch"))
+    original_branch_present = "original_branch" in journal
+    original_head_sha = _recovery_sha(journal.get("original_head_sha"))
+    original_ref = (
+        _recovery_ref(journal.get("original_ref"))
+        if "original_ref" in journal
+        else None
+    )
+    if original_branch is not None and "original_ref" in journal:
+        if original_ref != f"refs/heads/{original_branch}":
+            original_branch = None
+    elif original_branch_present and journal.get("original_branch") is None:
+        if journal.get("original_ref") not in (None, ""):
+            original_head_sha = None
+    maintenance_branch = _recovery_branch(journal.get("maintenance_branch"))
+    maintenance_old_raw = (
+        journal.get("maintenance_old_sha")
+        if "maintenance_old_sha" in journal
+        else journal.get("old_sha")
+    )
+    maintenance_old_sha = _recovery_sha(maintenance_old_raw)
+    candidate_sha = _recovery_sha(journal.get("candidate_sha"))
+    current_sha = _recovery_sha(journal.get("current_sha"))
+    current_or_candidate_sha = current_sha or candidate_sha
+    target_sha = _recovery_sha(journal.get("target_sha"))
+
+    if "maintenance_ref" in journal:
+        maintenance_ref = _recovery_ref(journal.get("maintenance_ref"))
+    elif maintenance_branch is not None:
+        maintenance_ref = f"refs/heads/{maintenance_branch}"
+    else:
+        maintenance_ref = None
+    if (
+        maintenance_ref is not None
+        and maintenance_branch is not None
+        and maintenance_ref != f"refs/heads/{maintenance_branch}"
+    ):
+        maintenance_ref = None
+    backup_ref = _recovery_ref(journal.get("backup_ref"))
+    candidate_branch = _recovery_branch(journal.get("candidate_branch"))
+    candidate_path = _recovery_candidate_path(journal_path, journal.get("candidate_path"))
+    repo_path = _recovery_absolute_path(str(repo_root))
+    if candidate_path is not None and repo_path is not None and candidate_path == repo_path:
+        candidate_path = None
+
+    marker = _recovery_safe_text(journal.get("stash_marker"))
+    stash_sha = _recovery_sha(journal.get("stash_sha"))
+    capture_required = journal.get("stash_capture_required")
+    capture_confirmed_raw = journal.get("stash_capture_confirmed")
+    capture_uncertain_raw = journal.get("stash_capture_uncertain")
+    capture_confirmed = capture_confirmed_raw is True
+    capture_uncertain_flag = capture_uncertain_raw is True
+    local_state_present = journal.get("local_state_present")
+    stash_pending_raw = journal.get("stash_pending")
+    stash_pending = stash_pending_raw is True
+    stash_apply_attempted = journal.get("stash_apply_attempted") is True
+    stash_applied = journal.get("stash_applied") is True
+
+    # Unknown local state is handled like present local state.  The only state
+    # that authorizes destructive recovery without a confirmed stash is an
+    # explicit, durably recorded ``False``.
+    capture_uncertain = (
+        capture_uncertain_flag
+        or (
+            local_state_present is not False
+            and (not capture_confirmed or stash_sha is None)
+        )
+        or (capture_required is True and not capture_confirmed)
+        or (stash_pending and (not capture_confirmed or stash_sha is None))
+    )
+    destructive_recovery_blocked = capture_uncertain
+
+    post_cas_phases = {
+        "promoting",
+        "promotion-needs-recovery",
+        "promotion-uncertain",
+        "promoted",
+        "candidate-cleanup",
+        "candidate-cleanup-failed",
+        "finalizing",
+        "stash-restore-conflict",
+        "stash-restore-failed",
+        "stash-drop-failed",
+        "stash-drop-unverified",
+        "finalized",
+    }
+    post_cas = phase_key in post_cas_phases
+    stash_conflict = stash_pending and stash_apply_attempted and not stash_applied
+    cleanup_unresolved = phase_key in {
+        "candidate-cleanup-failed",
+        "candidate-cleanup",
+    } or (
+        journal.get("candidate_created") is True
+        and journal.get("candidate_cleanup") is not True
+        and post_cas
+    )
+
+    def field(label: str, value: object, *, quote: bool = False) -> None:
+        if value is None:
+            lines.append(f"{label}: unavailable (invalid journal value)")
+        else:
+            rendered = shlex.quote(str(value)) if quote else str(value)
+            lines.append(f"{label}: {rendered}")
+
+    lines = [
+        "Unfinished release transaction recovery guidance (no commands were executed):",
+        f"journal: {journal_display}",
+        f"phase: {phase or 'unavailable (invalid journal value)'}",
+        f"repo root: {repo_display}",
+    ]
+    if original_branch_present and journal.get("original_branch") is None:
+        lines.append("original checkout: detached HEAD")
+    elif original_branch is not None:
+        lines.append(f"original checkout: branch {original_branch}")
+    else:
+        lines.append("original checkout: symbolic branch unavailable (invalid journal value)")
+    field("original HEAD SHA", original_head_sha)
+    field("maintenance ref", maintenance_ref)
+    field("maintenance old SHA", maintenance_old_sha)
+    field("target SHA", target_sha)
+    field("current/candidate SHA", current_or_candidate_sha)
+    field("candidate SHA", candidate_sha)
+    field("backup ref", backup_ref)
+    field("candidate path", candidate_path, quote=True)
+    field("candidate branch", candidate_branch)
+    field("stash marker", marker, quote=True)
+    field(
+        "local state present",
+        local_state_present if isinstance(local_state_present, bool) else None,
+    )
+    field(
+        "stash capture required",
+        capture_required if isinstance(capture_required, bool) else None,
+    )
+    field(
+        "stash capture confirmed",
+        capture_confirmed_raw if isinstance(capture_confirmed_raw, bool) else None,
+    )
+    field(
+        "stash capture uncertain",
+        capture_uncertain_raw if isinstance(capture_uncertain_raw, bool) else None,
+    )
+    field("stash pending", stash_pending_raw if isinstance(stash_pending_raw, bool) else None)
+    field("stash SHA", stash_sha)
+
+    known_objects: list[str] = []
+    for value in (original_head_sha, maintenance_old_sha, target_sha, candidate_sha, backup_ref):
+        if value is not None and value not in known_objects:
+            known_objects.append(value)
+
+    def add_inspection_commands(*, include_stash: bool) -> None:
+        lines.append("Nondestructive inspection commands:")
+        lines.append(_recovery_command("git", "status", "--short"))
+        if marker is not None:
+            lines.append(_recovery_stash_list_command(marker))
+        else:
+            lines.append("Stash-list marker command unavailable (invalid journal value).")
+        objects = list(known_objects)
+        if include_stash and stash_sha is not None:
+            objects.append(stash_sha)
+        seen: set[str] = set()
+        for value in objects:
+            if value in seen:
+                continue
+            seen.add(value)
+            lines.append(_recovery_command("git", "show", "--stat", value))
+
+    def add_original_checkout() -> bool:
+        if original_branch is not None:
+            lines.append(_recovery_command("git", "checkout", "--force", original_branch))
+            return True
+        if original_branch_present and journal.get("original_branch") is None and original_head_sha:
+            lines.append(_recovery_command("git", "checkout", "--detach", original_head_sha))
+            return True
+        lines.append("Original checkout command unavailable (invalid journal identity).")
+        return False
+
+    def add_stash_apply() -> bool:
+        if not stash_pending:
+            return False
+        if not capture_confirmed or capture_uncertain_flag or stash_sha is None:
+            lines.append("Immutable stash apply command unavailable; do not use a movable stash selector.")
+            return False
+        lines.append(_recovery_command("git", "stash", "apply", "--index", stash_sha))
+        return True
+
+    if capture_uncertain:
+        lines.extend(
+            [
+                "SAFETY STOP: stash capture is uncertain or has no verified immutable SHA while local state may be present.",
+                "DO NOT run destructive checkout/reset/clean/stash apply/drop cleanup commands.",
+                "Preserve the exact journal above and do not archive, rename, or delete it yet.",
+            ]
+        )
+        add_inspection_commands(include_stash=False)
+        lines.append("Only the inspection commands above are authorized until capture is independently verified.")
+        return "\n".join(lines)
+
+    if phase is None:
+        lines.extend(
+            [
+                "SAFETY STOP: transaction phase is unavailable or invalid; no recovery mutators are authorized.",
+                "Preserve the exact journal above and use inspection output only until a trusted phase is established.",
+            ]
+        )
+        add_inspection_commands(include_stash=capture_confirmed and stash_sha is not None)
+        return "\n".join(lines)
+
+    if post_cas:
+        lines.append("Recovery class: post-CAS/promotion state; verify identities before every write.")
+        add_inspection_commands(include_stash=True)
+        if destructive_recovery_blocked:
+            lines.append("Destructive rollback and checkout/reset commands are withheld until stash capture is confirmed.")
+        elif maintenance_ref and maintenance_old_sha and candidate_sha:
+            lines.append(
+                "1. Only if the maintenance ref currently resolves to the candidate SHA, run this exact CAS rollback:"
+            )
+            lines.append(_recovery_command("git", "update-ref", maintenance_ref, maintenance_old_sha, candidate_sha))
+            if maintenance_branch:
+                lines.append(
+                    "2. After the CAS succeeds, and only after confirmed stash capture "
+                    "(or no local state was present):"
+                )
+                lines.append(_recovery_command("git", "checkout", "--force", maintenance_branch))
+                lines.append(_recovery_command("git", "reset", "--hard", maintenance_old_sha))
+            else:
+                lines.append("Maintenance checkout/reset commands unavailable (invalid branch value).")
+            lines.append("3. Restore the original checkout only after verifying the current ref identity:")
+            original_restored = add_original_checkout()
+            if original_restored and original_branch and original_head_sha:
+                lines.append(_recovery_command("git", "reset", "--hard", original_head_sha))
+            if stash_pending:
+                lines.append("4. After the checkout identity is verified, apply the immutable stash:")
+                add_stash_apply()
+        else:
+            lines.append("CAS rollback command unavailable: maintenance ref, old SHA, or candidate SHA is invalid.")
+    else:
+        lines.append("Recovery class: pre-promotion; verify the original checkout identity before applying user state.")
+        add_inspection_commands(include_stash=True)
+        if original_branch or (original_branch_present and journal.get("original_branch") is None and original_head_sha):
+            lines.append("After verifying the original checkout identity, restore it:")
+            add_original_checkout()
+        if stash_pending:
+            lines.append("Apply user state only after verifying the original checkout identity:")
+            add_stash_apply()
+
+    if stash_conflict and not capture_uncertain:
+        lines.append("Stash restore remains unresolved; do not clean any stash reflog entry yet.")
+        if capture_confirmed and stash_sha:
+            lines.append("verify files and index before any stash reflog cleanup; never use stash@{N}:")
+            if not any(
+                line == _recovery_command("git", "stash", "apply", "--index", stash_sha)
+                for line in lines
+            ):
+                lines.append(_recovery_command("git", "stash", "apply", "--index", stash_sha))
+        else:
+            lines.append("Immutable stash apply command unavailable until a verified SHA exists.")
+
+    if cleanup_unresolved:
+        lines.append("Candidate cleanup is unresolved; inspect it only after live checkout and stash recovery verification:")
+        lines.append(_recovery_command("git", "worktree", "list", "--porcelain"))
+        if candidate_path is not None:
+            lines.append(_recovery_command("git", "-C", candidate_path, "status", "--short"))
+        else:
+            lines.append("Candidate status command unavailable (invalid candidate path).")
+        if candidate_path is not None and candidate_branch is not None:
+            lines.append("OPTIONAL final cleanup, only after live checkout and user-file/stash recovery are verified:")
+            lines.append(_recovery_command("git", "worktree", "remove", "--force", "--", candidate_path))
+            lines.append(_recovery_command("git", "branch", "-D", "--", candidate_branch))
+        else:
+            lines.append("Optional candidate removal commands withheld because a candidate path or branch is invalid.")
+
+    if journal_command_path is not None:
+        resolved_journal = shlex.quote(f"{journal_path}.resolved")
+        lines.extend(
+            [
+                "Final journal acknowledgment: only after live checkout and user files are verified, archive/rename the journal; never auto-delete it:",
+                f"$ mv -- {journal_command_path} {resolved_journal}",
+                "On platforms without POSIX mv, use the platform's equivalent rename to the same .resolved path after verification.",
+            ]
+        )
+    else:
+        lines.append("Final journal acknowledgment command unavailable; preserve the journal and do not delete it.")
+    return "\n".join(lines)
+
+
+def _reject_unfinished_release_transaction(
+    git_cmd: list[str], cwd: Path | str
+) -> None:
+    found = _find_unfinished_release_transaction(git_cmd, cwd)
+    if found is None:
+        return
+    journal_path, journal = found
+    guidance = _format_release_transaction_recovery_guidance(
+        journal_path, journal, repo_root=Path(cwd).absolute()
+    )
+    raise RuntimeError(
+        "An unfinished release transaction is already recorded at "
+        f"{journal_path}; recover it before starting another release upgrade.\n\n"
+        f"{guidance}"
+    )
+
+
+def _create_release_upgrade_context(
+    git_cmd: list[str],
+    cwd: Path | str,
+    *,
+    original_branch: str | None,
+    original_head_sha: str,
+    maintenance_old_sha: str,
+    release_tag: str,
+    base_sha: str,
+    target_sha: str,
+    payload: bytes,
+    stash_marker: str | None = None,
+) -> ReleaseUpgradeContext:
+    """Create and durably seed a release transaction before live Git moves."""
+
+    root = Path(cwd)
+    common = _git_common_dir(git_cmd, root)
+    transactions = common / "hermes-upgrade-transactions"
+    try:
+        transactions_info = transactions.lstat()
+    except FileNotFoundError:
+        transactions.mkdir(exist_ok=False)
+        # Persist the newly-created transactions root before creating a child
+        # that may contain the first discoverable recovery journal.
+        _fsync_directory(common, required=True)
+    else:
+        if stat.S_ISLNK(transactions_info.st_mode) or not stat.S_ISDIR(
+            transactions_info.st_mode
+        ):
+            raise RuntimeError(
+                f"Refusing non-directory release transaction root: {transactions}"
+            )
+
+    transaction_id = uuid.uuid4().hex
+    transaction_dir = transactions / transaction_id
+    transaction_dir.mkdir(exist_ok=False)
+    # The child directory entry must be durable before its journal/payload
+    # can become discoverable or any live Git state can be changed.
+    _fsync_directory(transactions, required=True)
+    payload_path = transaction_dir / "runtime-local-maintenance.patch"
+    backup_ref = f"refs/hermes-upgrade/backups/{transaction_id}"
+    candidate_branch = f"hermes-upgrade-candidate/{transaction_id}"
+    candidate_path = common.parent.parent / f"hermes-upgrade-candidate-{transaction_id}"
+    journal_path = transaction_dir / "journal.json"
+    marker = stash_marker or f"hermes-update-autostash-{os.getpid()}-{transaction_id}"
+    journal = {
+        "version": 2,
+        "transaction_id": transaction_id,
+        "phase": "prepared",
+        "state": "prepared",
+        "original_branch": original_branch,
+        "original_ref": f"refs/heads/{original_branch}" if original_branch else None,
+        "original_head_sha": original_head_sha,
+        "maintenance_branch": "hermes-release",
+        "maintenance_old_sha": maintenance_old_sha,
+        "old_sha": maintenance_old_sha,
+        "release_tag": release_tag,
+        "base_sha": base_sha,
+        "target_sha": target_sha,
+        "backup_ref": backup_ref,
+        "backup_created": False,
+        "candidate_branch": candidate_branch,
+        "candidate_path": str(candidate_path),
+        "candidate_sha": None,
+        "candidate_cleanup": False,
+        "payload_path": str(payload_path),
+        "payload_sha256": hashlib.sha256(payload).hexdigest(),
+        "payload_bytes": len(payload),
+        "stash_marker": marker,
+        "stash_sha": None,
+        # These fields are deliberately tri-state/explicit: a missing or
+        # unconfirmed capture must never be treated as an empty worktree.
+        "local_state_present": None,
+        "stash_capture_required": None,
+        "stash_capture_confirmed": False,
+        "stash_capture_uncertain": False,
+        "stash_pending": False,
+        "stash_apply_attempted": False,
+        "stash_applied": False,
+        "checkout_restored": False,
+        "final_state_verified": False,
+    }
+    context = ReleaseUpgradeContext(
+        root=root,
+        common_dir=common,
+        transaction_dir=transaction_dir,
+        journal_path=journal_path,
+        journal=journal,
+    )
+    # The journal exists before payload capture; the payload itself is then
+    # written as a regular fsynced file before any stash/checkout/reset.
+    _write_transaction_journal(common, journal, path=journal_path)
+    _atomic_write_bytes(
+        payload_path,
+        payload,
+        required_parent_fsync=True,
+    )
+    info = payload_path.lstat()
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise RuntimeError(f"Durable release payload is not a regular file: {payload_path}")
+    _journal_update(context, "payload-persisted")
+    return context
+
+
+def _candidate_artifact_directory(candidate: Path) -> Path:
+    directory = candidate / _LOCAL_PATCHES_DIRNAME
+    try:
+        info = directory.lstat()
+    except FileNotFoundError:
+        directory.mkdir(parents=True)
+        return directory
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise RuntimeError(f"Refusing non-directory local-patches path: {directory}")
+    allowed = {"0001-local-maintenance.patch", "README.md", ".release_base"}
+    for entry in directory.iterdir():
+        try:
+            entry_info = entry.lstat()
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(entry_info.st_mode):
+            raise RuntimeError(f"Refusing symlink in local-patches: {entry}")
+        if entry.name in allowed:
+            if not stat.S_ISREG(entry_info.st_mode):
+                raise RuntimeError(f"Refusing non-regular local-patches artifact: {entry}")
+        elif entry.suffix == ".patch" and stat.S_ISREG(entry_info.st_mode):
+            entry.unlink()
+        else:
+            raise RuntimeError(f"Unexpected local-patches entry in candidate: {entry.name}")
+    return directory
+
+
+def _commit_candidate_changes(git_cmd: list[str], candidate: Path, message: str) -> None:
+    cached = subprocess.run(
+        git_cmd + ["diff", "--cached", "--quiet"],
+        cwd=candidate,
+        capture_output=True,
+    )
+    if cached.returncode == 0:
+        return
+    if cached.returncode != 1:
+        raise RuntimeError("Could not inspect candidate index before commit.")
+    commit = subprocess.run(
+        git_cmd + ["commit", "--no-gpg-sign", "-m", message],
+        cwd=candidate,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if commit.returncode != 0:
+        detail = (commit.stderr or commit.stdout or "").strip()
+        raise RuntimeError(
+            f"Could not commit isolated upgrade candidate: "
+            f"{detail.splitlines()[0] if detail else 'git commit failed'}"
+        )
+
+
+def _apply_payload_to_candidate(
+    git_cmd: list[str], candidate: Path, payload: bytes, *, label: str
+) -> None:
+    if not payload:
+        return
+    fd, tmp_name = tempfile.mkstemp(prefix="hermes-upgrade-payload-", suffix=".patch")
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        applied = subprocess.run(
+            git_cmd
+            + ["apply", "--3way", "--index", "--whitespace=nowarn", str(tmp_path)],
+            cwd=candidate,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        unmerged = subprocess.run(
+            git_cmd + ["ls-files", "--unmerged"],
+            cwd=candidate,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        unmerged_output = (unmerged.stdout or "").strip()
+        conflict_paths: list[str] = []
+        for line in unmerged_output.splitlines():
+            # ``git ls-files --unmerged`` emits one record per index stage,
+            # with the path after a tab. Keep a bounded set of paths rather
+            # than exposing the repeated stage records or an unbounded index.
+            if "\t" in line:
+                path = line.split("\t", 1)[1].strip()
+            else:
+                fields = line.split(maxsplit=3)
+                path = fields[3].strip() if len(fields) == 4 else line.strip()
+            if path and path not in conflict_paths:
+                conflict_paths.append(path)
+
+        if applied.returncode != 0 or unmerged_output or unmerged.returncode != 0:
+            detail_parts: list[str] = []
+            if conflict_paths:
+                shown_paths = conflict_paths[:20]
+                suffix = (
+                    f" (+{len(conflict_paths) - len(shown_paths)} more)"
+                    if len(conflict_paths) > len(shown_paths)
+                    else ""
+                )
+                detail_parts.append(
+                    "unmerged index path(s): " + ", ".join(shown_paths) + suffix
+                )
+            elif unmerged.returncode != 0:
+                inspect_detail = (unmerged.stderr or unmerged.stdout or "").strip()
+                detail_parts.append(
+                    "could not inspect the candidate's unmerged index"
+                    + (f": {inspect_detail[:2000]}" if inspect_detail else "")
+                )
+
+            if applied.returncode != 0:
+                apply_output = "\n".join(
+                    part.strip()
+                    for part in (applied.stderr or "", applied.stdout or "")
+                    if part and part.strip()
+                )
+                detail_parts.append(
+                    f"git apply exited {applied.returncode}"
+                    + (f": {apply_output[:4000]}" if apply_output else "")
+                )
+
+            detail = "; ".join(detail_parts) or "git apply --3way failed"
+            raise RuntimeError(
+                f"Release payload {label} conflicts in isolated candidate: "
+                f"{detail}"
+            )
+    finally:
+        try:
+            tmp_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _validate_candidate_gitlinks(git_cmd: list[str], candidate: Path) -> None:
+    """Reject submodule-like index entries before a candidate is applied."""
+
+    staged = subprocess.run(
+        git_cmd + ["ls-files", "--stage", "-z"],
+        cwd=candidate,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if staged.returncode != 0:
+        detail = (staged.stderr or staged.stdout or "").strip()
+        raise RuntimeError(
+            "Could not inspect candidate index for gitlinks"
+            + (f": {detail.splitlines()[0]}" if detail else "")
+        )
+    for record in staged.stdout.split("\x00"):
+        if not record:
+            continue
+        metadata, separator, path = record.partition("\t")
+        if not separator:
+            raise RuntimeError("Candidate index contained an invalid staged entry.")
+        mode = metadata.split(maxsplit=1)[0]
+        if mode == "160000":
+            raise RuntimeError(
+                f"Candidate validation rejected gitlink/submodule entry {path!r}; "
+                "release candidates must contain ordinary files."
+            )
+
+
+def _validate_candidate_self_hosting(candidate: Path) -> None:
+    """Run the production release-candidate self-hosting checks."""
+
+    syntax_ok, failing_path, syntax_error = _validate_critical_files_syntax(candidate)
+    if not syntax_ok:
+        raise RuntimeError(
+            f"Candidate validation failed at {failing_path}: "
+            f"{syntax_error or 'syntax error'}"
+        )
+    imports_ok, failing_module, import_error = _validate_critical_modules_import(candidate)
+    if not imports_ok:
+        raise RuntimeError(
+            f"Candidate import validation failed at {failing_module}: "
+            f"{import_error or 'import error'}"
+        )
+
+
+def _validate_candidate_tree(
+    git_cmd: list[str],
+    candidate: Path,
+    *,
+    candidate_validator=None,
+) -> str:
+    _validate_candidate_gitlinks(git_cmd, candidate)
+    status = subprocess.run(
+        git_cmd + ["status", "--porcelain"],
+        cwd=candidate,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    unmerged = subprocess.run(
+        git_cmd + ["ls-files", "--unmerged"],
+        cwd=candidate,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if status.returncode != 0 or status.stdout.strip() or unmerged.stdout.strip():
+        raise RuntimeError("Candidate worktree is not clean after replay.")
+    # This private seam is used only by real-Git tests whose temporary
+    # repositories intentionally are not Hermes-shaped. The production path
+    # never supplies it and therefore always runs strict self-hosting checks.
+    if candidate_validator is None:
+        _validate_candidate_self_hosting(candidate)
+    else:
+        candidate_validator(git_cmd, candidate)
+    resolved = _git_resolve_commit(git_cmd, candidate, "HEAD")
+    if resolved is None:
+        raise RuntimeError("Candidate HEAD did not resolve to an immutable commit.")
+    return resolved
+
+
+def _upgrade_release_transaction(
+    git_cmd: list[str],
+    cwd: Path | str,
+    release_tag: str,
+    target_sha: str,
+    *,
+    transaction_context: ReleaseUpgradeContext | None = None,
+    candidate_validator=None,
+) -> ReleaseUpgradeResult:
+    """Replay maintenance changes in isolation, then CAS-promote the candidate."""
+
+    root = Path(cwd).resolve()
+    _validate_release_tag_name(git_cmd, root, release_tag)
+    if not _SHA_RE.fullmatch(target_sha):
+        raise RuntimeError("Release target is not an immutable commit SHA.")
+    target_sha = target_sha.lower()
+    exact_target = _git_resolve_commit(
+        git_cmd, root, f"refs/tags/{release_tag}"
+    ) or _git_resolve_commit(git_cmd, root, f"refs/hermes-upgrade/tags/{release_tag}")
+    if exact_target != target_sha:
+        raise RuntimeError(
+            f"Release target {release_tag} is not the exact fetched tag commit; refusing to guess."
+        )
+
+    branch = "hermes-release"
+    maintenance_ref = f"refs/heads/{branch}"
+    current_snapshot = _capture_release_git_snapshot(
+        git_cmd, root, maintenance_ref=maintenance_ref
+    )
+    if (
+        transaction_context is not None
+        and "post_stash_snapshot" in transaction_context.journal
+    ):
+        try:
+            current_snapshot = _validate_release_git_snapshot(
+                git_cmd,
+                root,
+                _release_context_snapshot(
+                    transaction_context,
+                    "maintenance_snapshot"
+                    if "maintenance_snapshot" in transaction_context.journal
+                    else "post_stash_snapshot",
+                ),
+                label="release transaction post-stash entry",
+            )
+        except Exception as exc:
+            _release_mark_manual_interference(transaction_context, exc)
+            raise
+    old_sha = current_snapshot.maintenance_ref_sha
+    if current_snapshot.symbolic_head != maintenance_ref or current_snapshot.head_sha != old_sha:
+        message = "Release transaction requires the explicit hermes-release branch at its recorded HEAD."
+        if transaction_context is not None:
+            _release_mark_manual_interference(transaction_context, message)
+        raise ReleaseGitStateError(message)
+    if not _release_snapshot_is_clean(current_snapshot):
+        message = "Live maintenance worktree must be clean after user changes are stashed."
+        if transaction_context is not None:
+            _release_mark_manual_interference(transaction_context, message)
+        raise ReleaseGitStateError(message)
+
+    context = transaction_context
+    if context is None:
+        metadata = _read_release_base_metadata(root)
+        payload = _generate_runtime_local_payload(git_cmd, root, metadata, head_sha=old_sha)
+        context = _create_release_upgrade_context(
+            git_cmd,
+            root,
+            original_branch=branch,
+            original_head_sha=current_snapshot.head_sha,
+            maintenance_old_sha=old_sha,
+            release_tag=release_tag,
+            base_sha=metadata.base_sha,
+            target_sha=target_sha,
+            payload=payload,
+        )
+        _release_snapshot_with_journal(context, "original_snapshot", current_snapshot)
+        _release_snapshot_with_journal(context, "original_clean_snapshot", current_snapshot)
+    journal = context.journal
+    recorded_old_sha = journal.get("maintenance_old_sha")
+    if recorded_old_sha != old_sha:
+        message = "Live maintenance ref changed before promotion; candidate and backup were preserved."
+        _release_mark_manual_interference(context, message)
+        raise ReleaseGitStateError(message)
+    if "pre_cas_snapshot" in journal:
+        try:
+            current_snapshot = _validate_release_git_snapshot(
+                git_cmd,
+                root,
+                _release_context_snapshot(context, "pre_cas_snapshot"),
+                label="release transaction entry",
+            )
+        except Exception as exc:
+            _release_mark_manual_interference(context, exc)
+            raise
+    else:
+        _release_snapshot_with_journal(context, "pre_cas_snapshot", current_snapshot)
+    payload_path = Path(journal["payload_path"])
+    payload = payload_path.read_bytes()
+    if (
+        len(payload) != journal.get("payload_bytes")
+        or hashlib.sha256(payload).hexdigest() != journal.get("payload_sha256")
+    ):
+        _journal_update(context, "payload-integrity-failed")
+        raise RuntimeError("Durable release payload changed before candidate replay.")
+
+    backup_ref = journal["backup_ref"]
+    candidate_branch = journal["candidate_branch"]
+    candidate_path = Path(journal["candidate_path"])
+    backup = subprocess.run(
+        git_cmd + ["update-ref", backup_ref, old_sha],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if backup.returncode != 0:
+        _journal_update(context, "backup-failed")
+        raise RuntimeError("Could not create durable pre-promotion backup ref.")
+    _journal_update(context, "backup-created", backup_created=True)
+
+    try:
+        worktree = subprocess.run(
+            git_cmd + ["worktree", "add", "-b", candidate_branch, str(candidate_path), target_sha],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if worktree.returncode != 0:
+            _journal_update(context, "candidate-create-failed")
+            detail = (worktree.stderr or worktree.stdout or "").strip()
+            raise RuntimeError(
+                "Could not create isolated upgrade candidate: "
+                f"{detail.splitlines()[0] if detail else 'git worktree add failed'}"
+            )
+        _journal_update(context, "candidate-created", candidate_created=True)
+        _validate_candidate_gitlinks(git_cmd, candidate_path)
+        _apply_payload_to_candidate(git_cmd, candidate_path, payload, label=release_tag)
+        _commit_candidate_changes(
+            git_cmd, candidate_path, f"local: replay maintenance payload onto {release_tag}"
+        )
+        candidate_head = _git_resolve_commit(git_cmd, candidate_path, "HEAD")
+        if candidate_head is None:
+            raise RuntimeError("Candidate payload commit did not produce a commit SHA.")
+        artifact_dir = _candidate_artifact_directory(candidate_path)
+        artifact_payload = _git_diff_bytes(git_cmd, candidate_path, target_sha, candidate_head)
+        artifact_sha = hashlib.sha256(artifact_payload).hexdigest()
+        artifact_metadata = {
+            "format_version": 1,
+            "tag": release_tag,
+            "base_sha": target_sha,
+            "target_sha": target_sha,
+            "patch_sha256": artifact_sha,
+            "patch_bytes": len(artifact_payload),
+        }
+        _atomic_write_bytes(artifact_dir / "0001-local-maintenance.patch", artifact_payload)
+        _atomic_write_bytes(artifact_dir / "README.md", _LOCAL_PATCHES_README.encode())
+        _atomic_write_bytes(
+            artifact_dir / ".release_base",
+            (json.dumps(artifact_metadata, sort_keys=True, indent=2) + "\n").encode(),
+        )
+        stage = subprocess.run(
+            git_cmd
+            + [
+                "add",
+                "--",
+                f"{_LOCAL_PATCHES_DIRNAME}/0001-local-maintenance.patch",
+                f"{_LOCAL_PATCHES_DIRNAME}/README.md",
+                f"{_LOCAL_PATCHES_DIRNAME}/.release_base",
+            ],
+            cwd=candidate_path,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if stage.returncode != 0:
+            raise RuntimeError("Could not stage expected local-patches artifacts in candidate.")
+        _commit_candidate_changes(
+            git_cmd, candidate_path, f"local: refresh maintenance artifacts for {release_tag}"
+        )
+        candidate_sha = _validate_candidate_tree(
+            git_cmd, candidate_path, candidate_validator=candidate_validator
+        )
+        _journal_update(context, "candidate-validated", candidate_sha=candidate_sha)
+
+        pre_cas_snapshot = _release_context_snapshot(context, "pre_cas_snapshot")
+        try:
+            _validate_release_git_snapshot(
+                git_cmd, root, pre_cas_snapshot, label="promotion CAS precondition"
+            )
+        except Exception as exc:
+            _release_mark_manual_interference(context, exc)
+            raise
+        _journal_update(context, "promoting")
+        promote = subprocess.run(
+            git_cmd + ["update-ref", f"refs/heads/{branch}", candidate_sha, old_sha],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if promote.returncode != 0:
+            try:
+                _validate_release_git_snapshot(
+                    git_cmd, root, pre_cas_snapshot, label="failed promotion CAS"
+                )
+            except Exception as exc:
+                _release_mark_manual_interference(context, exc)
+                raise
+            _journal_update(context, "promotion-cas-failed")
+            raise RuntimeError(
+                "Live maintenance branch changed before promotion; candidate and backup were preserved."
+            )
+
+        candidate_tree_sha = _release_git_sha(
+            git_cmd,
+            root,
+            ["rev-parse", "--verify", f"{candidate_sha}^{{tree}}"],
+            label="candidate tree",
+        )
+        post_cas = _capture_release_git_snapshot(
+            git_cmd, root, maintenance_ref=maintenance_ref
+        )
+        try:
+            _release_assert_identity(
+                post_cas,
+                symbolic_head=maintenance_ref,
+                head_sha=candidate_sha,
+                maintenance_ref_sha=candidate_sha,
+                label="promotion CAS postcondition",
+            )
+            if (
+                post_cas.index_tree_sha != pre_cas_snapshot.index_tree_sha
+                or post_cas.tracked_diff_sha256 != pre_cas_snapshot.tracked_diff_sha256
+                or post_cas.untracked_count != pre_cas_snapshot.untracked_count
+                or post_cas.head_tree_sha != candidate_tree_sha
+            ):
+                raise ReleaseGitStateError(
+                    "Live checkout differs from the expected temporary ref/worktree skew."
+                )
+        except Exception as exc:
+            _release_mark_manual_interference(context, exc)
+            raise
+        _release_snapshot_with_journal(context, "post_cas_snapshot", post_cas)
+
+        candidate_expected = _release_clean_snapshot(
+            post_cas,
+            symbolic_head=maintenance_ref,
+            head_sha=candidate_sha,
+            maintenance_ref_sha=candidate_sha,
+            head_tree_sha=candidate_tree_sha,
+        )
+        try:
+            _validate_release_git_snapshot(
+                git_cmd, root, post_cas, label="live synchronization precondition"
+            )
+        except Exception as exc:
+            _release_mark_manual_interference(context, exc)
+            raise
+        reset = subprocess.run(
+            git_cmd + ["reset", "--hard", candidate_sha],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if reset.returncode != 0:
+            try:
+                current_after_reset_failure = _capture_release_git_snapshot(
+                    git_cmd, root, maintenance_ref=maintenance_ref
+                )
+                if current_after_reset_failure != post_cas:
+                    raise ReleaseGitStateError(
+                        "Live checkout changed while candidate synchronization failed."
+                    )
+            except Exception as exc:
+                _release_mark_manual_interference(context, exc)
+                raise
+            _journal_update(context, "promotion-needs-recovery")
+            raise RuntimeError(
+                f"Promotion did not verify. Recover with backup ref {backup_ref} "
+                f"and candidate {candidate_path}. Journal: {context.journal_path}. "
+                f"If refs/heads/{branch} still resolves to {candidate_sha}, use the "
+                f"pinned compare-and-swap rollback: git update-ref refs/heads/{branch} "
+                f"{old_sha} {candidate_sha}. Immutable stash: "
+                f"{journal.get('stash_sha') or '<none>'} "
+                f"(stash_pending={journal.get('stash_pending')})."
+            )
+        try:
+            _validate_release_git_snapshot(
+                git_cmd, root, candidate_expected, label="live synchronization postcondition"
+            )
+        except Exception as exc:
+            _release_mark_manual_interference(context, exc)
+            raise RuntimeError(
+                f"Promotion did not verify. Recover with backup ref {backup_ref} "
+                f"and candidate {candidate_path}. Journal: {context.journal_path}."
+            ) from exc
+        _release_snapshot_with_journal(
+            context,
+            "candidate_snapshot",
+            candidate_expected,
+            phase="promoted",
+            candidate_sha=candidate_sha,
+        )
+        # The candidate is isolated transaction evidence, not live user state.
+        # Once promotion and the live synchronization postcondition have both
+        # been verified, clean it at the end of this transaction so callers
+        # that defer outer finalization do not strand a successful candidate.
+        # A failed cleanup remains recoverable through the outer finalizer.
+        if journal.get("candidate_created") and not journal.get("candidate_cleanup"):
+            try:
+                candidate_cleaned = _release_cleanup_candidate(git_cmd, root, context)
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except BaseException as exc:
+                logger.warning(
+                    "Release candidate cleanup could not be completed; recovery journal kept at %s: %s",
+                    context.journal_path,
+                    exc,
+                )
+                candidate_cleaned = False
+            if candidate_cleaned:
+                _journal_update(context, "candidate-cleanup", candidate_cleanup=True)
+            else:
+                _journal_update(context, "candidate-cleanup-failed", candidate_cleanup=False)
+    except BaseException:
+        # Candidate and journal are recovery evidence across every exception,
+        # including KeyboardInterrupt/SystemExit.  The outer finalizer decides
+        # whether it is safe to return user state or must leave guidance.
+        raise
+
+    return ReleaseUpgradeResult(
+        old_sha,
+        target_sha,
+        candidate_sha,
+        backup_ref,
+        candidate_path,
+        context,
+    )
+
+
+def _prepare_and_promote_release(
+    git_cmd: list[str],
+    cwd: Path | str,
+    release_tag: str,
+    target_sha: str,
+    *,
+    input_fn=None,
+    candidate_validator=None,
+) -> ReleaseUpgradeResult:
+    """Capture user state, promote a release, and defer restore to finalization."""
+
+    root = Path(cwd).resolve()
+    branch = "hermes-release"
+    maintenance_ref = f"refs/heads/{branch}"
+    _validate_release_tag_name(git_cmd, root, release_tag)
+    _reject_unfinished_release_transaction(git_cmd, root)
+    original_snapshot = _capture_release_git_snapshot(
+        git_cmd, root, maintenance_ref=maintenance_ref
+    )
+    original_branch = _release_snapshot_branch(original_snapshot)
+    original_head_sha = original_snapshot.head_sha
+    maintenance_sha = original_snapshot.maintenance_ref_sha
+    metadata = _read_release_base_metadata_at_commit(git_cmd, root, maintenance_sha)
+    _validate_release_base_metadata(git_cmd, root, metadata, maintenance_sha)
+    payload = _git_diff_bytes(git_cmd, root, metadata.base_sha, maintenance_sha)
+    context = _create_release_upgrade_context(
+        git_cmd,
+        root,
+        original_branch=original_branch,
+        original_head_sha=original_head_sha,
+        maintenance_old_sha=maintenance_sha,
+        release_tag=release_tag,
+        base_sha=metadata.base_sha,
+        target_sha=target_sha.lower(),
+        payload=payload,
+    )
+    _release_snapshot_with_journal(context, "original_snapshot", original_snapshot)
+    original_clean_snapshot = _release_clean_snapshot(
+        original_snapshot,
+        symbolic_head=original_snapshot.symbolic_head,
+        head_sha=original_snapshot.head_sha,
+        maintenance_ref_sha=maintenance_sha,
+        head_tree_sha=original_snapshot.head_tree_sha,
+    )
+    _release_snapshot_with_journal(
+        context, "original_clean_snapshot", original_clean_snapshot
+    )
+    try:
+        try:
+            _validate_release_git_snapshot(
+                git_cmd, root, original_snapshot, label="stash capture precondition"
+            )
+        except Exception as exc:
+            _release_mark_manual_interference(context, exc)
+            raise
+        pre_capture_status = subprocess.run(
+            git_cmd + ["status", "--porcelain"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        local_state_present = (
+            bool(pre_capture_status.stdout.strip())
+            if pre_capture_status.returncode == 0
+            else None
+        )
+        _journal_update(
+            context,
+            "stash-capture-started",
+            local_state_present=local_state_present,
+            stash_capture_required=(
+                local_state_present if local_state_present is not None else None
+            ),
+            stash_capture_confirmed=False,
+            stash_capture_uncertain=local_state_present is None,
+            stash_pending=False,
+        )
+        if local_state_present is None:
+            detail = (pre_capture_status.stderr or pre_capture_status.stdout or "").strip()
+            raise RuntimeError(
+                "Could not inspect local state before stash capture"
+                + (f": {detail.splitlines()[0]}" if detail else "")
+            )
+        try:
+            _validate_release_git_snapshot(
+                git_cmd, root, original_snapshot, label="stash mutation precondition"
+            )
+        except Exception as exc:
+            _release_mark_manual_interference(context, exc)
+            raise
+        _journal_update(context, "stash-capture-started")
+        stash_ref = _stash_local_changes_if_needed(
+            git_cmd, root, marker=context.journal["stash_marker"]
+        )
+        if local_state_present:
+            _journal_update(
+                context,
+                "stash-capture-verifying",
+                stash_sha=None,
+                stash_pending=False,
+                stash_capture_confirmed=False,
+                stash_capture_uncertain=True,
+            )
+            verified_stash_ref = _verify_release_stash_capture(
+                git_cmd, root, context, stash_ref
+            )
+            if verified_stash_ref is None:
+                _journal_update(
+                    context,
+                    "stash-capture-uncertain",
+                    stash_sha=None,
+                    stash_pending=False,
+                    stash_capture_confirmed=False,
+                    stash_capture_uncertain=True,
+                )
+                raise RuntimeError(
+                    "Stash capture could not independently verify one unique "
+                    "immutable stash SHA."
+                )
+            _journal_update(
+                context,
+                "stashed",
+                stash_sha=verified_stash_ref,
+                stash_pending=True,
+                stash_capture_confirmed=True,
+                stash_capture_uncertain=False,
+            )
+        else:
+            if stash_ref is not None:
+                raise RuntimeError(
+                    "Stash capture returned an entry even though the pre-capture "
+                    "worktree was clean."
+                )
+            _journal_update(
+                context,
+                "no-stash",
+                stash_pending=False,
+                stash_capture_required=False,
+                stash_capture_confirmed=False,
+                stash_capture_uncertain=False,
+            )
+        post_stash_expected = _release_clean_snapshot(
+            original_snapshot,
+            symbolic_head=original_snapshot.symbolic_head,
+            head_sha=original_snapshot.head_sha,
+            maintenance_ref_sha=maintenance_sha,
+            head_tree_sha=original_snapshot.head_tree_sha,
+        )
+        try:
+            post_stash_snapshot = _validate_release_git_snapshot(
+                git_cmd,
+                root,
+                post_stash_expected,
+                label="post-stash clean checkout",
+            )
+        except Exception as exc:
+            _release_mark_manual_interference(context, exc)
+            raise
+        _release_snapshot_with_journal(
+            context,
+            "post_stash_snapshot",
+            post_stash_snapshot,
+        )
+        maintenance_tree_sha = _release_git_sha(
+            git_cmd,
+            root,
+            ["rev-parse", "--verify", f"{maintenance_sha}^{{tree}}"],
+            label="maintenance tree before checkout",
+        )
+        if original_branch != branch:
+            checkout = subprocess.run(
+                git_cmd + ["checkout", branch],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            if checkout.returncode != 0:
+                detail = (checkout.stderr or checkout.stdout or "").strip()
+                raise RuntimeError(
+                    f"Could not switch to local maintenance branch '{branch}': "
+                    f"{detail.splitlines()[0] if detail else 'git checkout failed'}"
+                )
+            maintenance_expected = _release_clean_snapshot(
+                post_stash_snapshot,
+                symbolic_head=maintenance_ref,
+                head_sha=maintenance_sha,
+                maintenance_ref_sha=maintenance_sha,
+                head_tree_sha=maintenance_tree_sha,
+            )
+            try:
+                _validate_release_git_snapshot(
+                    git_cmd,
+                    root,
+                    maintenance_expected,
+                    label="maintenance branch checkout",
+                )
+            except Exception as exc:
+                _release_mark_manual_interference(context, exc)
+                raise
+            _release_snapshot_with_journal(
+                context,
+                "maintenance_snapshot",
+                maintenance_expected,
+            )
+        result = _upgrade_release_transaction(
+            git_cmd,
+            root,
+            release_tag,
+            target_sha,
+            transaction_context=context,
+            candidate_validator=candidate_validator,
+        )
+        return result
+    except BaseException:
+        capture_required = context.journal.get("stash_capture_required")
+        capture_confirmed = bool(context.journal.get("stash_capture_confirmed"))
+        if capture_required is not False and not capture_confirmed:
+            recovered_stash = None
+            if not context.journal.get("stash_capture_uncertain"):
+                try:
+                    # A helper can raise after `git stash push` has created the
+                    # entry.  Only a unique marker match can promote this
+                    # uncertain state to a confirmed immutable capture.
+                    recovered_stash = _refresh_transaction_stash_identity(
+                        git_cmd, root, context
+                    )
+                except BaseException as exc:
+                    logger.warning("Could not refresh stash identity after capture fault: %s", exc)
+            if recovered_stash:
+                try:
+                    _journal_update(
+                        context,
+                        "stashed",
+                        stash_sha=recovered_stash,
+                        stash_pending=True,
+                        stash_capture_confirmed=True,
+                        stash_capture_uncertain=False,
+                    )
+                    if "post_stash_snapshot" not in context.journal:
+                        recovered_original = _release_context_snapshot(
+                            context, "original_snapshot"
+                        )
+                        recovered_expected = _release_clean_snapshot(
+                            recovered_original,
+                            symbolic_head=recovered_original.symbolic_head,
+                            head_sha=recovered_original.head_sha,
+                            maintenance_ref_sha=recovered_original.maintenance_ref_sha,
+                            head_tree_sha=recovered_original.head_tree_sha,
+                        )
+                        recovered_snapshot = _validate_release_git_snapshot(
+                            git_cmd,
+                            root,
+                            recovered_expected,
+                            label="recovered post-stash clean checkout",
+                        )
+                        _release_snapshot_with_journal(
+                            context,
+                            "post_stash_snapshot",
+                            recovered_snapshot,
+                        )
+                except BaseException as exc:
+                    logger.warning("Could not durably confirm recovered stash: %s", exc)
+            else:
+                try:
+                    _journal_update(
+                        context,
+                        "stash-capture-uncertain",
+                        stash_sha=None,
+                        stash_pending=False,
+                        stash_capture_confirmed=False,
+                        stash_capture_uncertain=True,
+                    )
+                except BaseException as exc:
+                    logger.warning("Could not durably mark stash capture uncertain: %s", exc)
+        else:
+            try:
+                _refresh_transaction_stash_identity(git_cmd, root, context)
+            except BaseException as exc:
+                logger.warning("Could not refresh stash identity during finalization: %s", exc)
+        if (
+            context.journal.get("local_state_present") is False
+            and not _release_has_manual_interference(context)
+        ):
+            # Preserve the ordinary update contract for a checkout that was
+            # proven to contain no user state.  This fallback runs before the
+            # transactional release finalizer; the finalizer itself never
+            # resets or cleans the live checkout.
+            subprocess.run(
+                git_cmd + ["reset", "--hard", "HEAD"],
+                cwd=root,
+                capture_output=True,
+            )
+            subprocess.run(
+                git_cmd + ["clean", "-fd"],
+                cwd=root,
+                capture_output=True,
+            )
+        _finalize_release_upgrade_for_orchestration(
+            git_cmd,
+            root,
+            context,
+            input_fn=input_fn,
+            primary_exc_info=sys.exc_info(),
+        )
+        raise
+
+
+def _verify_release_stash_capture(
+    git_cmd: list[str],
+    root: Path,
+    context: ReleaseUpgradeContext,
+    stash_ref: object,
+) -> str | None:
+    """Independently verify the helper's stash SHA against this transaction marker."""
+
+    if not isinstance(stash_ref, str) or not _SHA_RE.fullmatch(stash_ref):
+        return None
+    marker = context.journal.get("stash_marker")
+    if not isinstance(marker, str) or not marker:
+        return None
+    listing = subprocess.run(
+        git_cmd + ["stash", "list", "--format=%H%x00%gs"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if listing.returncode != 0:
+        return None
+    matches: list[str] = []
+    for line in listing.stdout.splitlines():
+        commit, separator, subject = line.partition("\0")
+        commit = commit.strip()
+        if separator and marker in subject and _SHA_RE.fullmatch(commit):
+            matches.append(commit.lower())
+    if len(matches) != 1 or matches[0] != stash_ref.lower():
+        return None
+    verified = subprocess.run(
+        git_cmd + ["cat-file", "-e", f"{matches[0]}^{{commit}}"],
+        cwd=root,
+        capture_output=True,
+    )
+    if verified.returncode != 0:
+        return None
+    return matches[0]
+
+
+def _refresh_transaction_stash_identity(
+    git_cmd: list[str], root: Path, context: ReleaseUpgradeContext
+) -> str | None:
+    """Resolve and durably confirm one immutable stash for this marker."""
+
+    journal = context.journal
+    current = journal.get("stash_sha")
+    if journal.get("stash_capture_confirmed") and isinstance(current, str):
+        if _SHA_RE.fullmatch(current):
+            verified = subprocess.run(
+                git_cmd + ["cat-file", "-e", f"{current}^{{commit}}"],
+                cwd=root,
+                capture_output=True,
+            )
+            if verified.returncode == 0:
+                return current.lower()
+        return None
+
+    marker = journal.get("stash_marker")
+    if not marker:
+        return None
+    listing = subprocess.run(
+        git_cmd + ["stash", "list", "--format=%H%x00%gs"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if listing.returncode != 0:
+        return None
+    matches: list[str] = []
+    for line in listing.stdout.splitlines():
+        commit, separator, subject = line.partition("\0")
+        commit = commit.strip()
+        if separator and marker in subject and _SHA_RE.fullmatch(commit):
+            matches.append(commit.lower())
+    if len(matches) != 1:
+        return None
+    commit = matches[0]
+    verified = subprocess.run(
+        git_cmd + ["cat-file", "-e", f"{commit}^{{commit}}"],
+        cwd=root,
+        capture_output=True,
+    )
+    if verified.returncode != 0:
+        return None
+    _journal_update(
+        context,
+        "stash-pending",
+        stash_sha=commit,
+        stash_pending=True,
+        stash_capture_confirmed=True,
+        stash_capture_uncertain=False,
+    )
+    return commit
+
+
+def _transaction_is_promoted(
+    git_cmd: list[str], root: Path, context: ReleaseUpgradeContext
+) -> bool:
+    journal = context.journal
+    candidate_sha = journal.get("candidate_sha")
+    if not isinstance(candidate_sha, str) or not _SHA_RE.fullmatch(candidate_sha):
+        return False
+    live_sha = _git_resolve_commit(
+        git_cmd, root, f"refs/heads/{journal.get('maintenance_branch', 'hermes-release')}"
+    )
+    return live_sha == candidate_sha and journal.get("phase") in {
+        "promoting",
+        "promoted",
+        "promotion-needs-recovery",
+        "candidate-cleanup",
+        "candidate-cleanup-failed",
+        "finalizing",
+        "stash-restore-conflict",
+        "finalized",
+    }
+
+
+def _restore_original_release_checkout(
+    git_cmd: list[str], root: Path, context: ReleaseUpgradeContext
+) -> None:
+    journal = context.journal
+    original_branch = journal.get("original_branch")
+    original_sha = journal["original_head_sha"]
+    promoted = _transaction_is_promoted(git_cmd, root, context)
+    if original_branch:
+        checkout = subprocess.run(
+            git_cmd + ["checkout", "--force", original_branch],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if checkout.returncode != 0:
+            detail = (checkout.stderr or checkout.stdout or "").strip()
+            raise RuntimeError(
+                f"Could not restore original branch '{original_branch}'"
+                + (f": {detail.splitlines()[0]}" if detail else "")
+            )
+        expected_sha = original_sha
+        if promoted and original_branch == journal.get("maintenance_branch"):
+            expected_sha = journal.get("candidate_sha") or original_sha
+        actual_branch = subprocess.run(
+            git_cmd + ["symbolic-ref", "--quiet", "--short", "HEAD"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        actual_sha = _git_resolve_commit(git_cmd, root, "HEAD")
+        if (
+            actual_branch.returncode != 0
+            or actual_branch.stdout.strip() != original_branch
+            or actual_sha != expected_sha
+        ):
+            raise RuntimeError(
+                f"Original branch restore did not verify: expected "
+                f"{original_branch}@{expected_sha}, got "
+                f"{actual_branch.stdout.strip() or 'detached'}@{actual_sha}"
+            )
+        return
+
+    checkout = subprocess.run(
+        git_cmd + ["checkout", "--detach", original_sha],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if checkout.returncode != 0:
+        detail = (checkout.stderr or checkout.stdout or "").strip()
+        raise RuntimeError(
+            "Could not restore original detached HEAD"
+            + (f": {detail.splitlines()[0]}" if detail else "")
+        )
+    actual_sha = _git_resolve_commit(git_cmd, root, "HEAD")
+    actual_branch = subprocess.run(
+        git_cmd + ["rev-parse", "--abbrev-ref", "HEAD"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if actual_sha != original_sha or actual_branch.stdout.strip() != "HEAD":
+        raise RuntimeError(
+            f"Detached HEAD restore did not verify: expected {original_sha}, "
+            f"got {actual_branch.stdout.strip()}@{actual_sha}"
+        )
+
+
+def _release_finalization_marker_state(journal: dict) -> str:
+    """Classify the context marker before any live-worktree inspection."""
+
+    phase = journal.get("phase")
+    state = journal.get("state")
+    verified = journal.get("final_state_verified")
+    finalized = journal.get("finalized")
+    if phase == "finalized":
+        if verified is not True:
+            return "inconsistent"
+        if state is not None and state != "finalized":
+            return "inconsistent"
+        if finalized is not None and finalized is not True:
+            return "inconsistent"
+        return "verified"
+    if verified is True or finalized is True or state == "finalized":
+        return "inconsistent"
+    return "unfinalized"
+
+
+_TERMINAL_RECONCILIATION_REQUIRED_FIELDS = frozenset(
+    {
+        "version",
+        "transaction_id",
+        "phase",
+        "state",
+        "original_branch",
+        "original_ref",
+        "original_head_sha",
+        "maintenance_branch",
+        "maintenance_old_sha",
+        "old_sha",
+        "release_tag",
+        "base_sha",
+        "target_sha",
+        "backup_ref",
+        "backup_created",
+        "candidate_branch",
+        "candidate_path",
+        "candidate_sha",
+        "candidate_cleanup",
+        "payload_path",
+        "payload_sha256",
+        "payload_bytes",
+        "stash_marker",
+        "stash_sha",
+        "local_state_present",
+        "stash_capture_required",
+        "stash_capture_confirmed",
+        "stash_capture_uncertain",
+        "stash_pending",
+        "stash_apply_attempted",
+        "stash_applied",
+        "checkout_restored",
+        "final_state_verified",
+    }
+)
+_TERMINAL_RECONCILIATION_BOOL_FIELDS = frozenset(
+    {
+        "backup_created",
+        "candidate_cleanup",
+        "stash_capture_confirmed",
+        "stash_capture_uncertain",
+        "stash_pending",
+        "stash_apply_attempted",
+        "stash_applied",
+        "checkout_restored",
+        "final_state_verified",
+        "candidate_created",
+        "finalized",
+    }
+)
+_TERMINAL_RECONCILIATION_SHA_FIELDS = (
+    "original_head_sha",
+    "maintenance_old_sha",
+    "old_sha",
+    "base_sha",
+    "target_sha",
+    "candidate_sha",
+)
+
+
+def _terminal_journal_digest(journal: dict) -> str:
+    """Return the digest of the exact in-memory pre-terminal journal."""
+
+    encoded = json.dumps(
+        journal,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _validate_terminal_reconciliation_paths(
+    context: ReleaseUpgradeContext,
+) -> tuple[Path, Path]:
+    """Validate the fixed transaction/journal path topology without Git."""
+
+    common = Path(context.common_dir)
+    transactions = common / "hermes-upgrade-transactions"
+    transaction_dir = Path(context.transaction_dir)
+    journal_path = Path(context.journal_path)
+    if not common.is_absolute() or not transaction_dir.is_absolute() or not journal_path.is_absolute():
+        raise RuntimeError("Uncertain terminal journal paths must be absolute.")
+    if transaction_dir.parent != transactions:
+        raise RuntimeError("Uncertain terminal journal transaction directory escaped its root.")
+    if journal_path != transaction_dir / "journal.json":
+        raise RuntimeError("Uncertain terminal journal path escaped its transaction directory.")
+
+    for directory, label in (
+        (common, "Git common directory"),
+        (transactions, "release transactions directory"),
+    ):
+        try:
+            info = directory.lstat()
+        except OSError as exc:
+            raise RuntimeError(f"Could not inspect {label}: {directory}") from exc
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise RuntimeError(f"Refusing non-directory {label}: {directory}")
+
+    try:
+        transaction_info = transaction_dir.lstat()
+    except FileNotFoundError:
+        return transactions, transaction_dir
+    except OSError as exc:
+        raise RuntimeError(
+            f"Could not inspect uncertain release transaction directory: {transaction_dir}"
+        ) from exc
+    if stat.S_ISLNK(transaction_info.st_mode) or not stat.S_ISDIR(transaction_info.st_mode):
+        raise RuntimeError(
+            f"Refusing non-directory uncertain release transaction: {transaction_dir}"
+        )
+    return transactions, transaction_dir
+
+
+def _validate_terminal_reconciliation_journal(
+    context: ReleaseUpgradeContext,
+    journal: object,
+    *,
+    terminal: bool,
+) -> dict:
+    """Validate the strict schema needed before filesystem-only reconciliation."""
+
+    if not isinstance(journal, dict):
+        raise RuntimeError("Uncertain terminal journal is not a JSON object.")
+    missing = _TERMINAL_RECONCILIATION_REQUIRED_FIELDS.difference(journal)
+    if missing:
+        raise RuntimeError(
+            "Uncertain terminal journal is missing control fields: "
+            + ", ".join(sorted(missing))
+        )
+    marker_state = _release_finalization_marker_state(journal)
+    expected_state = "verified" if terminal else "unfinalized"
+    if marker_state != expected_state:
+        raise RuntimeError(
+            f"Uncertain terminal journal has invalid marker state {marker_state!r}; "
+            f"expected {expected_state!r}."
+        )
+    if terminal:
+        if (
+            journal.get("phase") != "finalized"
+            or journal.get("state") != "finalized"
+            or journal.get("final_state_verified") is not True
+            or journal.get("finalized") is not True
+        ):
+            raise RuntimeError("Uncertain terminal journal terminal controls are not exact.")
+    elif journal.get("final_state_verified") is not False:
+        raise RuntimeError("Uncertain terminal journal prior marker is not explicitly nonterminal.")
+    if journal.get("version") != 2:
+        raise RuntimeError("Uncertain terminal journal has an unsupported version.")
+
+    transaction_dir = Path(context.transaction_dir)
+    transaction_id = journal.get("transaction_id")
+    if not isinstance(transaction_id, str) or transaction_id != transaction_dir.name:
+        raise RuntimeError("Uncertain terminal journal transaction identity mismatch.")
+
+    original_branch = journal.get("original_branch")
+    original_ref = journal.get("original_ref")
+    if original_branch is not None and (
+        not isinstance(original_branch, str)
+        or not original_branch
+        or original_ref != f"refs/heads/{original_branch}"
+    ):
+        raise RuntimeError("Uncertain terminal journal original branch/ref is invalid.")
+    if original_branch is None and original_ref is not None:
+        raise RuntimeError("Uncertain terminal journal has a ref without an original branch.")
+
+    for field in _TERMINAL_RECONCILIATION_SHA_FIELDS:
+        value = journal.get(field)
+        if not isinstance(value, str) or _SHA_RE.fullmatch(value) is None:
+            raise RuntimeError(f"Uncertain terminal journal has an invalid {field}.")
+    stash_sha = journal.get("stash_sha")
+    if stash_sha is not None and (
+        not isinstance(stash_sha, str) or _SHA_RE.fullmatch(stash_sha) is None
+    ):
+        raise RuntimeError("Uncertain terminal journal has an invalid stash SHA.")
+    payload_sha256 = journal.get("payload_sha256")
+    if not isinstance(payload_sha256, str) or re.fullmatch(r"[0-9a-fA-F]{64}", payload_sha256) is None:
+        raise RuntimeError("Uncertain terminal journal has an invalid payload digest.")
+    payload_bytes = journal.get("payload_bytes")
+    if not isinstance(payload_bytes, int) or isinstance(payload_bytes, bool) or payload_bytes < 0:
+        raise RuntimeError("Uncertain terminal journal has an invalid payload length.")
+
+    payload_path = journal.get("payload_path")
+    expected_payload = transaction_dir / "runtime-local-maintenance.patch"
+    if not isinstance(payload_path, str) or Path(payload_path) != expected_payload:
+        raise RuntimeError("Uncertain terminal journal payload path escaped its transaction directory.")
+    for field in (
+        "maintenance_branch",
+        "release_tag",
+        "stash_marker",
+        "backup_ref",
+        "candidate_branch",
+        "candidate_path",
+    ):
+        if not isinstance(journal.get(field), str) or not journal[field]:
+            raise RuntimeError(f"Uncertain terminal journal has an invalid {field}.")
+    if journal["backup_ref"] != f"refs/hermes-upgrade/backups/{transaction_id}":
+        raise RuntimeError("Uncertain terminal journal backup ref does not belong to this transaction.")
+    if journal["candidate_branch"] != f"hermes-upgrade-candidate/{transaction_id}":
+        raise RuntimeError("Uncertain terminal journal candidate branch does not belong to this transaction.")
+    if not Path(journal["candidate_path"]).is_absolute():
+        raise RuntimeError("Uncertain terminal journal candidate path is not absolute.")
+
+    if journal.get("local_state_present") not in (None, True, False):
+        raise RuntimeError("Uncertain terminal journal has an invalid local-state flag.")
+    if journal.get("stash_capture_required") not in (None, True, False):
+        raise RuntimeError("Uncertain terminal journal has an invalid stash-capture flag.")
+    for field in _TERMINAL_RECONCILIATION_BOOL_FIELDS:
+        if field in journal and not isinstance(journal[field], bool):
+            raise RuntimeError(f"Uncertain terminal journal has an invalid {field} flag.")
+    if journal.get("state") != journal.get("phase"):
+        raise RuntimeError("Uncertain terminal journal phase/state controls disagree.")
+    return journal
+
+
+def _read_uncertain_terminal_journal(context: ReleaseUpgradeContext) -> dict:
+    """Read the journal for reconciliation while rejecting unsafe entries."""
+
+    transactions, transaction_dir = _validate_terminal_reconciliation_paths(context)
+    journal_path = Path(context.journal_path)
+    try:
+        return _read_release_transaction_journal(
+            transaction_dir,
+            journal_path=journal_path,
+            expected_transactions_dir=transactions,
+        )
+    except _ReleaseJournalReadError as exc:
+        if exc.kind == "missing":
+            raise RuntimeError(
+                "Uncertain terminal journal is missing; refusing to infer completion."
+            ) from None
+        if exc.kind == "oversize":
+            raise RuntimeError(
+                "Uncertain terminal journal exceeds the maximum allowed size; refusing to infer completion."
+            ) from None
+        if exc.kind == "unsafe":
+            raise RuntimeError(
+                "Refusing non-regular, symlinked, or unsafe uncertain terminal journal."
+            ) from None
+        if exc.kind == "changed":
+            raise RuntimeError(
+                "Uncertain terminal journal changed while being read; refusing to infer completion."
+            ) from None
+        if exc.kind == "invalid":
+            raise RuntimeError(
+                "Uncertain terminal journal is unreadable or invalid JSON."
+            ) from None
+        raise RuntimeError(
+            "Could not read uncertain terminal journal; refusing to infer completion."
+        ) from None
+
+
+def _reconcile_uncertain_final_marker(context: ReleaseUpgradeContext) -> bool:
+    """Reconcile a possibly-replaced terminal marker without touching Git."""
+
+    prior = context.journal
+    candidate = context.final_marker_candidate
+    if context.final_marker_write_uncertain is not True:
+        raise RuntimeError("Terminal marker reconciliation was requested without an uncertainty latch.")
+    if type(prior) is not dict or type(candidate) is not dict:
+        raise RuntimeError("Uncertain terminal marker state is incomplete; preserving evidence.")
+    _validate_terminal_reconciliation_journal(context, prior, terminal=False)
+    if not isinstance(context.final_marker_prior_digest, str):
+        raise RuntimeError("Uncertain terminal marker has no immutable prior-journal digest.")
+    if _terminal_journal_digest(prior) != context.final_marker_prior_digest:
+        raise RuntimeError("Uncertain terminal marker prior journal was mutated in memory.")
+
+    expected_candidate = dict(prior)
+    expected_candidate.update(
+        {
+            "phase": "finalized",
+            "state": "finalized",
+            "final_state_verified": True,
+            "finalized": True,
+        }
+    )
+    if candidate != expected_candidate:
+        raise RuntimeError("Uncertain terminal marker candidate no longer matches its prior journal.")
+    _validate_terminal_reconciliation_journal(context, candidate, terminal=True)
+
+    disk = _read_uncertain_terminal_journal(context)
+    if disk != prior and disk != candidate:
+        raise RuntimeError(
+            "Uncertain terminal journal does not match either the exact prior or terminal candidate; "
+            "preserving evidence."
+        )
+
+    try:
+        _write_transaction_journal(
+            context.common_dir, candidate, path=context.journal_path
+        )
+    except BaseException:
+        # The context must remain nonterminal and latched even if this retry
+        # reaches replace before the required child-directory fsync fails.
+        context.final_marker_write_uncertain = True
+        raise
+
+    context.journal.clear()
+    context.journal.update(candidate)
+    context.final_marker_write_uncertain = False
+    context.final_marker_candidate = None
+    context.final_marker_prior_digest = None
+    return _acknowledge_finalized_release(context)
+
+
+
+def _acknowledge_finalized_release(context: ReleaseUpgradeContext) -> bool:
+    """Remove known terminal evidence and durably acknowledge its directory entries."""
+
+    transaction_dir = context.transaction_dir
+    transactions = transaction_dir.parent
+    try:
+        transaction_info = transaction_dir.lstat()
+    except FileNotFoundError:
+        # A prior attempt may have removed the child before losing the root
+        # directory fsync.  Retrying this filesystem-only acknowledgment is
+        # safe and repairs that final durability step.
+        _fsync_directory(transactions, required=True)
+        return True
+    if stat.S_ISLNK(transaction_info.st_mode) or not stat.S_ISDIR(
+        transaction_info.st_mode
+    ):
+        raise RuntimeError(f"Refusing non-directory release transaction: {transaction_dir}")
+
+    known_entries = (
+        context.journal_path,
+        transaction_dir / "runtime-local-maintenance.patch",
+    )
+    for entry in known_entries:
+        try:
+            entry_info = entry.lstat()
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(entry_info.st_mode) or not stat.S_ISREG(entry_info.st_mode):
+            raise RuntimeError(f"Refusing non-regular release transaction evidence: {entry}")
+        entry.unlink()
+
+    # The known evidence is gone, but unknown entries are deliberately not
+    # removed.  If one remains, rmdir fails closed and the terminal context is
+    # retained for a later acknowledgment retry.
+    _fsync_directory(transaction_dir, required=True)
+    try:
+        transaction_dir.rmdir()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        logger.warning(
+            "Release transaction acknowledgment retained unknown evidence in %s: %s",
+            transaction_dir,
+            exc,
+        )
+        return False
+    _fsync_directory(transactions, required=True)
+    return True
+
+
+
+def _mark_release_finalized(context: ReleaseUpgradeContext) -> None:
+    """Persist the terminal marker before exposing it to retry logic."""
+
+    prior_journal = dict(context.journal)
+    terminal_journal = dict(prior_journal)
+    terminal_journal.update(
+        {
+            "phase": "finalized",
+            "state": "finalized",
+            "final_state_verified": True,
+            "finalized": True,
+        }
+    )
+    context.final_marker_candidate = dict(terminal_journal)
+    context.final_marker_prior_digest = _terminal_journal_digest(prior_journal)
+    try:
+        _write_transaction_journal(
+            context.common_dir, terminal_journal, path=context.journal_path
+        )
+    except BaseException:
+        # os.replace may already have made the terminal bytes visible when the
+        # required child-directory fsync fails.  Keep the live context
+        # nonterminal, but latch the exact candidate before propagating.
+        context.final_marker_write_uncertain = True
+        raise
+    context.journal.clear()
+    context.journal.update(terminal_journal)
+    context.final_marker_write_uncertain = False
+    context.final_marker_candidate = None
+    context.final_marker_prior_digest = None
+
+
+def _release_expected_original_clean_snapshot(
+    original: ReleaseGitSnapshot,
+    candidate: ReleaseGitSnapshot | None,
+) -> ReleaseGitSnapshot:
+    """Build the clean checkout expected immediately before stash apply."""
+    if candidate is not None and original.symbolic_head == candidate.maintenance_ref:
+        head_sha = candidate.head_sha
+        head_tree_sha = candidate.head_tree_sha
+    else:
+        head_sha = original.head_sha
+        head_tree_sha = original.head_tree_sha
+    maintenance_ref_sha = candidate.maintenance_ref_sha if candidate else original.maintenance_ref_sha
+    return _release_clean_snapshot(
+        original,
+        symbolic_head=original.symbolic_head,
+        head_sha=head_sha,
+        maintenance_ref_sha=maintenance_ref_sha,
+        head_tree_sha=head_tree_sha,
+    )
+
+
+def _release_cleanup_candidate(
+    git_cmd: list[str], root: Path, context: ReleaseUpgradeContext
+) -> bool:
+    journal = context.journal
+    transaction_id = journal.get("transaction_id")
+    transactions = context.common_dir / "hermes-upgrade-transactions"
+    transaction_dir = Path(context.transaction_dir)
+    if (
+        not isinstance(transaction_id, str)
+        or not re.fullmatch(r"[0-9a-f]{32}", transaction_id)
+        or transaction_dir.parent != transactions
+        or transaction_dir.name != transaction_id
+    ):
+        logger.warning(
+            "Refusing release candidate cleanup for an untrusted transaction topology: %s",
+            context.journal_path,
+        )
+        return False
+
+    expected_candidate_path = context.common_dir.parent.parent / (
+        f"hermes-upgrade-candidate-{transaction_id}"
+    )
+    candidate_path_value = journal.get("candidate_path")
+    candidate_branch = journal.get("candidate_branch")
+    if (
+        not isinstance(candidate_path_value, str)
+        or Path(candidate_path_value) != expected_candidate_path
+        or not isinstance(candidate_branch, str)
+        or candidate_branch != f"hermes-upgrade-candidate/{transaction_id}"
+    ):
+        logger.warning(
+            "Refusing release candidate cleanup for an escaped candidate path or branch: %s",
+            context.journal_path,
+        )
+        return False
+    candidate_path = expected_candidate_path
+    try:
+        candidate_info = candidate_path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return False
+    if stat.S_ISLNK(candidate_info.st_mode) or not stat.S_ISDIR(candidate_info.st_mode):
+        logger.warning("Refusing non-directory release candidate cleanup path: %s", candidate_path)
+        return False
+    cleanup = subprocess.run(
+        git_cmd + ["worktree", "remove", "--force", str(candidate_path)],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if cleanup.returncode != 0:
+        return False
+    branch_cleanup = subprocess.run(
+        git_cmd + ["branch", "-D", candidate_branch],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    return (
+        branch_cleanup.returncode == 0
+        and _git_resolve_commit(git_cmd, root, f"refs/heads/{candidate_branch}") is None
+        and not candidate_path.exists()
+    )
+
+
+def _finalize_release_upgrade(
+    git_cmd: list[str],
+    cwd: Path | str,
+    context: ReleaseUpgradeContext,
+    *,
+    input_fn=None,
+) -> bool:
+    """Restore the original checkout and apply/drop the immutable stash once."""
+
+    root = Path(cwd).resolve()
+    if context.final_marker_write_uncertain is True:
+        # A terminal marker write may have replaced the file before its
+        # required child-directory fsync failed.  Reconcile only the journal;
+        # never inspect or mutate the live Git checkout on this retry.
+        try:
+            return _reconcile_uncertain_final_marker(context)
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException as exc:
+            logger.warning(
+                "Uncertain terminal marker reconciliation did not complete; journal retained at %s: %s",
+                context.journal_path,
+                exc,
+            )
+            print(f"⚠ Release user-state recovery is incomplete; journal: {context.journal_path}")
+            return False
+    if (
+        context.final_marker_write_uncertain is not False
+        or context.final_marker_candidate is not None
+        or context.final_marker_prior_digest is not None
+    ):
+        logger.error(
+            "Refusing release finalization with invalid in-memory terminal marker state: %s",
+            context.journal_path,
+        )
+        print(f"✗ Release finalization marker state is invalid; journal: {context.journal_path}")
+        return False
+    journal = context.journal
+    try:
+        marker_state = _release_finalization_marker_state(journal)
+        if marker_state == "verified":
+            # The final live state was already verified.  Only acknowledge the
+            # durable journal; never re-inspect or mutate the checkout.
+            return _acknowledge_finalized_release(context)
+        if marker_state == "inconsistent":
+            logger.error(
+                "Refusing to replay release finalization with an inconsistent "
+                "terminal journal marker: %s",
+                context.journal_path,
+            )
+            print(
+                "✗ Release finalization has an inconsistent terminal marker; "
+                "refusing destructive cleanup."
+            )
+            print(f"  Recovery journal retained at {context.journal_path}")
+            return False
+        try:
+            context.journal_path.lstat()
+        except FileNotFoundError:
+            # Journal absence is not proof that first finalization completed.
+            print(
+                "✗ Release finalization journal is missing before terminal "
+                "verification; refusing destructive cleanup."
+            )
+            print(f"  Expected recovery journal at {context.journal_path}")
+            return False
+        except OSError as exc:
+            logger.warning(
+                "Could not inspect release finalization journal %s: %s",
+                context.journal_path,
+                exc,
+            )
+            print(f"⚠ Release user-state recovery is incomplete; journal: {context.journal_path}")
+            return False
+
+        if _release_has_manual_interference(context):
+            print(
+                "✗ Release finalization detected manual Git interference; "
+                "refusing destructive recovery."
+            )
+            print(f"  Recovery journal retained at {context.journal_path}")
+            return False
+
+        if journal.get("stash_capture_uncertain") and not journal.get(
+            "stash_capture_confirmed"
+        ):
+            stash_sha = None
+        elif journal.get("stash_pending"):
+            stash_sha = _refresh_transaction_stash_identity(git_cmd, root, context)
+        else:
+            stash_sha = journal.get("stash_sha") if journal.get("stash_capture_confirmed") else None
+        stash_pending = bool(journal.get("stash_pending"))
+        stash_capture_required = journal.get("stash_capture_required")
+        stash_capture_confirmed = bool(journal.get("stash_capture_confirmed"))
+        if stash_capture_required is not False and not stash_capture_confirmed:
+            _journal_update(
+                context,
+                "stash-capture-uncertain",
+                stash_sha=None,
+                stash_pending=False,
+                stash_capture_confirmed=False,
+                stash_capture_uncertain=True,
+            )
+            print(
+                "✗ Stash capture is unconfirmed; refusing reset, clean, checkout, "
+                "stash apply/drop, and journal deletion."
+            )
+            print(f"  Recovery journal retained at {context.journal_path}")
+            print(
+                f"  Inspect marker {journal.get('stash_marker')!r} with: "
+                "git stash list --format='%gd %H %s'"
+            )
+            print("  Do not retry destructive cleanup until one immutable SHA is confirmed.")
+            return False
+        if stash_pending and not stash_sha:
+            print(
+                "✗ Release update still has an unidentified pending stash; "
+                f"journal: {context.journal_path}"
+            )
+            print(
+                f"  Search for marker {journal.get('stash_marker')!r} with: "
+                "git stash list --format='%gd %H %s'"
+            )
+            return False
+
+        if stash_pending and journal.get("stash_apply_attempted") and not journal.get(
+            "stash_applied"
+        ):
+            assert stash_sha is not None
+            _journal_update(context, "stash-restore-conflict")
+            print(
+                "✗ Release user-state restore was already attempted and remains "
+                "unresolved; leaving the immutable stash untouched."
+            )
+            print(f"  Recovery journal retained at {context.journal_path}")
+            _print_stash_cleanup_guidance(stash_sha)
+            return False
+
+        # The exact snapshot is the preparation step.  Never reset or clean a
+        # release checkout to make it fit an expectation: any mismatch is
+        # manual interference and therefore a zero-mutator failure.
+        candidate_snapshot: ReleaseGitSnapshot | None = None
+        try:
+            guard_identity_only = False
+            if journal.get("checkout_restored"):
+                guard_key = (
+                    "restored_snapshot" if journal.get("stash_applied")
+                    else "restore_clean_snapshot"
+                )
+                guard_snapshot = _release_context_snapshot(context, guard_key)
+                guard_identity_only = bool(journal.get("stash_applied"))
+                if not guard_identity_only and not _release_snapshot_is_clean(guard_snapshot):
+                    raise ReleaseGitStateError(
+                        "Stored pre-apply release checkout is not clean."
+                    )
+            elif "candidate_snapshot" in journal:
+                candidate_snapshot = _release_context_snapshot(context, "candidate_snapshot")
+                if not _release_snapshot_is_clean(candidate_snapshot):
+                    raise ReleaseGitStateError(
+                        "Stored promoted release checkout is not clean."
+                    )
+                guard_snapshot = candidate_snapshot
+            elif "post_cas_snapshot" in journal:
+                # The CAS has moved the maintenance ref, but a failed live
+                # synchronization can leave the old index/worktree temporarily
+                # skewed from that ref.  This exact snapshot is the only
+                # authorized recovery entry for that phase; it is intentionally
+                # not classified as a clean checkout.
+                guard_snapshot = _release_context_snapshot(context, "post_cas_snapshot")
+            elif "maintenance_snapshot" in journal:
+                guard_snapshot = _release_context_snapshot(context, "maintenance_snapshot")
+                if not _release_snapshot_is_clean(guard_snapshot):
+                    raise ReleaseGitStateError(
+                        "Stored maintenance checkout is not clean."
+                    )
+            elif "post_stash_snapshot" in journal:
+                guard_snapshot = _release_context_snapshot(context, "post_stash_snapshot")
+                if not _release_snapshot_is_clean(guard_snapshot):
+                    raise ReleaseGitStateError(
+                        "Stored post-stash checkout is not clean."
+                    )
+            else:
+                raise ReleaseGitStateError(
+                    "No bound clean release snapshot is available for finalization."
+                )
+            if guard_identity_only:
+                _validate_release_restored_snapshot_identity(
+                    git_cmd,
+                    root,
+                    guard_snapshot,
+                    label="finalization entry",
+                )
+            else:
+                _validate_release_git_snapshot(
+                    git_cmd,
+                    root,
+                    guard_snapshot,
+                    label="finalization entry",
+                )
+        except Exception as exc:
+            _release_mark_manual_interference(context, f"finalization incomplete: {exc}")
+            print(
+                "✗ Release finalization detected live checkout interference; "
+                "no reset, clean, checkout, stash apply, or stash drop was run."
+            )
+            print(f"  Recovery journal retained at {context.journal_path}")
+            return False
+
+        prior_phase = journal.get("phase")
+        prior_stash_applied = bool(journal.get("stash_applied"))
+        _journal_update(context, "finalizing")
+        original_snapshot = _release_context_snapshot(context, "original_snapshot")
+        original_branch = journal.get("original_branch")
+        maintenance_branch = journal.get("maintenance_branch", "hermes-release")
+        was_checkout_restored = bool(journal.get("checkout_restored"))
+        candidate_promotion_incomplete = False
+        if (
+            "post_cas_snapshot" in journal
+            and "candidate_snapshot" not in journal
+            and _transaction_is_promoted(git_cmd, root, context)
+        ):
+            post_cas_snapshot = _release_context_snapshot(context, "post_cas_snapshot")
+            candidate_sha = journal.get("candidate_sha")
+            if not isinstance(candidate_sha, str) or _SHA_RE.fullmatch(candidate_sha) is None:
+                raise ReleaseGitStateError("Promotion recovery candidate SHA is malformed.")
+            candidate_tree_sha = _release_git_sha(
+                git_cmd,
+                root,
+                ["rev-parse", "--verify", f"{candidate_sha}^{{tree}}"],
+                label="promotion recovery candidate tree",
+            )
+            candidate_snapshot = _release_clean_snapshot(
+                post_cas_snapshot,
+                symbolic_head=maintenance_branch,
+                head_sha=candidate_sha,
+                maintenance_ref_sha=candidate_sha,
+                head_tree_sha=candidate_tree_sha,
+            )
+            candidate_promotion_incomplete = True
+        if not was_checkout_restored:
+            # A promoted checkout on the maintenance branch is already the
+            # correct clean state; do not replay even a same-branch checkout.
+            needs_checkout = (
+                candidate_promotion_incomplete
+                or (
+                    candidate_snapshot is not None
+                    and original_branch != maintenance_branch
+                )
+            ) or (
+                candidate_snapshot is None
+                and original_branch != maintenance_branch
+            ) or (
+                candidate_snapshot is None
+                and "maintenance_snapshot" in journal
+            )
+            if needs_checkout:
+                if guard_identity_only:
+                    _validate_release_restored_snapshot_identity(
+                        git_cmd,
+                        root,
+                        guard_snapshot,
+                        label="immediate pre-original-checkout restoration",
+                    )
+                else:
+                    _validate_release_git_snapshot(
+                        git_cmd,
+                        root,
+                        guard_snapshot,
+                        label="immediate pre-original-checkout restoration",
+                    )
+                _restore_original_release_checkout(git_cmd, root, context)
+            restore_clean_snapshot = _release_expected_original_clean_snapshot(
+                original_snapshot,
+                candidate_snapshot,
+            )
+            try:
+                _validate_release_git_snapshot(
+                    git_cmd,
+                    root,
+                    restore_clean_snapshot,
+                    label="pre-stash-apply checkout",
+                )
+            except Exception as exc:
+                _release_mark_manual_interference(context, f"finalization incomplete: {exc}")
+                print(f"  Recovery journal retained at {context.journal_path}")
+                return False
+            _release_snapshot_with_journal(
+                context,
+                "restore_clean_snapshot",
+                restore_clean_snapshot,
+                checkout_restored=True,
+            )
+            was_checkout_restored = True
+        else:
+            restore_clean_snapshot = _release_context_snapshot(
+                context, "restore_clean_snapshot"
+            )
+
+        final_snapshot: ReleaseGitSnapshot = restore_clean_snapshot
+        if stash_pending:
+            assert stash_sha is not None
+            if not journal.get("stash_apply_attempted"):
+                if (
+                    subprocess.run(
+                        git_cmd + ["cat-file", "-e", f"{stash_sha}^{{commit}}"],
+                        cwd=root,
+                        capture_output=True,
+                    ).returncode
+                    != 0
+                ):
+                    raise RuntimeError(
+                        f"Immutable stash {stash_sha} is no longer reachable; "
+                        f"journal: {context.journal_path}"
+                    )
+                # This is the last read-only guard before the first necessary
+                # live mutator, stash apply.  The preceding checkout was
+                # separately verified against the clean restore snapshot.
+                _validate_release_git_snapshot(
+                    git_cmd,
+                    root,
+                    restore_clean_snapshot,
+                    label="immediate pre-stash-apply checkout",
+                )
+                _journal_update(context, stash_apply_attempted=True)
+                restored = _restore_stashed_changes(
+                    git_cmd,
+                    root,
+                    stash_sha,
+                    prompt_user=False,
+                    input_fn=input_fn,
+                    restore_index=True,
+                    drop_stash=False,
+                    preserve_conflict_state=True,
+                )
+                if not restored:
+                    _journal_update(context, "stash-restore-conflict")
+                    print(f"  Recovery journal retained at {context.journal_path}")
+                    _print_stash_cleanup_guidance(
+                        stash_sha, _resolve_stash_selector(git_cmd, root, stash_sha)
+                    )
+                    return False
+                try:
+                    restored_snapshot = _validate_release_restored_snapshot_identity(
+                        git_cmd,
+                        root,
+                        restore_clean_snapshot,
+                        label="post-stash-apply restoration",
+                    )
+                except Exception as exc:
+                    _release_mark_manual_interference(
+                        context, f"finalization incomplete: {exc}"
+                    )
+                    print(f"  Recovery journal retained at {context.journal_path}")
+                    return False
+                _release_snapshot_with_journal(
+                    context,
+                    "restored_snapshot",
+                    restored_snapshot,
+                    stash_applied=True,
+                )
+                final_snapshot = restored_snapshot
+            else:
+                final_snapshot = _release_context_snapshot(context, "restored_snapshot")
+                try:
+                    _validate_release_restored_snapshot_identity(
+                        git_cmd,
+                        root,
+                        final_snapshot,
+                        label="pre-stash-drop restoration",
+                    )
+                except Exception as exc:
+                    _release_mark_manual_interference(
+                        context, f"finalization incomplete: {exc}"
+                    )
+                    print(f"  Recovery journal retained at {context.journal_path}")
+                    return False
+
+            # Stash deletion is allowed only after the captured user-state
+            # snapshot still has the same immutable checkout identity.
+            selector = _resolve_stash_selector(git_cmd, root, stash_sha)
+            _validate_release_restored_snapshot_identity(
+                git_cmd,
+                root,
+                final_snapshot,
+                label="immediate pre-stash-drop restoration",
+            )
+            if selector is not None:
+                drop = subprocess.run(
+                    git_cmd + ["stash", "drop", selector],
+                    cwd=root,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+                if drop.returncode != 0:
+                    print(
+                        "⚠ Local changes were restored, but the immutable stash "
+                        "could not be dropped."
+                    )
+                    _print_stash_cleanup_guidance(stash_sha, selector)
+                    _journal_update(context, "stash-drop-failed")
+                    return False
+                if _resolve_stash_selector(git_cmd, root, stash_sha) is not None:
+                    _journal_update(context, "stash-drop-unverified")
+                    return False
+            _journal_update(context, stash_pending=False)
+        else:
+            if journal.get("stash_applied"):
+                final_snapshot = _release_context_snapshot(context, "restored_snapshot")
+                _validate_release_restored_snapshot_identity(
+                    git_cmd,
+                    root,
+                    final_snapshot,
+                    label="final restored checkout",
+                )
+            else:
+                _validate_release_git_snapshot(
+                    git_cmd,
+                    root,
+                    final_snapshot,
+                    label="final restored checkout",
+                )
+            _journal_update(context, stash_pending=False)
+
+        # Candidate evidence is retained until user bytes/index/status are
+        # verified restored.  Manual interference returned above before this
+        # point, so cleanup cannot erase evidence after a mismatch.
+        if journal.get("stash_applied"):
+            _validate_release_restored_snapshot_identity(
+                git_cmd,
+                root,
+                final_snapshot,
+                label="pre-candidate-cleanup restored checkout",
+            )
+        else:
+            _validate_release_git_snapshot(
+                git_cmd,
+                root,
+                final_snapshot,
+                label="pre-candidate-cleanup checkout",
+            )
+        candidate_cleanup_failed_before_restore = (
+            prior_phase == "candidate-cleanup-failed"
+            and not prior_stash_applied
+        )
+        if candidate_promotion_incomplete or (
+            journal.get("candidate_created") and "candidate_snapshot" not in journal
+        ):
+            _journal_update(
+                context,
+                "promotion-incomplete",
+                candidate_cleanup=False,
+            )
+            logger.warning(
+                "Release promotion did not reach a verified candidate; recovery journal kept at %s",
+                context.journal_path,
+            )
+            return False
+        if candidate_cleanup_failed_before_restore:
+            _journal_update(
+                context,
+                "candidate-cleanup-failed",
+                candidate_cleanup=False,
+            )
+            logger.warning(
+                "Release candidate cleanup remains incomplete; recovery journal kept at %s",
+                context.journal_path,
+            )
+            return False
+        if journal.get("candidate_created") and not journal.get("candidate_cleanup"):
+            if not _release_cleanup_candidate(git_cmd, root, context):
+                _journal_update(context, "candidate-cleanup-failed", candidate_cleanup=False)
+                logger.warning(
+                    "Release candidate cleanup failed; recovery journal kept at %s",
+                    context.journal_path,
+                )
+                return False
+            _journal_update(context, "candidate-cleanup", candidate_cleanup=True)
+
+        if journal.get("stash_applied"):
+            _validate_release_restored_snapshot_identity(
+                git_cmd,
+                root,
+                final_snapshot,
+                label="terminal restored checkout",
+            )
+        else:
+            _validate_release_git_snapshot(
+                git_cmd,
+                root,
+                final_snapshot,
+                label="terminal restored checkout",
+            )
+        _mark_release_finalized(context)
+        # Mark the verified terminal state before acknowledging journal removal.
+        # Any retry now takes the filesystem-only path above.
+        return _acknowledge_finalized_release(context)
+    except (KeyboardInterrupt, SystemExit):
+        # Preserve process-control exceptions after the terminal write latch has
+        # captured the candidate and kept the journal as recovery evidence.
+        raise
+    except BaseException as exc:
+        # A second Ctrl-C must not erase the only recovery evidence.  Preserve
+        # the journal and let an already-active exception continue propagating.
+        logger.warning(
+            "Release user-state finalization did not complete; journal retained at %s: %s",
+            context.journal_path,
+            exc,
+        )
+        print(f"⚠ Release user-state recovery is incomplete; journal: {context.journal_path}")
+        return False
+
+
+def _finalize_release_upgrade_for_orchestration(
+    git_cmd: list[str],
+    cwd: Path | str,
+    context: ReleaseUpgradeContext,
+    *,
+    input_fn=None,
+    primary_exc_info=None,
+) -> bool:
+    """Apply finalization precedence at the release orchestration boundary.
+
+    The transaction finalizer owns durable cleanup and its detailed warning.
+    This boundary is the sole owner of converting an otherwise-successful
+    ``False`` result into a command failure.  When a primary exception is
+    already active, every finalizer failure is logged and suppressed so the
+    original exception (including process-control exceptions) remains the one
+    that propagates.
+    """
+
+    primary = primary_exc_info[1] if primary_exc_info is not None else None
+    journal_path = getattr(context, "journal_path", "<unknown>")
+    try:
+        finalized = _finalize_release_upgrade(
+            git_cmd,
+            cwd,
+            context,
+            input_fn=input_fn,
+        )
+    except (KeyboardInterrupt, SystemExit) as exc:
+        if primary is None:
+            # With no primary operation failure, finalizer process-control
+            # semantics are authoritative and must not be converted to a
+            # normal upgrade error.
+            raise
+        logger.warning(
+            "Release finalizer raised %s while preserving the primary exception; "
+            "journal retained at %s",
+            type(exc).__name__,
+            journal_path,
+        )
+        return False
+    except BaseException as exc:
+        if primary is None:
+            raise ReleaseFinalizationIncompleteError(journal_path) from exc
+        logger.warning(
+            "Release finalizer raised %s while preserving the primary exception; "
+            "journal retained at %s",
+            type(exc).__name__,
+            journal_path,
+        )
+        return False
+
+    if finalized:
+        return True
+    if primary is not None:
+        logger.warning(
+            "Release finalization incomplete; preserving the primary exception; "
+            "journal retained at %s",
+            journal_path,
+        )
+        return False
+    raise ReleaseFinalizationIncompleteError(journal_path)
 
 
 _UPDATE_RUNTIME_RELOAD_MODULES = (
@@ -84,7 +4623,6 @@ def _reload_updated_runtime_modules() -> None:
                 logger.debug("Could not reload updated module %s: %s", module_name, exc)
     except Exception as exc:
         logger.debug("Could not refresh update runtime modules: %s", exc)
-
 
 def _reload_config_modules() -> None:
     """Force-reload modules from disk after git pull.
@@ -158,6 +4696,7 @@ def _run_migrate_config_fresh(*, interactive: bool = False, quiet: bool = False)
 # validates these and auto-rolls-back on failure.
 _UPDATE_CRITICAL_FILES = (
     "hermes_cli/main.py",
+    "hermes_cli/update_cmd.py",
     "hermes_cli/config.py",
     "hermes_cli/__init__.py",
     "hermes_cli/web_server.py",
@@ -182,45 +4721,444 @@ def _capture_head_sha(git_cmd, cwd) -> str | None:
     except (subprocess.CalledProcessError, OSError):
         return None
 
-def _validate_critical_files_syntax(root) -> tuple[bool, str | None, str | None]:
-    """Compile each file in ``_UPDATE_CRITICAL_FILES`` to catch SyntaxErrors.
 
-    These are the files imported on every ``hermes`` startup; if any of them
-    has a syntax error (orphan merge-conflict markers, bad ref to a name
-    that no longer exists, etc.) the CLI can't bootstrap at all. We validate
-    them after a successful ``git pull`` so we can auto-roll-back instead of
-    leaving the user with a bricked install.
+_LOCAL_PATCHES_DIRNAME = "local-patches"
+_LOCAL_PATCHES_README = """# Hermes local release patches
 
-    The compiled ``.pyc`` is written to a temp directory rather than the
-    source tree's ``__pycache__/`` so we don't race with concurrent test
-    workers that walk the same dir, and so we don't leave a stale pyc
-    behind in production if the next interpreter run picks a different
-    Python version. The pyc is discarded on function return either way —
-    we only care about the compile-or-not signal.
+These artifacts are maintained on the ``hermes-release`` branch.
 
-    Returns ``(ok, failing_path, error_message)``. ``ok=True`` means every
-    file parsed cleanly.
-    """
-    import py_compile
+``hermes upgrade`` captures user changes before any cleanup, generates the
+maintenance payload from committed Git history (not this file), replays it in
+a temporary candidate worktree with ``git apply --3way --index``, validates the
+candidate, and only then promotes it.  The generated patch is a portable,
+byte-safe snapshot for inspection and recovery; it is never the sole source of
+truth for an upgrade.
+
+The payload excludes this directory so the series cannot patch itself.  The
+JSON ``.release_base`` file records the human release tag, immutable base SHA,
+and patch hash/size.  A missing or stale patch artifact therefore cannot make a
+committed local change disappear.
+
+## Regenerate after editing local customizations
+
+Run ``hermes upgrade``.  It atomically refreshes this directory after the
+candidate has been committed and validated.  Manual edits to these artifacts
+are stashed and restored like every other user edit.
+
+## Keep out of this series
+
+- Mem0 sync_turns / infer_turns / api_url → ``$HERMES_HOME/plugins/mem0-local``
+  with ``memory.provider: mem0-local`` in config.yaml
+"""
+
+
+def _repo_local_patches_dir(cwd: Path | str | None = None) -> Path:
+    """In-repo ``local-patches/`` on the hermes-release branch."""
+    root = Path(cwd) if cwd is not None else Path(_m().PROJECT_ROOT)
+    return root / _LOCAL_PATCHES_DIRNAME
+
+
+def _home_local_patches_dir() -> Path:
+    """Legacy ``$HERMES_HOME/local-patches`` (migration / emergency fallback)."""
+    return Path(get_hermes_home()) / _LOCAL_PATCHES_DIRNAME
+
+
+def _patch_series_signature(patches: list[Path]) -> tuple[tuple[str, str], ...]:
+    """Return ordered patch names and byte hashes without exposing contents."""
+    signature = []
+    for path in patches:
+        try:
+            payload = path.read_bytes()
+        except OSError as exc:
+            raise RuntimeError(f"Could not read local patch {path}: {exc}") from exc
+        signature.append((path.name, hashlib.sha256(payload).hexdigest()))
+    return tuple(signature)
+
+
+def _select_local_patch_files(cwd: Path | str | None = None) -> list[Path]:
+    """Select one compatible repo/home patch series or fail closed on conflict."""
+    root = Path(cwd) if cwd is not None else Path(_m().PROJECT_ROOT)
+    repo_dir = _repo_local_patches_dir(root)
+    home_dir = _home_local_patches_dir()
+    repo_patches = list(_iter_patch_files(repo_dir))
+    home_patches = list(_iter_patch_files(home_dir))
+
+    if repo_patches and home_patches:
+        if _patch_series_signature(repo_patches) != _patch_series_signature(home_patches):
+            raise RuntimeError(
+                "Conflicting local patch series found in "
+                f"{repo_dir} and {home_dir}. Migrate to one location, or make "
+                "both series byte-identical, then re-run the update."
+            )
+        return repo_patches
+    return repo_patches or home_patches
+
+
+def _local_patches_dir(cwd: Path | str | None = None) -> Path:
+    """Prefer the repo patch series, checking legacy home state for conflicts."""
+    selected = _select_local_patch_files(cwd)
+    if selected:
+        return selected[0].parent
+    return _repo_local_patches_dir(cwd)
+
+
+def _iter_patch_files(patches_dir: Path):
+    if not patches_dir.is_dir():
+        return
+    for path in sorted(patches_dir.iterdir()):
+        try:
+            info = path.lstat()
+        except OSError:
+            continue
+        if (
+            stat.S_ISREG(info.st_mode)
+            and path.suffix == ".patch"
+            and not path.name.startswith(".")
+            and info.st_size > 0
+        ):
+            yield path
+
+
+def _list_local_release_patches(cwd: Path | str | None = None) -> list[Path]:
+    """Sorted ``*.patch`` files used to reapply local customizations after a release reset."""
+    return _select_local_patch_files(cwd)
+
+
+def _snapshot_local_release_patches(cwd: Path | str) -> list[tuple[str, str]]:
+    """Read the selected patch series before ``reset --hard`` removes its copies."""
+    snapshots: list[tuple[str, str]] = []
+    for path in _select_local_patch_files(cwd):
+        try:
+            content = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise RuntimeError(f"Could not read local patch {path}: {exc}") from exc
+        if not content.strip():
+            continue
+        snapshots.append((path.name, content))
+    return snapshots
+
+
+def _git_working_tree_dirty(git_cmd, cwd) -> bool:
+    result = subprocess.run(
+        git_cmd + ["status", "--porcelain"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    return bool(result.stdout.strip())
+
+
+def _apply_patch_text(git_cmd, cwd, name: str, content: str) -> None:
+    """Apply one patch from an in-memory snapshot via a temp file."""
     import tempfile
 
+    with tempfile.TemporaryDirectory(prefix="hermes-local-patch-") as tmp:
+        patch_path = Path(tmp) / name
+        patch_path.write_text(content, encoding="utf-8")
+        print(f"→ Applying local patch {name}...")
+        apply_result = subprocess.run(
+            git_cmd
+            + [
+                "apply",
+                "--3way",
+                "--whitespace=nowarn",
+                str(patch_path),
+            ],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if apply_result.returncode != 0:
+            apply_result = subprocess.run(
+                git_cmd + ["apply", "--whitespace=nowarn", str(patch_path)],
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+        if apply_result.returncode != 0:
+            err = (apply_result.stderr or apply_result.stdout or "").strip()
+            detail = err.splitlines()[0] if err else "git apply failed"
+            raise RuntimeError(
+                f"Could not apply local patch {name}: {detail}. "
+                f"Update files under {_LOCAL_PATCHES_DIRNAME}/ against the new "
+                "release, then re-run: hermes upgrade"
+            )
+
+
+def _refresh_local_release_patch_file(
+    git_cmd,
+    cwd,
+    release_tag: str,
+    *,
+    patch_body: str,
+) -> Path:
+    """Write the versioned ``local-patches/`` directory for ``patch_body``."""
+    patches_dir = _repo_local_patches_dir(cwd)
+    patches_dir.mkdir(parents=True, exist_ok=True)
+    primary = patches_dir / "0001-local-maintenance.patch"
+    primary.write_text(patch_body, encoding="utf-8")
+    (patches_dir / "README.md").write_text(_LOCAL_PATCHES_README, encoding="utf-8")
+    (patches_dir / ".release_base").write_text(f"{release_tag}\n", encoding="utf-8")
+    for stale in _iter_patch_files(patches_dir):
+        if stale.resolve() != primary.resolve():
+            stale.unlink(missing_ok=True)
+    try:
+        home_dir = _home_local_patches_dir()
+        home_dir.mkdir(parents=True, exist_ok=True)
+        (home_dir / primary.name).write_text(patch_body, encoding="utf-8")
+        (home_dir / "README.md").write_text(_LOCAL_PATCHES_README, encoding="utf-8")
+        (home_dir / ".release_base").write_text(f"{release_tag}\n", encoding="utf-8")
+    except OSError:
+        pass
+    return primary
+
+
+def _diff_local_payload_against_release(git_cmd, cwd, release_tag: str) -> str:
+    """Diff release tag vs current index/worktree, excluding ``local-patches/``."""
+    # Stage payload so newly created files (from git apply) are included.
+    add_payload = subprocess.run(
+        git_cmd
+        + [
+            "add",
+            "-A",
+            "--",
+            ".",
+            f":!({_LOCAL_PATCHES_DIRNAME})",
+        ],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if add_payload.returncode != 0:
+        raise RuntimeError("Failed to stage reapplied local patch payload.")
+
+    diff_result = subprocess.run(
+        git_cmd
+        + [
+            "diff",
+            "--cached",
+            release_tag,
+            "--",
+            ".",
+            f":!({_LOCAL_PATCHES_DIRNAME})",
+        ],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=True,
+    )
+    return diff_result.stdout
+
+
+def _apply_local_release_patches(
+    git_cmd,
+    cwd,
+    release_tag: str,
+    *,
+    patch_snapshots: list[tuple[str, str]] | None = None,
+) -> None:
+    """Reapply local patches after reset, commit, and refresh the in-repo series.
+
+    Customizations stay out of upstream merge history: upgrade resets to the
+    release tag, replays these patches, and commits onto ``hermes-release``.
+    """
+    snapshots = patch_snapshots
+    if snapshots is None:
+        snapshots = _snapshot_local_release_patches(cwd)
+    if not snapshots:
+        print(
+            f"→ No local patches under {_LOCAL_PATCHES_DIRNAME}/ "
+            "(or $HERMES_HOME/local-patches); staying on clean release."
+        )
+        return
+
+    for name, content in snapshots:
+        _apply_patch_text(git_cmd, cwd, name, content)
+
+    try:
+        patch_body = _diff_local_payload_against_release(git_cmd, cwd, release_tag)
+        _refresh_local_release_patch_file(
+            git_cmd, cwd, release_tag, patch_body=patch_body
+        )
+    except (OSError, subprocess.CalledProcessError, RuntimeError) as exc:
+        raise RuntimeError(f"Failed to refresh local patch series: {exc}") from exc
+
+    add_patches = subprocess.run(
+        git_cmd + ["add", "-A", "--", _LOCAL_PATCHES_DIRNAME],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if add_patches.returncode != 0:
+        raise RuntimeError("Failed to stage refreshed local-patches directory.")
+
+    cached = subprocess.run(
+        git_cmd + ["diff", "--cached", "--quiet"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if cached.returncode == 0:
+        print("→ Local patches applied with no tree changes.")
+        return
+
+    commit_result = subprocess.run(
+        git_cmd
+        + [
+            "commit",
+            "--no-gpg-sign",
+            "-m",
+            f"local: reapply patches onto {release_tag}",
+        ],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if commit_result.returncode != 0:
+        err = (commit_result.stderr or commit_result.stdout or "").strip()
+        detail = err.splitlines()[0] if err else "git commit failed"
+        raise RuntimeError(f"Failed to commit reapplied local patches: {detail}")
+
+    print(f"→ Refreshed in-repo local-patches against {release_tag}.")
+
+
+def _upgrade_release_with_local_patches(git_cmd, cwd, release_tag: str) -> subprocess.CompletedProcess:
+    """Reset hermes-release to ``release_tag``, then reapply local patches."""
+    # Snapshot before reset — in-repo local-patches disappear with --hard.
+    try:
+        snapshots = _snapshot_local_release_patches(cwd)
+    except RuntimeError as exc:
+        return subprocess.CompletedProcess(
+            ["snapshot-local-patches"],
+            returncode=1,
+            stdout="",
+            stderr=str(exc),
+        )
+
+    reset_result = subprocess.run(
+        git_cmd
+        + [
+            "-c",
+            "gpg.ssh.allowedSignersFile=/dev/null",
+            "reset",
+            "--hard",
+            release_tag,
+        ],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if reset_result.returncode != 0:
+        return reset_result
+
+    try:
+        _apply_local_release_patches(
+            git_cmd, cwd, release_tag, patch_snapshots=snapshots
+        )
+    except RuntimeError as exc:
+        return subprocess.CompletedProcess(
+            reset_result.args,
+            returncode=1,
+            stdout=reset_result.stdout,
+            stderr=str(exc),
+        )
+    return subprocess.CompletedProcess(
+        reset_result.args,
+        returncode=0,
+        stdout=reset_result.stdout,
+        stderr=reset_result.stderr,
+    )
+
+
+def _validate_critical_files_syntax(root) -> tuple[bool, str | None, str | None]:
+    """Strictly compile every required production file in a candidate.
+
+    Release-candidate validation is fail-closed: every path in
+    ``_UPDATE_CRITICAL_FILES`` must exist, be a contained regular file, and
+    compile successfully.  Keep this strict entry point separate from the
+    compatibility guard used after an ordinary update.
+    """
+    return _validate_critical_files_syntax_impl(root, allow_missing=False)
+
+
+def _validate_post_pull_critical_files_syntax(
+    root,
+) -> tuple[bool, str | None, str | None]:
+    """Compile existing critical files after an ordinary post-pull update.
+
+    Older installations can legitimately predate one of the current critical
+    paths.  Missing files are therefore tolerated here, but every path that
+    does exist still receives the same regular-file, containment, and syntax
+    checks as strict candidate validation.
+    """
+    return _validate_critical_files_syntax_impl(root, allow_missing=True)
+
+
+def _validate_critical_files_syntax_impl(
+    root, *, allow_missing: bool
+) -> tuple[bool, str | None, str | None]:
+    """Shared syntax guard implementation with an explicit missing-file mode."""
+    import py_compile
+
     root = Path(root)
+    try:
+        candidate_root = root.resolve(strict=True)
+    except OSError as exc:
+        return False, str(root), f"candidate root is not accessible: {exc}"
+
     with tempfile.TemporaryDirectory(prefix="hermes-syntax-check-") as tmpdir:
         for relpath in _UPDATE_CRITICAL_FILES:
-            path = root / relpath
-            if not path.exists():
-                # Missing file is suspicious but not necessarily fatal — a future
-                # refactor may legitimately remove one of these. Skip and move on.
-                continue
-            # Mirror the relative path under the tmpdir so two different
-            # files with the same basename don't collide on the cfile name.
-            cfile = Path(tmpdir) / (relpath.replace("/", "__") + "c")
+            relative = Path(relpath)
+            path = root / relative
+            if relative.is_absolute() or ".." in relative.parts:
+                return False, str(path), "critical path escapes candidate root"
+            try:
+                info = path.lstat()
+            except FileNotFoundError:
+                if allow_missing:
+                    continue
+                return False, str(path), "required critical file is missing"
+            except OSError as exc:
+                return False, str(path), f"could not inspect required file: {exc}"
+            if stat.S_ISLNK(info.st_mode):
+                return False, str(path), "required critical file is a symlink"
+            if not stat.S_ISREG(info.st_mode):
+                return False, str(path), "required critical file is not a regular file"
+            try:
+                resolved = path.resolve(strict=True)
+                resolved.relative_to(candidate_root)
+            except ValueError:
+                return False, str(path), "required critical file resolves outside candidate root"
+            except OSError as exc:
+                return False, str(path), f"could not resolve required file: {exc}"
+
+            # Mirror the relative path under the temp directory so different
+            # source files cannot collide in the compile output.
+            cfile = Path(tmpdir) / (str(relative).replace("/", "__") + "c")
             try:
                 py_compile.compile(str(path), cfile=str(cfile), doraise=True)
             except py_compile.PyCompileError as exc:
                 return False, str(path), str(exc)
             except OSError as exc:
-                return False, str(path), f"could not read: {exc}"
+                return False, str(path), f"could not compile: {exc}"
     return True, None, None
 
 
@@ -229,6 +5167,7 @@ def _validate_critical_files_syntax(root) -> tuple[bool, str | None, str | None]
 # is caught — a file can be syntactically perfect and still fail to import
 # because a name it pulls from a sibling module no longer exists.
 _UPDATE_CRITICAL_MODULES = (
+    "hermes_cli.update_cmd",
     "hermes_cli.main",
     "run_agent",
     "model_tools",
@@ -237,82 +5176,116 @@ _UPDATE_CRITICAL_MODULES = (
 
 
 def _validate_critical_modules_import(root) -> tuple[bool, str | None, str | None]:
-    """Import each module in ``_UPDATE_CRITICAL_MODULES`` in a subprocess.
+    """Import every critical module from the candidate in an isolated process.
 
-    ``_validate_critical_files_syntax`` only *parses* files, so it cannot see
-    cross-module breakage: a partially-updated tree where ``agent/`` is new but
-    ``tools/`` is old parses perfectly and still dies at startup with
-    ``ImportError: cannot import name 'TODO_INJECTION_HEADER' from
-    'tools.todo_tool'``. Every file is valid Python; the *combination* is not.
-
-    That skew is reachable on the Windows ZIP-update path, whose copy loop
-    walks top-level entries in ``os.listdir`` order and replaces each one
-    independently — ``agent/`` lands long before ``tools/``, so a failure or
-    interruption between them leaves exactly that mismatch on disk.
-
-    Runs in a subprocess because importing these modules into the running
-    updater would pollute ``sys.modules`` and execute import-time side effects
-    against the half-updated tree. Costs ~0.4s.
-
-    Uses the project venv's interpreter when there is one (matching
-    ``_venv_core_imports_healthy``): ``hermes update`` can be driven by a
-    different Python than the install's own, and probing the wrong
-    interpreter would test a tree the user never runs.
-
-    Returns ``(ok, failing_module, error_message)``.
+    A missing dependency is deferred to the existing dependency-sync stage only
+    when it is an explicitly named, non-first-party module. Every other import
+    or probe failure remains fatal before candidate promotion.
     """
-    from hermes_constants import FIRST_PARTY_MODULE_ROOTS
 
+    root = Path(root)
+    try:
+        candidate_root = root.resolve(strict=True)
+    except OSError as exc:
+        return False, "candidate import probe", f"candidate root is not accessible: {exc}"
+
+    # Inject the canonical root set into the child probe. The parent still uses
+    # is_first_party_module() for names such as hermes_constants, whose
+    # first-party family is represented by that canonical helper as well.
+    first_party_roots = tuple(sorted(FIRST_PARTY_MODULE_ROOTS))
     probe = (
-        "import importlib, sys\n"
-        "for name in %r:\n"
+        "import importlib, sys, traceback\n"
+        "from pathlib import Path\n"
+        f"_root = Path({str(candidate_root)!r})\n"
+        "_root = _root.resolve(strict=True)\n"
+        "sys.path.insert(0, str(_root))\n"
+        "_FIRST_PARTY_MODULE_ROOTS = frozenset(%r)\n"
+        "for _name in %r:\n"
         "    try:\n"
-        "        importlib.import_module(name)\n"
-        "    except ModuleNotFoundError as exc:\n"
-        # A missing *third-party* module means dependencies aren't installed
-        # yet, not a skewed checkout. Only our own packages count as breakage.
-        # The root set is injected from hermes_constants so this can't drift
-        # from the hint the user is shown (they disagreed once already).
-        "        missing = (getattr(exc, 'name', '') or '').split('.')[0]\n"
-        "        if missing in %r or missing.startswith('hermes_'):\n"
-        "            sys.stdout.write(name + '\\n' + str(exc))\n"
-        "            raise SystemExit(3)\n"
-        "    except ImportError as exc:\n"
-        "        sys.stdout.write(name + '\\n' + str(exc))\n"
-        "        raise SystemExit(3)\n"
-        "    except Exception:\n"
-        "        pass\n"  # non-import errors (config/env) aren't update breakage
-        "raise SystemExit(0)\n"
-        % (_UPDATE_CRITICAL_MODULES, tuple(sorted(FIRST_PARTY_MODULE_ROOTS)))
+        "        _module = importlib.import_module(_name)\n"
+        "        _origin = getattr(_module, '__file__', None)\n"
+        "        if not _origin:\n"
+        "            raise RuntimeError('critical module has no __file__')\n"
+        "        _resolved = Path(_origin).resolve(strict=True)\n"
+        "        try:\n"
+        "            _resolved.relative_to(_root)\n"
+        "        except ValueError as _exc:\n"
+        "            raise RuntimeError(\n"
+        "                f'critical module imported from outside candidate: {_resolved}'\n"
+        "            ) from _exc\n"
+        "    except ModuleNotFoundError as _exc:\n"
+        "        _missing = getattr(_exc, 'name', None) or ''\n"
+        "        _missing_root = _missing.split('.', 1)[0]\n"
+        "        if _missing_root in _FIRST_PARTY_MODULE_ROOTS:\n"
+        "            _marker = 'HERMES_FIRST_PARTY_MISSING:'\n"
+        "        else:\n"
+        "            _marker = 'HERMES_MODULE_NOT_FOUND:'\n"
+        "        print(_marker + _name + ':' + _missing)\n"
+        "        traceback.print_exc()\n"
+        "        continue\n"
+        "    except BaseException:\n"
+        "        print('HERMES_IMPORT_FAILURE:' + _name)\n"
+        "        traceback.print_exc()\n"
+        "        raise\n"
+        "print('HERMES_IMPORT_OK')\n"
+        % (first_party_roots, _UPDATE_CRITICAL_MODULES)
     )
     try:
         interpreter = sys.executable
         try:
             venv_python = venv_python_path(
-                Path(root) / "venv", windows=_m()._is_windows()
+                root / "venv", windows=_m()._is_windows()
             )
             if venv_python.exists():
                 interpreter = str(venv_python)
         except Exception:
             pass  # fall back to the running interpreter
         result = subprocess.run(
-            [interpreter, "-c", probe],
-            cwd=str(root),
+            [interpreter, "-I", "-c", probe],
+            cwd=str(candidate_root),
             capture_output=True,
             text=True,
             encoding="utf-8",
             errors="replace",
             timeout=120,
         )
-    except (OSError, subprocess.SubprocessError):
-        # Can't run the probe — don't block the update on our own tooling.
-        return True, None, None
-    if result.returncode == 3:
-        parts = (result.stdout or "").split("\n", 1)
-        module = parts[0].strip() or "unknown"
-        detail = parts[1].strip() if len(parts) > 1 else ""
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, "candidate import probe", f"could not execute import probe: {exc}"
+
+    stdout_lines = (result.stdout or "").splitlines()
+    output = "\n".join(
+        part for part in ((result.stdout or "").strip(), (result.stderr or "").strip()) if part
+    )
+    if result.returncode != 0 or "HERMES_IMPORT_OK" not in stdout_lines:
+        module = "candidate import probe"
+        for line in stdout_lines:
+            if line.startswith("HERMES_IMPORT_FAILURE:"):
+                module = line.partition(":")[2].strip() or module
+                break
+        detail = output or f"import probe exited with status {result.returncode}"
         return False, module, detail
+
+    missing: list[tuple[str, str, bool]] = []
+    for line in stdout_lines:
+        if line.startswith("HERMES_FIRST_PARTY_MISSING:"):
+            payload = line.partition(":")[2]
+            module, _, missing_name = payload.partition(":")
+            missing.append((module, missing_name, True))
+        elif line.startswith("HERMES_MODULE_NOT_FOUND:"):
+            payload = line.partition(":")[2]
+            module, _, missing_name = payload.partition(":")
+            missing.append((module, missing_name, False))
+
+    for module, missing_name, marked_first_party in missing:
+        if marked_first_party or not missing_name or is_first_party_module(missing_name):
+            return False, module or "candidate import probe", output or missing_name
+
+    # A clearly third-party ModuleNotFoundError is deferred, but retain the
+    # child traceback so callers that expose diagnostics can report it.
+    if missing:
+        return True, None, output or None
     return True, None, None
+
 
 def _gateway_prompt(prompt_text: str, default: str = "", timeout: float = 300.0) -> str:
     """File-based IPC prompt for gateway mode.
@@ -1208,7 +6181,31 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False):
     # git-update path for rationale (#30271).
     _finish_dashboard_update_cleanup(node_failures)
 
-def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[str]:
+def _stash_local_changes_if_needed(
+    git_cmd: list[str], cwd: Path, *, marker: str | None = None
+) -> Optional[str]:
+    # An unmerged index contains stage 1/2/3 entries whose identity must survive
+    # an update refusal.  Never reset, stash, or otherwise mutate an unresolved
+    # merge/rebase state; require the user to resolve it first.
+    unmerged = subprocess.run(
+        git_cmd + ["ls-files", "--unmerged"],
+        cwd=cwd,
+        capture_output=True,
+        text=True, encoding="utf-8", errors="replace",
+    )
+    if unmerged.returncode != 0:
+        print("✗ Could not inspect the Git index safely; update aborted.")
+        print("  Resolve conflicts or inspect the repository manually, then re-run the update.")
+        raise RuntimeError(
+            "Could not inspect the Git index safely; resolve conflicts before updating."
+        )
+    if unmerged.stdout.strip():
+        print("✗ Unresolved Git index conflicts detected; update aborted.")
+        print("  Resolve conflicts in the working tree, then re-run the update.")
+        raise RuntimeError(
+            "Unresolved Git index conflicts detected; resolve conflicts before updating."
+        )
+
     status = subprocess.run(
         git_cmd + ["status", "--porcelain"],
         cwd=cwd,
@@ -1219,32 +6216,10 @@ def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[st
     if not status.stdout.strip():
         return None
 
-    # If the index has unmerged entries (e.g. from an interrupted merge/rebase),
-    # git stash will fail with "needs merge / could not write index".  Clear the
-    # conflict state with `git reset` so the stash can proceed.  Working-tree
-    # changes are preserved; only the index conflict markers are dropped.
-    unmerged = subprocess.run(
-        git_cmd + ["ls-files", "--unmerged"],
-        cwd=cwd,
-        capture_output=True,
-        text=True, encoding="utf-8", errors="replace",
-    )
-    if unmerged.stdout.strip():
-        print("→ Clearing unmerged index entries from a previous conflict...")
-        subprocess.run(git_cmd + ["reset"], cwd=cwd, capture_output=True)
-
-    from datetime import datetime, timezone
-
-    stash_name = datetime.now(timezone.utc).strftime(
-        "hermes-update-autostash-%Y%m%d-%H%M%S"
+    stash_name = marker or (
+        f"hermes-update-autostash-{os.getpid()}-{uuid.uuid4().hex}"
     )
     print("→ Local changes detected — stashing before update...")
-    prev_stash = subprocess.run(
-        git_cmd + ["rev-parse", "--verify", "refs/stash"],
-        cwd=cwd,
-        capture_output=True,
-        text=True, encoding="utf-8", errors="replace",
-    ).stdout.strip()
     push = subprocess.run(
         git_cmd + ["stash", "push", "--include-untracked", "-m", stash_name],
         cwd=cwd,
@@ -1253,59 +6228,58 @@ def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[st
     )
     if push.stdout.strip():
         print(push.stdout.strip())
-    stash_probe = subprocess.run(
-        git_cmd + ["rev-parse", "--verify", "refs/stash"],
+    stash_matches: list[str] = []
+    stash_list = subprocess.run(
+        git_cmd + ["stash", "list", "--format=%H%x00%gs"],
         cwd=cwd,
         capture_output=True,
         text=True, encoding="utf-8", errors="replace",
     )
-    stash_ref = stash_probe.stdout.strip()
-    stash_created = (
-        stash_probe.returncode == 0 and bool(stash_ref) and stash_ref != prev_stash
-    )
+    if stash_list.returncode == 0:
+        for line in stash_list.stdout.splitlines():
+            commit, separator, subject = line.partition("\0")
+            commit = commit.strip()
+            if separator and stash_name in subject and _SHA_RE.fullmatch(commit):
+                stash_matches.append(commit.lower())
+    stash_created = len(stash_matches) == 1
 
     if push.returncode != 0:
+        if push.stderr.strip():
+            print(push.stderr.strip())
         if stash_created:
-            # git stash push exits non-zero when it saved everything but could
-            # not delete some swept untracked files from the working tree
-            # (e.g. a root-owned directory: "warning: failed to remove ...:
-            # Permission denied").  The stash entry is complete — the changes
-            # are safe — so this is not a failure.  Leave the undeletable
-            # files in place and continue the update.
-            if push.stderr.strip():
-                print(push.stderr.strip())
             print(
-                "  ⚠ Some untracked files could not be removed from the "
-                "working tree (permission denied)."
+                "  ⚠ The stash command failed after creating a uniquely marked "
+                f"entry; it remains preserved as immutable stash {stash_matches[0]}."
             )
-            print(
-                "    They were still saved to the stash and were left in "
-                "place — the update will continue."
-            )
-            # A partially-failed stash push also aborts its working-tree
-            # cleanup for TRACKED modifications — they are saved in the stash
-            # but still dirty the tree, which would break the checkout/pull
-            # that follows. Safe to reset: everything is in the stash entry.
-            subprocess.run(
-                git_cmd + ["reset", "--hard", "HEAD"],
-                cwd=cwd,
-                capture_output=True,
-            )
+            if marker is None:
+                # Preserve ordinary update behavior: Git may leave tracked
+                # edits in place after saving the stash while an untracked
+                # path cannot be removed.  The ordinary caller's existing
+                # restore path expects a clean checkout window here.
+                subprocess.run(
+                    git_cmd + ["reset", "--hard", "HEAD"],
+                    cwd=cwd,
+                    capture_output=True,
+                )
         else:
-            # No stash entry was created: the changes were NOT saved.  This
-            # is a real failure — bail out before the update touches HEAD.
             print("✗ Could not stash local changes — update aborted.")
-            if push.stderr.strip():
-                print(f"  {push.stderr.strip().splitlines()[0]}")
             print(
                 "  Commit, stash, or clean up your local changes manually, "
                 "then re-run `hermes update`."
             )
+            # Never reset/clean here.  The transaction boundary will either
+            # durably confirm this exact SHA or retain an uncertain-capture journal.
             raise subprocess.CalledProcessError(
                 push.returncode, push.args, output=push.stdout, stderr=push.stderr
             )
 
-    return stash_ref
+    if not stash_created:
+        print("✗ Could not identify one exact autostash entry — update aborted.")
+        raise RuntimeError(
+            "The local changes may not be safely stashed; inspect `git stash list` "
+            "and recover before retrying."
+        )
+    return stash_matches[0]
 
 def _resolve_stash_selector(
     git_cmd: list[str], cwd: Path, stash_ref: str
@@ -1372,6 +6346,9 @@ def _restore_stashed_changes(
     stash_ref: str,
     prompt_user: bool = False,
     input_fn=None,
+    restore_index: bool = False,
+    drop_stash: bool = True,
+    preserve_conflict_state: bool = False,
 ) -> bool:
     if prompt_user:
         print()
@@ -1400,8 +6377,12 @@ def _restore_stashed_changes(
             return False
 
     print("→ Restoring local changes...")
+    stash_apply = git_cmd + ["stash", "apply"]
+    if restore_index:
+        stash_apply.append("--index")
+    stash_apply.append(stash_ref)
     restore = subprocess.run(
-        git_cmd + ["stash", "apply", stash_ref],
+        stash_apply,
         cwd=cwd,
         capture_output=True,
         text=True, encoding="utf-8", errors="replace",
@@ -1445,20 +6426,28 @@ def _restore_stashed_changes(
         print("\nYour stashed changes are preserved — nothing is lost.")
         print(f"  Stash ref: {stash_ref}")
 
-        # Always reset to clean state — leaving conflict markers in source
-        # files makes hermes completely unrunnable (SyntaxError on import).
-        # The user's changes are safe in the stash for manual recovery.
-        subprocess.run(
-            git_cmd + ["reset", "--hard", "HEAD"],
-            cwd=cwd,
-            capture_output=True,
-        )
-        print("Working tree reset to clean state.")
+        if not preserve_conflict_state:
+            # Ordinary update recovery retains its historical behavior.  The
+            # release transaction opts into preserving the conflict state so
+            # finalization never replays a destructive reset.
+            subprocess.run(
+                git_cmd + ["reset", "--hard", "HEAD"],
+                cwd=cwd,
+                capture_output=True,
+            )
+            print("Working tree reset to clean state.")
+        else:
+            print("  Conflict state is preserved for manual resolution.")
         print(f"Restore your changes later with: git stash apply {stash_ref}")
         # Don't sys.exit — the code update itself succeeded, only the stash
         # restore had conflicts.  Let cmd_update continue with pip install,
         # skill sync, and gateway restart.
         return False
+
+    if not drop_stash:
+        print("⚠ Local changes were restored on top of the updated codebase.")
+        print("  Review `git diff` / `git status` if Hermes behaves unexpectedly.")
+        return True
 
     stash_selector = _resolve_stash_selector(git_cmd, cwd, stash_ref)
     if stash_selector is None:
@@ -4131,157 +9120,26 @@ def _resume_windows_gateways_after_update(token: dict | None) -> None:
         )
 
 def _discard_lockfile_churn(git_cmd, repo_root):
-    """Restore tracked ``package-lock.json`` files that npm dirtied locally.
+    """Compatibility hook that deliberately never discards user lockfile edits.
 
-    npm rewrites lockfiles non-deterministically at install/build time. On a
-    managed install those diffs are never intentional, so we discard them so
-    ``hermes update`` sees a clean tree instead of autostashing every run.
-    Best-effort; only ever touches files named ``package-lock.json``.
+    ``package-lock.json`` is ordinary tracked user data.  Older versions used
+    ``git checkout --`` here before the stash probe, which silently destroyed an
+    intentional edit.  The update transaction now stashes the complete dirty
+    tree first; npm may still normalize the lockfile later, but no pre-stash
+    cleanup is safe to perform.
     """
-    try:
-        diff = subprocess.run(
-            git_cmd + ["diff", "--name-only"],
-            cwd=repo_root,
-            capture_output=True,
-            text=True, encoding="utf-8", errors="replace",
-        )
-        if diff.returncode != 0:
-            return
-        dirty_package_dirs = {
-            Path(line.strip()).parent
-            for line in diff.stdout.splitlines()
-            if line.strip().endswith("package.json")
-        }
-        dirty = [
-            line.strip()
-            for line in diff.stdout.splitlines()
-            if line.strip().endswith("package-lock.json")
-            and Path(line.strip()).parent not in dirty_package_dirs
-        ]
-        if not dirty:
-            return
-        subprocess.run(
-            git_cmd + ["checkout", "--", *dirty],
-            cwd=repo_root,
-            capture_output=True,
-            text=True, encoding="utf-8", errors="replace",
-            check=False,
-        )
-        print(f"→ Discarded npm lockfile churn ({len(dirty)} file(s))")
-    except Exception:
-        # Never let lockfile cleanup block an update.
-        pass
+    return None
 
 def _normalize_managed_eol(git_cmd, repo_root):
-    """Take a managed checkout off ``core.autocrlf=true`` without leaving it dirty.
+    """Compatibility no-op: never rewrite user bytes before autostash.
 
-    Git for Windows ships ``core.autocrlf=true`` in its system config, which
-    renormalizes this repo's LF text files to CRLF in the working tree. That
-    breaks ``git checkout`` on update with "Your local changes would be
-    overwritten", so ``install.ps1`` pins ``core.autocrlf=false`` on the managed
-    clone (#67730). Checkouts created before that landed never got the pin and
-    cannot receive it — the bootstrap installer reuses its build-pinned
-    ``install.ps1`` forever — so ``hermes update``, which ships with the checkout
-    itself, is the only path left that can fix them.
-
-    The pin and the cleanup are one operation. Under ``autocrlf=true`` git
-    compares normalized content, so a CRLF working tree reads clean; pinning
-    alone would expose every text file as modified and hand the update an
-    autostash of the whole tree. So the pin is written only after the tree is
-    verified clean under it, and a checkout we cannot fully normalize is left
-    exactly as it was. Best-effort: never blocks an update.
+    A CRLF-only difference can be intentional user data.  The update transaction
+    must preserve it through the complete stash boundary rather than guessing
+    that it is machine-generated checkout churn.  The helper remains as a call
+    seam for older callers, but all normalization belongs after user state has
+    been safely captured (if it is needed at all).
     """
-    # -c, not config: evaluate the tree as it WOULD look pinned, without
-    # persisting anything we might not be able to follow through on.
-    probe = git_cmd + ["-c", "core.autocrlf=false"]
-
-    def _dirty(*extra):
-        out = subprocess.run(
-            probe + ["diff", "-z", "--name-only", *extra],
-            cwd=repo_root,
-            capture_output=True,
-            text=True, encoding="utf-8", errors="replace",
-        )
-        if out.returncode != 0:
-            return None
-        return {p for p in out.stdout.split("\0") if p}
-
-    def _real_dirty():
-        # Files with a *content* change once CRLF differences are ignored.
-        # NOTE: ``diff --name-only --ignore-cr-at-eol`` still LISTS CR-only
-        # files (the name list is computed from blob/stat differences before
-        # the CR filter is applied), so it cannot be used to isolate real
-        # edits. ``--numstat`` does honor the filter: a CR-only file produces
-        # no numstat record, while a genuinely-edited file does. Parse the
-        # paths out of numstat instead.
-        out = subprocess.run(
-            probe + ["-c", "core.quotepath=false",
-                     "diff", "--numstat", "--ignore-cr-at-eol"],
-            cwd=repo_root,
-            capture_output=True,
-            text=True, encoding="utf-8", errors="replace",
-        )
-        if out.returncode != 0:
-            return None
-        paths = set()
-        for line in out.stdout.splitlines():
-            if not line.strip():
-                continue
-            # Format: "<added>\t<deleted>\t<path>". Rename detection is off in
-            # plain diff, so there is exactly one path field per record.
-            parts = line.split("\t", 2)
-            if len(parts) == 3 and parts[2]:
-                paths.add(parts[2])
-        return paths
-
-    def _eol_only():
-        all_dirty, real_dirty = _dirty(), _real_dirty()
-        if all_dirty is None or real_dirty is None:
-            return None
-        return all_dirty - real_dirty
-
-    try:
-        effective = subprocess.run(
-            git_cmd + ["config", "--get", "core.autocrlf"],
-            cwd=repo_root,
-            capture_output=True,
-            text=True, encoding="utf-8", errors="replace",
-        )
-        # Only "true" rewrites LF to CRLF on checkout. Unset, false, and input
-        # all leave the working tree alone, so there is nothing to repair.
-        if effective.stdout.strip().lower() != "true":
-            return
-
-        eol_only = _eol_only()
-        if eol_only is None:
-            return
-        if eol_only:
-            # Pathspec over stdin, not argv: a fully renormalized checkout is
-            # thousands of paths, well past the Windows command-line limit.
-            subprocess.run(
-                probe
-                + ["checkout", "--pathspec-from-file=-", "--pathspec-file-nul", "--"],
-                cwd=repo_root,
-                input="\0".join(sorted(eol_only)),
-                capture_output=True,
-                text=True, encoding="utf-8", errors="replace",
-                check=False,
-            )
-            if _eol_only():
-                # Still dirty — persisting the pin here would only surface churn
-                # we failed to clear. Leave the checkout as we found it.
-                return
-            print(f"→ Normalized line-ending churn ({len(eol_only)} file(s))")
-
-        subprocess.run(
-            git_cmd + ["config", "core.autocrlf", "false"],
-            cwd=repo_root,
-            capture_output=True,
-            check=False,
-        )
-    except Exception:
-        # Never let line-ending cleanup block an update.
-        pass
+    return None
 
 
 def _desktop_app_present(desktop_dir: Path) -> bool:
@@ -4376,6 +9234,14 @@ def _cmd_update_impl(args, gateway_mode: bool):
         else None
     )
     assume_yes = bool(getattr(args, "yes", False))
+    release_tag = getattr(args, "release_tag", None)
+    release_repo_lock = None
+    release_target = None
+    release_transaction_result = None
+    release_upgrade_context = None
+    release_success_banner_pending = False
+    release_completion_banner_pending = False
+    update_succeeded = False
 
     # Whether this update is running without a human at the keyboard.
     # Interactive terminal updates always stash-and-ask (unchanged behavior);
@@ -4526,7 +9392,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
     # On Windows, git can fail with "unable to write loose object file: Invalid argument"
     # due to filesystem atomicity issues. Set the recommended workaround.
-    if sys.platform == "win32" and git_dir.exists():
+    if sys.platform == "win32" and git_dir.exists() and not release_tag:
         subprocess.run(
             [
                 "git",
@@ -4553,11 +9419,13 @@ def _cmd_update_impl(args, gateway_mode: bool):
     # tree dirty — forcing an autostash on every update and making branch
     # switches fragile. Restoring them first lets the common case (only
     # lockfile churn) update with a clean tree.
-    _discard_lockfile_churn(git_cmd, _m().PROJECT_ROOT)
-    # Same rationale, different generator: line-ending churn is machine-made
-    # dirt on a managed checkout, so clear it (and stop generating it) before
-    # the stash/branch logic rather than autostashing the entire tree.
-    _normalize_managed_eol(git_cmd, _m().PROJECT_ROOT)
+    if not release_tag:
+        _discard_lockfile_churn(git_cmd, _m().PROJECT_ROOT)
+    # Keep the compatibility seam, but never rewrite line endings before the
+    # stash boundary: a CRLF-only difference can be intentional user data.
+    # The ordinary stash captures it byte-for-byte before branch/update work.
+    if not release_tag:
+        _normalize_managed_eol(git_cmd, _m().PROJECT_ROOT)
 
     # Detect if we're updating from a fork (before any branch logic)
     origin_url = _m()._get_origin_url(git_cmd, _m().PROJECT_ROOT)
@@ -4581,31 +9449,55 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
     # Fetch and pull
     try:
+        if release_tag:
+            release_repo_lock = RepositoryUpdateLock(_m().PROJECT_ROOT, git_cmd)
+            try:
+                release_repo_lock.acquire()
+            except RuntimeError as exc:
+                print(f"✗ Could not acquire the repository update lock: {exc}")
+                sys.exit(1)
 
-        # Resolve the target branch up front so the fetch can be scoped to it.
+        # Resolve the target ref up front so the fetch can be scoped to it.
         # A bare `git fetch origin` pulls every ref, and this repo carries
         # thousands of auto-generated branches — an unscoped fetch can stall for
         # minutes on a non-single-branch checkout. Fetch only what we update
         # against.
-        branch = _m()._resolve_update_branch(args)
+        branch = "hermes-release" if release_tag else _m()._resolve_update_branch(args)
 
-        # Self-heal abandoned git lock files (e.g. .git/shallow.lock left by a
-        # crashed fetch) before the fetch — otherwise the update fails with
-        # "Unable to create .../shallow.lock: File exists" and never reaches
-        # the network.
-        from hermes_cli.gitlock import clear_stale_git_locks
+        if not release_tag:
+            # Self-heal abandoned git lock files (e.g. .git/shallow.lock left
+            # by a crashed fetch) before the ordinary update fetch. Release
+            # transactions use their repository lock and exact-target fetch.
+            from hermes_cli.gitlock import clear_stale_git_locks
 
-        cleared = clear_stale_git_locks(_m().PROJECT_ROOT)
-        if cleared:
-            print("  (removed stale git lock(s): %s)" % ", ".join(cleared))
+            cleared = clear_stale_git_locks(_m().PROJECT_ROOT)
+            if cleared:
+                print("  (removed stale git lock(s): %s)" % ", ".join(cleared))
 
-        print("→ Fetching updates...")
-        fetch_result = subprocess.run(
-            git_cmd + ["fetch", "origin", branch],
-            cwd=_m().PROJECT_ROOT,
-            capture_output=True,
-            text=True, encoding="utf-8", errors="replace",
-        )
+        if release_tag:
+            print("→ Resolving exact release target...")
+            try:
+                release_target = _resolve_release_target(
+                    git_cmd, _m().PROJECT_ROOT, release_tag
+                )
+            except RuntimeError as exc:
+                print(f"✗ Could not resolve Release {release_tag}.")
+                print(f"  {exc}")
+                sys.exit(1)
+            fetch_result = subprocess.CompletedProcess(
+                git_cmd + ["fetch", "--no-tags", "origin"],
+                returncode=0,
+                stdout="",
+                stderr="",
+            )
+        else:
+            print("→ Fetching updates...")
+            fetch_result = subprocess.run(
+                git_cmd + ["fetch", "origin", branch],
+                cwd=_m().PROJECT_ROOT,
+                capture_output=True,
+                text=True, encoding="utf-8", errors="replace",
+            )
         if fetch_result.returncode != 0:
             stderr = fetch_result.stderr.strip()
             if "Could not resolve host" in stderr or "unable to access" in stderr:
@@ -4633,12 +9525,15 @@ def _cmd_update_impl(args, gateway_mode: bool):
         )
         current_branch = result.stdout.strip()
 
+        if release_tag:
+            print(f"→ Target Release: {release_tag}")
+            auto_stash_ref = None
         # If user is on a different branch than the update target, switch
         # to the target. When the target is "main" this is the historical
         # "always update against main" behavior; for any other target it's
         # the same thing — get HEAD onto the requested branch first, then
         # fast-forward.
-        if current_branch != branch:
+        elif current_branch != branch:
             label = (
                 "detached HEAD"
                 if current_branch == "HEAD"
@@ -4688,31 +9583,70 @@ def _cmd_update_impl(args, gateway_mode: bool):
             and (gateway_mode or (sys.stdin.isatty() and sys.stdout.isatty()))
         )
 
-        # Check if there are updates. On shallow checkouts `rev-list --count`
-        # walks the truncated graph and can report the entire remote ancestry
-        # (e.g. "Found 9980 new commit(s)" on a depth-1 install — #53479).
-        # The zero/nonzero gate is still sound (HEAD == origin/<branch> counts
-        # 0), so keep it, but treat the shallow NUMBER as unknown and recover
-        # the real one via the GitHub compare API when possible.
-        result = subprocess.run(
-            git_cmd + ["rev-list", f"HEAD..origin/{branch}", "--count"],
-            cwd=_m().PROJECT_ROOT,
-            capture_output=True,
-            text=True, encoding="utf-8", errors="replace",
-            check=True,
-        )
-        commit_count = int(result.stdout.strip())
-
-        apply_is_shallow = (
-            subprocess.run(
-                git_cmd + ["rev-parse", "--is-shallow-repository"],
+        # Release upgrades compare the exact fetched tag with the maintenance
+        # branch. Ordinary updates compare the fetched remote branch and keep
+        # the shallow-checkout correction below.
+        if release_tag:
+            maintenance_sha = _git_resolve_commit(
+                git_cmd, _m().PROJECT_ROOT, f"refs/heads/{branch}"
+            )
+            if maintenance_sha is None:
+                print(
+                    "✗ Local maintenance branch 'hermes-release' is missing; "
+                    "create it from an official release and initialize "
+                    "local-patches/.release_base before upgrading."
+                )
+                sys.exit(1)
+            release_merged = subprocess.run(
+                git_cmd
+                + [
+                    "merge-base",
+                    "--is-ancestor",
+                    release_target.target_sha,
+                    f"refs/heads/{branch}",
+                ],
                 cwd=_m().PROJECT_ROOT,
                 capture_output=True,
                 text=True, encoding="utf-8", errors="replace",
-            ).stdout.strip()
-            == "true"
-        )
-        if commit_count > 0 and apply_is_shallow:
+            )
+            if release_merged.returncode == 0:
+                commit_count = 0
+            elif release_merged.returncode == 1:
+                commit_count = 1
+            else:
+                print(f"✗ Failed to compare local branch with Release {release_tag}.")
+                if release_merged.stderr.strip():
+                    print(f"  {release_merged.stderr.strip().splitlines()[0]}")
+                sys.exit(1)
+        else:
+            # On shallow checkouts `rev-list --count` walks the truncated graph
+            # and can report the entire remote ancestry. The zero/nonzero gate
+            # is still sound, while the correction below recovers the count
+            # from the GitHub compare API when possible.
+            result = subprocess.run(
+                git_cmd + ["rev-list", f"HEAD..origin/{branch}", "--count"],
+                cwd=_m().PROJECT_ROOT,
+                capture_output=True,
+                text=True, encoding="utf-8", errors="replace",
+                check=True,
+            )
+            commit_count = int(result.stdout.strip())
+
+        if release_tag:
+            # Release targets are compared against the exact fetched tag and
+            # never use the ordinary remote-branch shallow-count fallback.
+            apply_is_shallow = False
+        else:
+            apply_is_shallow = (
+                subprocess.run(
+                    git_cmd + ["rev-parse", "--is-shallow-repository"],
+                    cwd=_m().PROJECT_ROOT,
+                    capture_output=True,
+                    text=True, encoding="utf-8", errors="replace",
+                ).stdout.strip()
+                == "true"
+            )
+        if not release_tag and commit_count > 0 and apply_is_shallow:
             from hermes_cli.banner import _github_compare_behind
 
             head_sha = subprocess.run(
@@ -4853,14 +9787,20 @@ def _cmd_update_impl(args, gateway_mode: bool):
             _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
             return
 
-        if commit_count > 0:
+        if release_tag:
+            print(f"→ Release upgrade available: {release_tag}")
+        elif commit_count > 0:
             print(f"→ Found {commit_count} new commit(s)")
         else:
             # Shallow checkout, exact count unrecoverable (offline/rate-limited
             # compare API) — the tips differ, so there IS an update.
             print("→ Updates available (commit count unknown on this shallow checkout)")
 
-        print("→ Pulling updates...")
+        print(
+            "→ Promoting isolated release candidate..."
+            if release_tag
+            else "→ Pulling updates..."
+        )
         update_succeeded = False
         # Capture the pre-pull SHA so we can auto-roll-back if the new code
         # has a syntax error in a critical-path file (PR #28452 incident:
@@ -4869,19 +9809,42 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # the bad commit and the fix landing).
         pre_pull_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
         try:
-            # Merge the ref we already fetched above (→ Fetching updates...)
-            # instead of `git pull`, which performs a SECOND network fetch of
-            # the same branch (~0.5-1.5 s of redundant round-trip per update).
-            # `merge --ff-only origin/<branch>` is byte-identical in effect to
-            # `pull --ff-only origin <branch>` given the fresh tracking ref;
-            # the divergence fallback below is unchanged.
-            pull_result = subprocess.run(
-                git_cmd + ["merge", "--ff-only", f"origin/{branch}"],
-                cwd=_m().PROJECT_ROOT,
-                capture_output=True,
-                text=True, encoding="utf-8", errors="replace",
-            )
-            if pull_result.returncode != 0:
+            if release_tag:
+                try:
+                    release_transaction_result = _prepare_and_promote_release(
+                        git_cmd,
+                        _m().PROJECT_ROOT,
+                        release_tag,
+                        release_target.target_sha,
+                        input_fn=gw_input_fn,
+                    )
+                    release_upgrade_context = getattr(
+                        release_transaction_result, "context", None
+                    )
+                except RuntimeError as exc:
+                    print(f"✗ Could not upgrade to Release {release_tag}.")
+                    print(f"  {exc}")
+                    sys.exit(1)
+                pull_result = subprocess.CompletedProcess(
+                    ["hermes-release-transaction", release_tag],
+                    returncode=0,
+                    stdout="",
+                    stderr="",
+                )
+            else:
+                # Merge the ref we already fetched above (→ Fetching updates...)
+                # instead of `git pull`, which performs a SECOND network fetch of
+                # the same branch (~0.5-1.5 s of redundant round-trip per update).
+                # `merge --ff-only origin/<branch>` is byte-identical in effect to
+                # `pull --ff-only origin <branch>` given the fresh tracking ref;
+                # the divergence fallback below is unchanged.
+                pull_result = subprocess.run(
+                    git_cmd + ["merge", "--ff-only", f"origin/{branch}"],
+                    cwd=_m().PROJECT_ROOT,
+                    capture_output=True,
+                    text=True, encoding="utf-8", errors="replace",
+                )
+            if pull_result.returncode != 0 and not release_tag:
                 # ff-only failed — local and remote have diverged (e.g. upstream
                 # force-pushed or rebase).  Since local changes are already
                 # stashed, reset to match the remote exactly.
@@ -4909,9 +9872,15 @@ def _cmd_update_impl(args, gateway_mode: bool):
             # ruff check), this catches it on the user side and rolls back
             # so the CLI stays bootable. The user can then retry ``hermes
             # update`` later once a fix lands upstream.
-            syntax_ok, failing_path, syntax_error = _validate_critical_files_syntax(
-                _m().PROJECT_ROOT
-            )
+            if release_tag:
+                # The isolated candidate was syntax/import validated before
+                # promotion. Do not run the ordinary post-pull rollback path
+                # against the already-promoted live checkout.
+                syntax_ok, failing_path, syntax_error = True, None, None
+            else:
+                syntax_ok, failing_path, syntax_error = _validate_post_pull_critical_files_syntax(
+                    _m().PROJECT_ROOT
+                )
             if not syntax_ok:
                 print()
                 print("✗ Pulled code has a syntax error in a critical file:")
@@ -4945,6 +9914,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 sys.exit(1)
 
             update_succeeded = True
+            if release_tag:
+                # Do not announce success until the durable user-state
+                # finalizer has returned True.  A retained recovery journal is
+                # a failed command, not a successful upgrade with a warning.
+                release_success_banner_pending = True
         finally:
             if auto_stash_ref is not None:
                 # Don't attempt stash restore if the code update itself failed —
@@ -4985,7 +9959,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # and post-pull HEAD; if they match, surface the no-op instead of
         # claiming success.
         post_pull_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
-        if pre_pull_sha and post_pull_sha == pre_pull_sha:
+        if not release_tag and pre_pull_sha and post_pull_sha == pre_pull_sha:
             print()
             print("✗ Code did not move — update was a no-op.")
             print(
@@ -5164,8 +10138,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
             had_desktop_app_before_update=had_desktop_app_before_update,
         )
 
-        print()
-        print("✓ Code updated!")
+        if not release_tag:
+            print()
+            print("✓ Code updated!")
 
         # ── Post-update state.db integrity guard (#68474) ─────────────────
         # Verify that state.db survived the update intact.  If the live file
@@ -5545,7 +10520,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
             print("  Code and Python deps are updated, but the dashboard/TUI may")
             print("  be in a mixed state until the Node deps are rebuilt.")
         else:
-            _print_update_completion("✓ Update complete!")
+            if release_tag:
+                release_completion_banner_pending = True
+            else:
+                _print_update_completion("✓ Update complete!")
 
         # Search-index optimization notice (v23). Existing installs keep their
         # working search index untouched on update; the compact v23 layout —
@@ -6458,7 +11436,23 @@ def _cmd_update_impl(args, gateway_mode: bool):
             sys.exit(1)
 
     except subprocess.CalledProcessError as e:
-        if _m()._is_windows():
+        if release_tag:
+            if (
+                release_transaction_result is not None
+                or release_upgrade_context is not None
+                or update_succeeded
+            ):
+                print("✗ Release transaction was promoted, but a post-promotion step failed.")
+                print(f"  {e}")
+                print(
+                    "  Recovery/finalization will run before the repository lock is released; "
+                    "the ZIP fallback is intentionally disabled for release upgrades."
+                )
+            else:
+                print(f"✗ Release update failed before promotion: {e}")
+                print("  The ZIP fallback is intentionally disabled for release upgrades.")
+            sys.exit(1)
+        if _m()._is_windows() and not update_succeeded:
             print(f"⚠ Git update failed: {e}")
             print("→ Falling back to ZIP download...")
             print()
@@ -6469,6 +11463,35 @@ def _cmd_update_impl(args, gateway_mode: bool):
         else:
             print(f"✗ Update failed: {e}")
             sys.exit(1)
+    finally:
+        # Finalization is the release transaction's sole top-level success
+        # owner.  Capture the active exception before entering it so a failed
+        # cleanup can never replace the operation failure already in flight.
+        primary_exc_info = sys.exc_info()
+        try:
+            release_finalization_verified = False
+            if release_upgrade_context is not None:
+                release_finalization_verified = _finalize_release_upgrade_for_orchestration(
+                    git_cmd,
+                    _m().PROJECT_ROOT,
+                    release_upgrade_context,
+                    input_fn=gw_input_fn,
+                    primary_exc_info=primary_exc_info,
+                )
+            if (
+                release_finalization_verified
+                and primary_exc_info[0] is None
+            ):
+                if release_success_banner_pending:
+                    print()
+                    print("✓ Code updated!")
+                if release_completion_banner_pending:
+                    print("✓ Update complete!")
+        finally:
+            # Keep lock release outside the finalizer's failure path, exactly
+            # once, while the release context is still protected above.
+            if release_repo_lock is not None:
+                release_repo_lock.release()
 
 # --- Hoisted from the body of _cmd_update_impl (self-contained, no closure state) ---
 
