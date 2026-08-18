@@ -1,5 +1,5 @@
 diff --git a/agent/agent_init.py b/agent/agent_init.py
-index 4249979e48754b553a7b356501eb9f2bbd1103c5..e722013cfc698e4410f24fa43a739f1d9a2da962 100644
+index 67fc38bf3f5a7919344542262d07e9629178e386..6539a745d8ecfe63bc59430acdfe0dd8105dc6b0 100644
 --- a/agent/agent_init.py
 +++ b/agent/agent_init.py
 @@ -48,7 +48,11 @@ from agent.tool_guardrails import (
@@ -141,7 +141,7 @@ index 4249979e48754b553a7b356501eb9f2bbd1103c5..e722013cfc698e4410f24fa43a739f1d
  def _moa_reference_output_allowed(agent: Any) -> bool:
      """Keep MoA display events off only the machine-readable ``-Q`` surface."""
      return not (
-@@ -1933,6 +2056,33 @@ def init_agent(
+@@ -1970,6 +2093,33 @@ def init_agent(
          _api_retries = 3
      agent._api_max_retries = _api_retries
  
@@ -175,7 +175,7 @@ index 4249979e48754b553a7b356501eb9f2bbd1103c5..e722013cfc698e4410f24fa43a739f1d
      # Initialize context compressor for automatic context management
      # Compresses conversation when approaching model's context limit
      # Configuration via config.yaml (compression section)
-@@ -2632,10 +2782,29 @@ def init_agent(
+@@ -2669,10 +2819,29 @@ def init_agent(
              pass
      agent.compression_enabled = compression_enabled
      agent.compression_in_place = compression_in_place
@@ -461,7 +461,7 @@ index d66bee1cad6f63871534c8386783cd41050bab83..6f8c6eb8f419aea5fa9e42c481c78c37
          """Update tracked token usage from API response."""
          self.last_prompt_tokens = usage.get("prompt_tokens", 0)
 diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
-index 9b37cbfa90d791ea2547d838de1577de49c570f2..367bb0336c60860b88c94d6f38977f3da20e5410 100644
+index ea9e1ce264788d598e27868942974dd273e70b1c..68fc2bf6288802e3b27634a608e7f55ce629c393 100644
 --- a/agent/conversation_loop.py
 +++ b/agent/conversation_loop.py
 @@ -39,6 +39,7 @@ from agent.context_engine import automatic_compaction_status_message
@@ -472,7 +472,7 @@ index 9b37cbfa90d791ea2547d838de1577de49c570f2..367bb0336c60860b88c94d6f38977f3d
  from agent.turn_context import (
      _compression_warrants_another_preflight_pass,
      build_turn_context,
-@@ -169,6 +170,22 @@ _HANDOFF_SKIP_FINAL_RESPONSE = (
+@@ -170,6 +171,22 @@ _HANDOFF_SKIP_FINAL_RESPONSE = (
  # cancelled while waiting on the provider. Surfaces (ACP, TUI) match on this
  # to treat it as cancellation metadata rather than assistant prose.
  INTERRUPT_WAITING_FOR_MODEL_PREFIX = "Operation interrupted: waiting for model response ("
@@ -495,7 +495,7 @@ index 9b37cbfa90d791ea2547d838de1577de49c570f2..367bb0336c60860b88c94d6f38977f3d
  
  
  def _should_rearm_compression_budget(
-@@ -524,6 +541,105 @@ def _is_nous_inference_route(provider: str, base_url: str) -> bool:
+@@ -525,6 +542,105 @@ def _is_nous_inference_route(provider: str, base_url: str) -> bool:
      )
  
  
@@ -601,7 +601,7 @@ index 9b37cbfa90d791ea2547d838de1577de49c570f2..367bb0336c60860b88c94d6f38977f3d
  def _billing_or_entitlement_message(
      *,
      capability: str,
-@@ -3015,6 +3131,7 @@ def run_conversation(
+@@ -3094,6 +3210,7 @@ def run_conversation(
                  
                  # Validate response shape before proceeding
                  response_invalid = False
@@ -609,7 +609,7 @@ index 9b37cbfa90d791ea2547d838de1577de49c570f2..367bb0336c60860b88c94d6f38977f3d
                  error_details = []
                  if agent.api_mode == "codex_responses":
                      _ct_v = agent._get_transport()
-@@ -3029,14 +3146,25 @@ def run_conversation(
+@@ -3108,14 +3225,25 @@ def run_conversation(
                              _codex_resp_status = str(getattr(response, "status", "") or "").strip().lower()
                              if _codex_resp_status in {"failed", "cancelled"}:
                                  _codex_error_obj = getattr(response, "error", None)
@@ -637,7 +637,7 @@ index 9b37cbfa90d791ea2547d838de1577de49c570f2..367bb0336c60860b88c94d6f38977f3d
                                      agent._client_log_context(),
                                  )
                                  response_invalid = True
-@@ -3121,19 +3249,21 @@ def run_conversation(
+@@ -3200,19 +3328,21 @@ def run_conversation(
                      # upstream server error, or malformed response.
                      retry_count += 1
                      
@@ -672,7 +672,7 @@ index 9b37cbfa90d791ea2547d838de1577de49c570f2..367bb0336c60860b88c94d6f38977f3d
  
                      # Check for error field in response (some providers include this)
                      error_msg = "Unknown"
-@@ -3208,6 +3338,22 @@ def run_conversation(
+@@ -3287,6 +3417,22 @@ def run_conversation(
                              _retry.primary_recovery_attempted = False
                              _retry.restart_with_rebuilt_messages = True
                              break
@@ -695,7 +695,7 @@ index 9b37cbfa90d791ea2547d838de1577de49c570f2..367bb0336c60860b88c94d6f38977f3d
                          # Terminal — flush buffered retry trace so user sees what happened.
                          agent._flush_status_buffer()
                          agent._emit_status(f"❌ Max retries ({max_retries}) exceeded for invalid responses. Giving up.")
-@@ -5118,8 +5264,8 @@ def run_conversation(
+@@ -5197,8 +5343,8 @@ def run_conversation(
                  # and transport errors (connection failure / timeout / provider
                  # overloaded).  Rate limits and billing: switch immediately —
                  # the primary provider won't recover within the retry window.
@@ -706,7 +706,7 @@ index 9b37cbfa90d791ea2547d838de1577de49c570f2..367bb0336c60860b88c94d6f38977f3d
                  is_rate_limited = classified.reason in {
                      FailoverReason.rate_limit,
                      FailoverReason.billing,
-@@ -5143,7 +5289,7 @@ def run_conversation(
+@@ -5222,7 +5368,7 @@ def run_conversation(
                      max_retries = max(max_retries, zai_coding_overload_retry_ceiling())
                  _should_fallback = (
                      is_rate_limited
@@ -715,7 +715,7 @@ index 9b37cbfa90d791ea2547d838de1577de49c570f2..367bb0336c60860b88c94d6f38977f3d
                  )
                  if _should_fallback and agent._fallback_index < len(agent._fallback_chain):
                      # Don't eagerly fallback if credential pool rotation may
-@@ -5838,6 +5984,29 @@ def run_conversation(
+@@ -5917,6 +6063,29 @@ def run_conversation(
                          _retry.primary_recovery_attempted = False
                          _retry.restart_with_rebuilt_messages = True
                          break
@@ -745,7 +745,7 @@ index 9b37cbfa90d791ea2547d838de1577de49c570f2..367bb0336c60860b88c94d6f38977f3d
                      if api_kwargs is not None:
                          agent._dump_api_request_debug(
                              api_kwargs, reason="non_retryable_client_error", error=api_error,
-@@ -6052,6 +6221,26 @@ def run_conversation(
+@@ -6131,6 +6300,26 @@ def run_conversation(
                          _retry.primary_recovery_attempted = False
                          _retry.restart_with_rebuilt_messages = True
                          break
@@ -773,7 +773,7 @@ index 9b37cbfa90d791ea2547d838de1577de49c570f2..367bb0336c60860b88c94d6f38977f3d
                      agent._flush_status_buffer()
                      _final_summary = agent._summarize_api_error(api_error)
 diff --git a/agent/turn_finalizer.py b/agent/turn_finalizer.py
-index 1d27e62d70d0ed7d8998bd37e879dea05dcfdb6f..e46643d9d97261a49efae13970ee7ef3212753ac 100644
+index fbdf19cd91b4088c8525aca6567a489f863185cf..3cb3fafc75cc1f38b31a084601155c11fe79e2cc 100644
 --- a/agent/turn_finalizer.py
 +++ b/agent/turn_finalizer.py
 @@ -401,6 +401,24 @@ def finalize_turn(
@@ -811,10 +811,10 @@ index 1d27e62d70d0ed7d8998bd37e879dea05dcfdb6f..e46643d9d97261a49efae13970ee7ef3
                      and callable(getattr(_compressor, '_micro_compact', None))
                      and final_response
 diff --git a/cli-config.yaml.example b/cli-config.yaml.example
-index 5d8461431cf294d4c90d072bdd645dd91daaba13..6262c00a38fe73081c63b880ef3984a9ebeb2bb7 100644
+index d2228c76a74ba3907c44226ac1fdff5008c742d8..dd6661c2e3c34546dbaa792dd5044d6cba4f75d3 100644
 --- a/cli-config.yaml.example
 +++ b/cli-config.yaml.example
-@@ -1002,6 +1002,11 @@ agent:
+@@ -1010,6 +1010,11 @@ agent:
    # underneath this wrapper — this is the Hermes-level loop.
    # api_max_retries: 3
  
@@ -827,10 +827,10 @@ index 5d8461431cf294d4c90d072bdd645dd91daaba13..6262c00a38fe73081c63b880ef3984a9
    # verify before finishing. The default "auto" enables it on interactive
    # coding surfaces (CLI, TUI, desktop) and programmatic callers, and disables
 diff --git a/cli.py b/cli.py
-index 5b737212d5e2641ea9466cfdb3d3c81203462bf7..ba3705f906c8e611f274ea7b33703d789e0a3673 100644
+index 5467c52299043ca674ccdb3f17d033c2607f82d4..0620328fb7804a5318cb025b2e54771b1133b596 100644
 --- a/cli.py
 +++ b/cli.py
-@@ -9286,6 +9286,21 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
+@@ -9510,6 +9510,21 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
              # First session or empty history — still finalize the old session
              self._notify_session_boundary("on_session_finalize")
  
@@ -852,7 +852,7 @@ index 5b737212d5e2641ea9466cfdb3d3c81203462bf7..ba3705f906c8e611f274ea7b33703d78
          if self._session_db and old_session_id:
              # Flush any un-persisted messages from the current turn to the
              # old session *before* rotating.  /new can be called mid-turn
-@@ -9306,7 +9321,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
+@@ -9530,7 +9545,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                  pass
              # Don't let immediately-rotated empty sessions pile up in
              # /resume and `hermes sessions list` (gemini-cli#27770 port).
@@ -862,7 +862,7 @@ index 5b737212d5e2641ea9466cfdb3d3c81203462bf7..ba3705f906c8e611f274ea7b33703d78
  
          self.session_start = datetime.now()
          timestamp_str = self.session_start.strftime("%Y%m%d_%H%M%S")
-@@ -9389,6 +9405,21 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
+@@ -9613,6 +9629,21 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
              self.agent.session_start = self.session_start
              self.agent.reasoning_config = self.reasoning_config
              self.agent.reset_session_state()
@@ -884,7 +884,7 @@ index 5b737212d5e2641ea9466cfdb3d3c81203462bf7..ba3705f906c8e611f274ea7b33703d78
              if hasattr(self.agent, "_last_flushed_db_idx"):
                  self.agent._last_flushed_db_idx = 0
              if hasattr(self.agent, "_todo_store"):
-@@ -11311,6 +11342,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
+@@ -11535,6 +11566,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
              self._handle_resume_command(cmd_original)
          elif canonical == "sessions":
              self._handle_sessions_command(cmd_original)
@@ -1007,7 +1007,7 @@ index b0e067fc162ad7775b827065bab19d03c85c851f..27b48ea327fc2564d22f27a4e1ac330c
          # event's thread was auto-created by its auto-thread egress policy.
          # Lights the SAME semantic-rename lane native Discord uses
 diff --git a/gateway/run.py b/gateway/run.py
-index a4fcde2d499dee9386690cff598148af4650eea4..71df3598390ca435fc33c5c028cd687d326658ff 100644
+index 657f706fd1aa426dfc22bdadf1a958f70cecbba5..d84941636d25a3d8d0ab6611bb560164ae6ac85f 100644
 --- a/gateway/run.py
 +++ b/gateway/run.py
 @@ -45,7 +45,7 @@ from collections import OrderedDict
@@ -1141,7 +1141,7 @@ index a4fcde2d499dee9386690cff598148af4650eea4..71df3598390ca435fc33c5c028cd687d
  
  
  def load_gateway_config_for_runner() -> "GatewayConfig":
-@@ -3901,6 +3972,16 @@ def _should_clear_resume_pending_after_turn(agent_result: dict) -> bool:
+@@ -4004,6 +4075,16 @@ def _should_clear_resume_pending_after_turn(agent_result: dict) -> bool:
      return True
  
  
@@ -1158,9 +1158,9 @@ index a4fcde2d499dee9386690cff598148af4650eea4..71df3598390ca435fc33c5c028cd687d
  def _preserve_queued_followup_history_offset(
      current_result: dict,
      followup_result: dict,
-@@ -6541,11 +6622,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
-             logger.debug("could not set multiplex-active flag", exc_info=True)
-         self.adapters: Dict[Platform, BasePlatformAdapter] = {}
+@@ -6657,11 +6738,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+         # via a missing /resume or empty history (#88235).
+         self._session_db_init_error: Optional[str] = None
          # Multi-profile multiplexing: adapters for NON-default profiles live
 -        # here, keyed by profile name then Platform. self.adapters stays the
 -        # default/active profile's map so the ~93 existing self.adapters[...]
@@ -1174,7 +1174,7 @@ index a4fcde2d499dee9386690cff598148af4650eea4..71df3598390ca435fc33c5c028cd687d
          self._warn_if_docker_media_delivery_is_risky()
          _gateway_runner_ref = _weakref.ref(self)
  
-@@ -7363,6 +7445,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -7566,6 +7648,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
  
      def _session_key_for_source(self, source: SessionSource) -> str:
          """Resolve the current session key for a source, honoring gateway config when available."""
@@ -1185,7 +1185,7 @@ index a4fcde2d499dee9386690cff598148af4650eea4..71df3598390ca435fc33c5c028cd687d
          if hasattr(self, "session_store") and self.session_store is not None:
              try:
                  session_key = self.session_store._generate_session_key(source)
-@@ -11424,7 +11510,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -11627,7 +11713,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
      # .clean_shutdown marker).  All three mean "the agent was mid-turn and
      # we killed it" — eligible for startup auto-resume.
      _AUTO_RESUME_REASONS = frozenset(
@@ -1199,7 +1199,7 @@ index a4fcde2d499dee9386690cff598148af4650eea4..71df3598390ca435fc33c5c028cd687d
      )
  
      async def _run_startup_resume_event(
-@@ -11679,7 +11770,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -11882,7 +11973,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                      )
          return redelivered
  
@@ -1214,7 +1214,7 @@ index a4fcde2d499dee9386690cff598148af4650eea4..71df3598390ca435fc33c5c028cd687d
          """Auto-continue fresh restart-interrupted sessions after startup.
  
          ``resume_pending`` already preserves the transcript AND the existing
-@@ -11713,6 +11810,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -11916,6 +12013,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                      and entry.origin is not None
                      and entry.resume_reason in self._AUTO_RESUME_REASONS
                      and (platform is None or entry.origin.platform == platform)
@@ -1222,7 +1222,7 @@ index a4fcde2d499dee9386690cff598148af4650eea4..71df3598390ca435fc33c5c028cd687d
                  ]
          except Exception as exc:
              logger.warning("Failed to enumerate resume-pending sessions: %s", exc)
-@@ -11728,7 +11826,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -11931,7 +12029,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
          # is now in the loop). Defenses 1-2 cover the cron/CLI/terminal paths;
          # this catches every other SIGTERM source (e.g. a raw `terminal(
          # "launchctl kickstart ai.hermes.gateway")`).
@@ -1231,7 +1231,7 @@ index a4fcde2d499dee9386690cff598148af4650eea4..71df3598390ca435fc33c5c028cd687d
              try:
                  from gateway import restart_loop_guard as _rlg
  
-@@ -14685,6 +14783,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -14915,6 +15013,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
              return 0
  
          active = get_active_profile_name() or "default"
@@ -1266,7 +1266,7 @@ index a4fcde2d499dee9386690cff598148af4650eea4..71df3598390ca435fc33c5c028cd687d
          connected = 0
          # Resource claim -> profile that owns it. Credential claims prevent two
          # profiles polling the same account; listener claims prevent sidecars
-@@ -14706,7 +14832,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -14936,7 +15062,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                  if isinstance(retry_claim, tuple):
                      claimed[retry_claim] = active
  
@@ -1274,7 +1274,7 @@ index a4fcde2d499dee9386690cff598148af4650eea4..71df3598390ca435fc33c5c028cd687d
          for profile_name, profile_home in profile_homes:
              if profile_name == active:
                  continue  # handled by the primary startup loop
-@@ -15806,6 +15931,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -16062,6 +16187,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
          # is truly hung — the executor thread is blocked and never checks
          # _interrupt_requested.  Force-clean _running_agents so the session
          # is unlocked and subsequent messages are processed normally.
@@ -1285,7 +1285,7 @@ index a4fcde2d499dee9386690cff598148af4650eea4..71df3598390ca435fc33c5c028cd687d
          await self._interrupt_and_clear_session(
              quick_key,
              source,
-@@ -16887,6 +17016,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -17143,6 +17272,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
          if canonical == "status":
              return await self._handle_status_command(event)
  
@@ -1295,7 +1295,7 @@ index a4fcde2d499dee9386690cff598148af4650eea4..71df3598390ca435fc33c5c028cd687d
          if canonical == "egress":
              from hermes_cli.proxy_cli import format_status_text
  
-@@ -17483,6 +17615,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -17739,6 +17871,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
          _claim_state.turn.started_ts = time.time()
          self._persist_active_agents()
          _run_generation = self._begin_session_run_generation(_quick_key)
@@ -1303,7 +1303,7 @@ index a4fcde2d499dee9386690cff598148af4650eea4..71df3598390ca435fc33c5c028cd687d
  
          try:
              try:
-@@ -17505,13 +17638,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -17761,13 +17894,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                      "protect the transcript, this message was not processed. "
                      "Wait for the active turn to finish, then resend it."
                  )
@@ -1339,7 +1339,7 @@ index a4fcde2d499dee9386690cff598148af4650eea4..71df3598390ca435fc33c5c028cd687d
              except Exception as _goal_exc:
                  logger.debug("post-turn hook failed: %s", _goal_exc)
              return _agent_result
-@@ -17542,6 +17691,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -17798,6 +17947,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
              # (routing key, run generation) so this unwind can only ever free
              # the lease its own turn acquired, never a newer turn's.
              self._release_turn_lease(_quick_key, _run_generation)
@@ -1357,7 +1357,7 @@ index a4fcde2d499dee9386690cff598148af4650eea4..71df3598390ca435fc33c5c028cd687d
  
      def _restore_moa_one_shot(self, event: "MessageEvent", quick_key: str) -> None:
          """Revert a ``/moa <prompt>`` one-shot model override after its turn.
-@@ -27370,64 +27530,137 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -27630,64 +27790,137 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
          )
          return None
  
@@ -1541,7 +1541,7 @@ index a4fcde2d499dee9386690cff598148af4650eea4..71df3598390ca435fc33c5c028cd687d
      async def _run_agent_inner(
          self,
 diff --git a/gateway/slash_commands.py b/gateway/slash_commands.py
-index 925c64b3a7dd73d54fe4fafed55912831f30dd8a..25c18da9c5856c44b811100bfede349a16d5ca49 100644
+index d66162fb60d975f1d7decfa050c37bc7c277cb18..05b72eb19605c551b07ff3d8f77a372f80d51df9 100644
 --- a/gateway/slash_commands.py
 +++ b/gateway/slash_commands.py
 @@ -405,6 +405,220 @@ class GatewaySlashCommandsMixin:
@@ -1765,7 +1765,7 @@ index 925c64b3a7dd73d54fe4fafed55912831f30dd8a..25c18da9c5856c44b811100bfede349a
      async def _handle_whoami_command(self, event: MessageEvent) -> str:
          """Handle /whoami — show the user's slash command access on this scope.
  
-@@ -1418,6 +1632,14 @@ class GatewaySlashCommandsMixin:
+@@ -1438,6 +1652,14 @@ class GatewaySlashCommandsMixin:
          source = event.source
          session_entry = await self.async_session_store.get_or_create_session(source)
          session_key = session_entry.session_key
@@ -1781,10 +1781,10 @@ index 925c64b3a7dd73d54fe4fafed55912831f30dd8a..25c18da9c5856c44b811100bfede349a
          agent = self._running_agents.get(session_key)
          if agent is _AGENT_PENDING_SENTINEL:
 diff --git a/hermes_cli/cli_commands_mixin.py b/hermes_cli/cli_commands_mixin.py
-index 4349db8926d157229298b549fa17ccfc77f08d66..4f546d13be1d4f550964348ff96a3f9d1b3613c3 100644
+index ceca64c67697d50d5bf60ca4c19402cd15dcecb7..40023aca5d01973741a6a772ee3e4d5c76f676e3 100644
 --- a/hermes_cli/cli_commands_mixin.py
 +++ b/hermes_cli/cli_commands_mixin.py
-@@ -1082,6 +1082,27 @@ class CLICommandsMixin:
+@@ -1112,6 +1112,27 @@ class CLICommandsMixin:
          if self.agent:
              self.agent.session_id = target_id
              self.agent.reset_session_state()
@@ -1812,7 +1812,7 @@ index 4349db8926d157229298b549fa17ccfc77f08d66..4f546d13be1d4f550964348ff96a3f9d
              if hasattr(self.agent, "_last_flushed_db_idx"):
                  self.agent._last_flushed_db_idx = len(self.conversation_history)
              if hasattr(self.agent, "_todo_store"):
-@@ -3194,6 +3215,37 @@ class CLICommandsMixin:
+@@ -3316,6 +3337,37 @@ class CLICommandsMixin:
          result = run_approval_mode_command(requested)
          _cprint(f"  {result.message}")
  
@@ -1851,7 +1851,7 @@ index 4349db8926d157229298b549fa17ccfc77f08d66..4f546d13be1d4f550964348ff96a3f9d
          """Toggle or inspect ``display.runtime_footer.enabled`` from the CLI.
  
 diff --git a/hermes_cli/commands.py b/hermes_cli/commands.py
-index c1865dfad7fd77b3f117c393b3502b349ca324bd..d62a60946c4a072fcc9838a4fda7b5bb4fa58a4e 100644
+index 350ee7411c05d50592a44655770572a8d8d6ba5c..12fa702429828743b0b72f2dadbdb2e454b83920 100644
 --- a/hermes_cli/commands.py
 +++ b/hermes_cli/commands.py
 @@ -127,6 +127,10 @@ class CommandDef:
@@ -1865,8 +1865,8 @@ index c1865dfad7fd77b3f117c393b3502b349ca324bd..d62a60946c4a072fcc9838a4fda7b5bb
  
  
  # Valid values for CommandDef.busy_policy (see field docs above).
-@@ -169,6 +173,12 @@ COMMAND_REGISTRY: list[CommandDef] = [
-                aliases=("fork",), args_hint="[name]"),
+@@ -172,6 +176,12 @@ COMMAND_REGISTRY: list[CommandDef] = [
+                subcommands=("new", "list")),
      CommandDef("compress", "Compress conversation context (add 'here [N]' to keep recent N turns; --preview shows what would happen)", "Session",
                 aliases=("compact",), args_hint="[here [N] | focus topic | --preview|--dry-run]"),
 +    CommandDef("micro", "Set the current session's micro-compaction policy", "Configuration",
@@ -1875,10 +1875,10 @@ index c1865dfad7fd77b3f117c393b3502b349ca324bd..d62a60946c4a072fcc9838a4fda7b5bb
 +               subcommands=("on", "off", "inherit", "status"),
 +               advertise_in_gateway_menu=False,
 +               busy_policy="reject"),
-     CommandDef("rollback", "List or restore filesystem checkpoints", "Session",
-                args_hint="[number]"),
+     CommandDef("rollback", "List or restore filesystem checkpoints (restores keep your hand-edits; --all overrides)", "Session",
+                args_hint="[number] [--all]"),
      CommandDef("snapshot", "Create or restore state snapshots of Hermes config/state", "Session",
-@@ -573,7 +583,7 @@ def _resolve_config_gates() -> set[str]:
+@@ -576,7 +586,7 @@ def _resolve_config_gates() -> set[str]:
  
  
  def _is_gateway_available(cmd: CommandDef, config_overrides: set[str] | None = None) -> bool:
@@ -1887,7 +1887,7 @@ index c1865dfad7fd77b3f117c393b3502b349ca324bd..d62a60946c4a072fcc9838a4fda7b5bb
  
      Unconditionally available when ``cli_only`` is False.  When ``cli_only``
      is True but ``gateway_config_gate`` is set, the command is available only
-@@ -588,6 +598,18 @@ def _is_gateway_available(cmd: CommandDef, config_overrides: set[str] | None = N
+@@ -591,6 +601,18 @@ def _is_gateway_available(cmd: CommandDef, config_overrides: set[str] | None = N
      return False
  
  
@@ -1906,7 +1906,7 @@ index c1865dfad7fd77b3f117c393b3502b349ca324bd..d62a60946c4a072fcc9838a4fda7b5bb
  def _requires_argument(args_hint: str) -> bool:
      """Return True when selecting a command without text would be incomplete."""
      return args_hint.strip().startswith("<")
-@@ -661,7 +683,7 @@ def telegram_bot_commands() -> list[tuple[str, str]]:
+@@ -664,7 +686,7 @@ def telegram_bot_commands() -> list[tuple[str, str]]:
      overrides = _resolve_config_gates()
      result: list[tuple[str, str]] = []
      for cmd in COMMAND_REGISTRY:
@@ -1915,7 +1915,7 @@ index c1865dfad7fd77b3f117c393b3502b349ca324bd..d62a60946c4a072fcc9838a4fda7b5bb
              continue
          # Built-in arg-taking commands are included — their handlers show
          # usage text when invoked without arguments, and hiding them from
-@@ -1397,7 +1419,7 @@ def slack_native_slashes() -> list[tuple[str, str, str]]:
+@@ -1412,7 +1434,7 @@ def slack_native_slashes() -> list[tuple[str, str, str]]:
      _alias_to_cmd = {
          alias: cmd
          for cmd in COMMAND_REGISTRY
@@ -1924,7 +1924,7 @@ index c1865dfad7fd77b3f117c393b3502b349ca324bd..d62a60946c4a072fcc9838a4fda7b5bb
          for alias in cmd.aliases
      }
      for alias in _SLACK_PRIORITY_ALIASES:
-@@ -1407,13 +1429,13 @@ def slack_native_slashes() -> list[tuple[str, str, str]]:
+@@ -1422,13 +1444,13 @@ def slack_native_slashes() -> list[tuple[str, str, str]]:
  
      # First pass: canonical names (so they win slots if we hit the cap).
      for cmd in COMMAND_REGISTRY:
@@ -1941,7 +1941,7 @@ index c1865dfad7fd77b3f117c393b3502b349ca324bd..d62a60946c4a072fcc9838a4fda7b5bb
          for alias in cmd.aliases:
              # Skip aliases that only differ from canonical by case/punctuation
 diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
-index 37be35baeec3210c1e0ddc57497a027ed411f829..ba04041fc54aa5c93c3395057a9a5ab86d6c8778 100644
+index 29ae25d7f700d8b9aefecce3305580a8fd682f2d..0a72e1137eca90cafcf8b2aad34e6e2e7673cf3a 100644
 --- a/hermes_cli/config_defaults.py
 +++ b/hermes_cli/config_defaults.py
 @@ -44,6 +44,15 @@ DEFAULT_CONFIG = {
@@ -1961,7 +1961,7 @@ index 37be35baeec3210c1e0ddc57497a027ed411f829..ba04041fc54aa5c93c3395057a9a5ab8
          # The agent can run indefinitely as long as it's actively calling
          # tools or receiving API responses.  Only fires when the agent has
 diff --git a/hermes_cli/main.py b/hermes_cli/main.py
-index ed9fe973ab268b41284529cc4c89559af7db261d..13c412571f680a532d0cbaabc7663931b59c77b9 100644
+index 1e8a83b18c1f6e3b5af205d75a5b2c0d5d8d8dff..a3851e10c15b18ba6cf1a3628ea253eca01b17d9 100644
 --- a/hermes_cli/main.py
 +++ b/hermes_cli/main.py
 @@ -35,7 +35,8 @@ Usage:
@@ -1974,7 +1974,7 @@ index ed9fe973ab268b41284529cc4c89559af7db261d..13c412571f680a532d0cbaabc7663931
      hermes uninstall           Uninstall Hermes Agent
      hermes acp                 Run as an ACP server for editor integration
      hermes sessions browse     Interactive session picker with search
-@@ -9792,6 +9793,214 @@ def _size_delta_label(saved_mb: float) -> str:
+@@ -9892,6 +9893,214 @@ def _size_delta_label(saved_mb: float) -> str:
      return f"grew by {-saved_mb:.1f} MB"
  
  
@@ -2189,7 +2189,7 @@ index ed9fe973ab268b41284529cc4c89559af7db261d..13c412571f680a532d0cbaabc7663931
  def cmd_update(args):
      """Update Hermes Agent to the latest version.
  
-@@ -13351,7 +13560,11 @@ def main():
+@@ -13531,7 +13740,11 @@ def main():
      # =========================================================================
      # update command  (parser built in hermes_cli/subcommands/update.py)
      # =========================================================================
@@ -2605,7 +2605,7 @@ index 0000000000000000000000000000000000000000..546ef53e19b041c7860400da8c7cb6ed
 +evaluate_micro_compact = effective_micro_compact
 +format_micro_status = format_micro_compact_status
 diff --git a/hermes_cli/profiles.py b/hermes_cli/profiles.py
-index fe582aca984382a0f8f32b41f380e5f889080961..6c06a28366f5471d31e462e4ef091d5496980298 100644
+index ad52b7b865e45e686a2a97c59c3be72dc92e783c..a5f0447c847298204473a057fcd8017a816dde0c 100644
 --- a/hermes_cli/profiles.py
 +++ b/hermes_cli/profiles.py
 @@ -316,7 +316,7 @@ def normalize_profile_name(name: str) -> str:
@@ -2749,7 +2749,7 @@ index fe582aca984382a0f8f32b41f380e5f889080961..6c06a28366f5471d31e462e4ef091d54
      if allowed is not None:
          missing = tuple(sorted(allowed - {name for name, _ in serve}))
 diff --git a/hermes_cli/subcommands/update.py b/hermes_cli/subcommands/update.py
-index f612001fa0ee0691674e5d50fe775a2ddb225b8b..e2e2a0f3a84897bf7c81a827d7dec38227d541ea 100644
+index f612001fa0ee0691674e5d50fe775a2ddb225b8b..7b0009b7cfc8ad483f06079ae3dfad569de2342d 100644
 --- a/hermes_cli/subcommands/update.py
 +++ b/hermes_cli/subcommands/update.py
 @@ -9,8 +9,13 @@ from __future__ import annotations
@@ -2768,7 +2768,7 @@ index f612001fa0ee0691674e5d50fe775a2ddb225b8b..e2e2a0f3a84897bf7c81a827d7dec382
      # =========================================================================
      # update command
      # =========================================================================
-@@ -74,3 +79,59 @@ def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
+@@ -74,3 +79,60 @@ def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
          help="Windows: mutate the venv even while other processes are running from its interpreter (desktop backend, gateway, terminals). Those processes keep native .pyd files locked, so the dependency sync will likely fail partway and strand the install half-updated. Use only if you know the detected holders are false positives.",
      )
      update_parser.set_defaults(func=cmd_update)
@@ -2780,8 +2780,9 @@ index f612001fa0ee0691674e5d50fe775a2ddb225b8b..e2e2a0f3a84897bf7c81a827d7dec382
 +        "upgrade",
 +        help="Upgrade Hermes Agent to the latest published Release",
 +        description=(
-+            "Fetch the latest GitHub Release, reset the local hermes-release "
-+            "branch to that tag, then reapply in-repo local-patches/"
++            "Fetch the latest GitHub Release, incrementally merge it into the "
++            "long-lived hermes-release branch, then validate and promote the "
++            "isolated candidate"
 +        ),
 +    )
 +    upgrade_parser.add_argument(
@@ -2829,10 +2830,10 @@ index f612001fa0ee0691674e5d50fe775a2ddb225b8b..e2e2a0f3a84897bf7c81a827d7dec382
 +    )
 +    upgrade_parser.set_defaults(func=cmd_upgrade)
 diff --git a/hermes_cli/update_cmd.py b/hermes_cli/update_cmd.py
-index 57cff41fdcb31b85673ba81fa2901684773e4af6..11c0af3d92b3931cc7cf37ebb567fccf9211b090 100644
+index e05850c7b9ce62e6fc29c53e976ea5f23766463d..0c8448beff475a876c3dea7d9829c9e609a09a45 100644
 --- a/hermes_cli/update_cmd.py
 +++ b/hermes_cli/update_cmd.py
-@@ -27,32 +27,4571 @@ import hashlib
+@@ -27,32 +27,4762 @@ import hashlib
  import json
  import logging
  import os
@@ -3353,6 +3354,8 @@ index 57cff41fdcb31b85673ba81fa2901684773e4af6..11c0af3d92b3931cc7cf37ebb567fccf
 +    target_sha: str | None = None
 +    patch_sha256: str | None = None
 +    patch_bytes: int | None = None
++    format_version: int = 1
++    integration_mode: str = "snapshot-patch"
 +
 +
 +@dataclass(frozen=True)
@@ -4344,6 +4347,8 @@ index 57cff41fdcb31b85673ba81fa2901684773e4af6..11c0af3d92b3931cc7cf37ebb567fccf
 +    target_sha = payload.get("target_sha")
 +    patch_sha256 = payload.get("patch_sha256")
 +    patch_bytes = payload.get("patch_bytes")
++    format_version = payload.get("format_version", 1)
++    integration_mode = payload.get("integration_mode")
 +    if not isinstance(tag, str) or not tag:
 +        raise RuntimeError(f"Invalid release metadata {source}: missing tag")
 +    if not isinstance(base_sha, str) or not _SHA_RE.fullmatch(base_sha):
@@ -4361,12 +4366,32 @@ index 57cff41fdcb31b85673ba81fa2901684773e4af6..11c0af3d92b3931cc7cf37ebb567fccf
 +        not isinstance(patch_bytes, int) or patch_bytes < 0
 +    ):
 +        raise RuntimeError(f"Invalid release metadata {source}: invalid patch_bytes")
++    if not isinstance(format_version, int) or isinstance(format_version, bool):
++        raise RuntimeError(f"Invalid release metadata {source}: invalid format_version")
++    if format_version not in {1, 2}:
++        raise RuntimeError(
++            f"Invalid release metadata {source}: unsupported format_version {format_version}"
++        )
++    if integration_mode is None:
++        integration_mode = "snapshot-patch" if format_version == 1 else "incremental-merge"
++    if integration_mode not in {"snapshot-patch", "incremental-merge"}:
++        raise RuntimeError(f"Invalid release metadata {source}: invalid integration_mode")
++    if format_version == 1 and integration_mode != "snapshot-patch":
++        raise RuntimeError(
++            f"Invalid release metadata {source}: format_version 1 requires snapshot-patch"
++        )
++    if format_version == 2 and integration_mode != "incremental-merge":
++        raise RuntimeError(
++            f"Invalid release metadata {source}: format_version 2 requires incremental-merge"
++        )
 +    return ReleaseBaseMetadata(
 +        tag=tag,
 +        base_sha=base_sha.lower(),
 +        target_sha=target_sha.lower() if isinstance(target_sha, str) else None,
 +        patch_sha256=patch_sha256.lower() if isinstance(patch_sha256, str) else None,
 +        patch_bytes=patch_bytes,
++        format_version=format_version,
++        integration_mode=integration_mode,
 +    )
 +
 +
@@ -4419,6 +4444,37 @@ index 57cff41fdcb31b85673ba81fa2901684773e4af6..11c0af3d92b3931cc7cf37ebb567fccf
 +        raise RuntimeError(
 +            f"Release metadata target {metadata.target_sha} is missing from the repository."
 +        )
++
++
++def _validate_incremental_release_target(
++    git_cmd: list[str],
++    cwd: Path | str,
++    *,
++    previous_base_sha: str,
++    target_sha: str,
++) -> None:
++    """Require release upgrades to advance the recorded upstream lineage."""
++
++    ancestry = subprocess.run(
++        git_cmd + ["merge-base", "--is-ancestor", previous_base_sha, target_sha],
++        cwd=cwd,
++        capture_output=True,
++        text=True,
++        encoding="utf-8",
++        errors="replace",
++    )
++    if ancestry.returncode == 0:
++        return
++    if ancestry.returncode == 1:
++        raise RuntimeError(
++            f"Release target {target_sha} does not descend from the recorded upstream "
++            f"base {previous_base_sha}; refusing a non-linear maintenance merge."
++        )
++    detail = (ancestry.stderr or ancestry.stdout or "").strip()
++    raise RuntimeError(
++        "Could not verify release ancestry"
++        + (f": {detail.splitlines()[0]}" if detail else ".")
++    )
 +
 +
 +def _maintenance_pathspec() -> str:
@@ -5387,6 +5443,120 @@ index 57cff41fdcb31b85673ba81fa2901684773e4af6..11c0af3d92b3931cc7cf37ebb567fccf
 +            pass
 +
 +
++def _merge_release_into_candidate(
++    git_cmd: list[str],
++    candidate: Path,
++    *,
++    maintenance_sha: str,
++    target_sha: str,
++    release_tag: str,
++) -> str:
++    """Incrementally merge one upstream release into an isolated candidate."""
++
++    merged = subprocess.run(
++        git_cmd
++        + [
++            "-c",
++            "rerere.enabled=true",
++            "-c",
++            "rerere.autoupdate=true",
++            "merge",
++            "--no-ff",
++            "--no-commit",
++            target_sha,
++        ],
++        cwd=candidate,
++        capture_output=True,
++        text=True,
++        encoding="utf-8",
++        errors="replace",
++    )
++    unmerged = subprocess.run(
++        git_cmd + ["ls-files", "--unmerged"],
++        cwd=candidate,
++        capture_output=True,
++        text=True,
++        encoding="utf-8",
++        errors="replace",
++    )
++    conflict_paths: list[str] = []
++    for line in (unmerged.stdout or "").splitlines():
++        path = line.split("\t", 1)[1].strip() if "\t" in line else ""
++        if path and path not in conflict_paths:
++            conflict_paths.append(path)
++
++    merge_head = _git_resolve_commit(git_cmd, candidate, "MERGE_HEAD")
++    if (
++        unmerged.returncode != 0
++        or conflict_paths
++        or merge_head != target_sha
++        or (merged.returncode != 0 and merge_head is None)
++    ):
++        detail_parts: list[str] = []
++        if conflict_paths:
++            shown = conflict_paths[:20]
++            suffix = (
++                f" (+{len(conflict_paths) - len(shown)} more)"
++                if len(conflict_paths) > len(shown)
++                else ""
++            )
++            detail_parts.append("unmerged path(s): " + ", ".join(shown) + suffix)
++        if unmerged.returncode != 0:
++            detail_parts.append("could not inspect the candidate's unmerged index")
++        merge_output = "\n".join(
++            part.strip()
++            for part in (merged.stderr or "", merged.stdout or "")
++            if part and part.strip()
++        )
++        if merge_output:
++            detail_parts.append(merge_output[:4000])
++        detail = "; ".join(detail_parts) or "incremental git merge failed"
++        raise RuntimeError(
++            f"Release {release_tag} conflicts in isolated candidate: {detail}"
++        )
++
++    _validate_candidate_gitlinks(git_cmd, candidate)
++    commit = subprocess.run(
++        git_cmd
++        + [
++            "commit",
++            "--no-gpg-sign",
++            "-m",
++            f"local: merge upstream release {release_tag}",
++        ],
++        cwd=candidate,
++        capture_output=True,
++        text=True,
++        encoding="utf-8",
++        errors="replace",
++    )
++    if commit.returncode != 0:
++        detail = (commit.stderr or commit.stdout or "").strip()
++        raise RuntimeError(
++            f"Could not commit incremental release merge: "
++            f"{detail.splitlines()[0] if detail else 'git commit failed'}"
++        )
++
++    candidate_head = _git_resolve_commit(git_cmd, candidate, "HEAD")
++    parents = subprocess.run(
++        git_cmd + ["rev-list", "--parents", "-n", "1", "HEAD"],
++        cwd=candidate,
++        capture_output=True,
++        text=True,
++        encoding="utf-8",
++        errors="replace",
++    )
++    fields = (parents.stdout or "").strip().lower().split()
++    expected = [candidate_head, maintenance_sha, target_sha]
++    if parents.returncode != 0 or fields != expected:
++        raise RuntimeError(
++            "Incremental release candidate did not preserve the expected maintenance "
++            "and upstream parents."
++        )
++    assert candidate_head is not None
++    return candidate_head
++
++
 +def _validate_candidate_gitlinks(git_cmd: list[str], candidate: Path) -> None:
 +    """Reject submodule-like index entries before a candidate is applied."""
 +
@@ -5482,7 +5652,7 @@ index 57cff41fdcb31b85673ba81fa2901684773e4af6..11c0af3d92b3931cc7cf37ebb567fccf
 +    transaction_context: ReleaseUpgradeContext | None = None,
 +    candidate_validator=None,
 +) -> ReleaseUpgradeResult:
-+    """Replay maintenance changes in isolation, then CAS-promote the candidate."""
++    """Merge an upstream release in isolation, then CAS-promote the candidate."""
 +
 +    root = Path(cwd).resolve()
 +    _validate_release_tag_name(git_cmd, root, release_tag)
@@ -5536,6 +5706,12 @@ index 57cff41fdcb31b85673ba81fa2901684773e4af6..11c0af3d92b3931cc7cf37ebb567fccf
 +    context = transaction_context
 +    if context is None:
 +        metadata = _read_release_base_metadata(root)
++        _validate_incremental_release_target(
++            git_cmd,
++            root,
++            previous_base_sha=metadata.base_sha,
++            target_sha=target_sha,
++        )
 +        payload = _generate_runtime_local_payload(git_cmd, root, metadata, head_sha=old_sha)
 +        context = _create_release_upgrade_context(
 +            git_cmd,
@@ -5556,6 +5732,15 @@ index 57cff41fdcb31b85673ba81fa2901684773e4af6..11c0af3d92b3931cc7cf37ebb567fccf
 +        message = "Live maintenance ref changed before promotion; candidate and backup were preserved."
 +        _release_mark_manual_interference(context, message)
 +        raise ReleaseGitStateError(message)
++    recorded_base_sha = journal.get("base_sha")
++    if not isinstance(recorded_base_sha, str) or not _SHA_RE.fullmatch(recorded_base_sha):
++        raise RuntimeError("Release transaction has no valid recorded upstream base.")
++    _validate_incremental_release_target(
++        git_cmd,
++        root,
++        previous_base_sha=recorded_base_sha.lower(),
++        target_sha=target_sha,
++    )
 +    if "pre_cas_snapshot" in journal:
 +        try:
 +            current_snapshot = _validate_release_git_snapshot(
@@ -5596,7 +5781,7 @@ index 57cff41fdcb31b85673ba81fa2901684773e4af6..11c0af3d92b3931cc7cf37ebb567fccf
 +
 +    try:
 +        worktree = subprocess.run(
-+            git_cmd + ["worktree", "add", "-b", candidate_branch, str(candidate_path), target_sha],
++            git_cmd + ["worktree", "add", "-b", candidate_branch, str(candidate_path), old_sha],
 +            cwd=root,
 +            capture_output=True,
 +            text=True,
@@ -5612,18 +5797,19 @@ index 57cff41fdcb31b85673ba81fa2901684773e4af6..11c0af3d92b3931cc7cf37ebb567fccf
 +            )
 +        _journal_update(context, "candidate-created", candidate_created=True)
 +        _validate_candidate_gitlinks(git_cmd, candidate_path)
-+        _apply_payload_to_candidate(git_cmd, candidate_path, payload, label=release_tag)
-+        _commit_candidate_changes(
-+            git_cmd, candidate_path, f"local: replay maintenance payload onto {release_tag}"
++        candidate_head = _merge_release_into_candidate(
++            git_cmd,
++            candidate_path,
++            maintenance_sha=old_sha,
++            target_sha=target_sha,
++            release_tag=release_tag,
 +        )
-+        candidate_head = _git_resolve_commit(git_cmd, candidate_path, "HEAD")
-+        if candidate_head is None:
-+            raise RuntimeError("Candidate payload commit did not produce a commit SHA.")
 +        artifact_dir = _candidate_artifact_directory(candidate_path)
 +        artifact_payload = _git_diff_bytes(git_cmd, candidate_path, target_sha, candidate_head)
 +        artifact_sha = hashlib.sha256(artifact_payload).hexdigest()
 +        artifact_metadata = {
-+            "format_version": 1,
++            "format_version": 2,
++            "integration_mode": "incremental-merge",
 +            "tag": release_tag,
 +            "base_sha": target_sha,
 +            "target_sha": target_sha,
@@ -5844,6 +6030,12 @@ index 57cff41fdcb31b85673ba81fa2901684773e4af6..11c0af3d92b3931cc7cf37ebb567fccf
 +    maintenance_sha = original_snapshot.maintenance_ref_sha
 +    metadata = _read_release_base_metadata_at_commit(git_cmd, root, maintenance_sha)
 +    _validate_release_base_metadata(git_cmd, root, metadata, maintenance_sha)
++    _validate_incremental_release_target(
++        git_cmd,
++        root,
++        previous_base_sha=metadata.base_sha,
++        target_sha=target_sha.lower(),
++    )
 +    payload = _git_diff_bytes(git_cmd, root, metadata.base_sha, maintenance_sha)
 +    context = _create_release_upgrade_context(
 +        git_cmd,
@@ -7414,7 +7606,7 @@ index 57cff41fdcb31b85673ba81fa2901684773e4af6..11c0af3d92b3931cc7cf37ebb567fccf
  
  
  _UPDATE_RUNTIME_RELOAD_MODULES = (
-@@ -85,7 +4624,6 @@ def _reload_updated_runtime_modules() -> None:
+@@ -85,7 +4815,6 @@ def _reload_updated_runtime_modules() -> None:
      except Exception as exc:
          logger.debug("Could not refresh update runtime modules: %s", exc)
  
@@ -7422,14 +7614,12 @@ index 57cff41fdcb31b85673ba81fa2901684773e4af6..11c0af3d92b3931cc7cf37ebb567fccf
  def _reload_config_modules() -> None:
      """Force-reload modules from disk after git pull.
  
-@@ -135,92 +4673,492 @@ def _run_config_check_fresh() -> tuple:
-     _reload_config_modules()
-     from hermes_cli.config import check_config_version
+@@ -138,89 +4867,491 @@ def _run_config_check_fresh() -> tuple:
+     return check_config_version()
  
--    return check_config_version()
-+    return check_config_version()
-+
-+
+ 
+-def _run_migrate_config_fresh(*, interactive: bool = False, quiet: bool = False) -> dict:
+-    """Run config migration using freshly-reloaded modules.
 +def _run_migrate_config_fresh(*, interactive: bool = False, quiet: bool = False) -> dict:
 +    """Run config migration using freshly-reloaded modules.
 +
@@ -7482,16 +7672,18 @@ index 57cff41fdcb31b85673ba81fa2901684773e4af6..11c0af3d92b3931cc7cf37ebb567fccf
 +These artifacts are maintained on the ``hermes-release`` branch.
 +
 +``hermes upgrade`` captures user changes before any cleanup, generates the
-+maintenance payload from committed Git history (not this file), replays it in
-+a temporary candidate worktree with ``git apply --3way --index``, validates the
-+candidate, and only then promotes it.  The generated patch is a portable,
-+byte-safe snapshot for inspection and recovery; it is never the sole source of
-+truth for an upgrade.
++maintenance payload from committed Git history (not this file), incrementally
++merges the new upstream release into the long-lived maintenance history in a
++temporary candidate worktree, validates the candidate, and only then promotes
++it.  Git rerere is enabled for the isolated merge so a previously recorded
++resolution can be reused.  The generated patch is a portable, byte-safe
++snapshot for inspection and recovery; it is never the upgrade input or sole
++source of truth.
 +
 +The payload excludes this directory so the series cannot patch itself.  The
-+JSON ``.release_base`` file records the human release tag, immutable base SHA,
-+and patch hash/size.  A missing or stale patch artifact therefore cannot make a
-+committed local change disappear.
++JSON ``.release_base`` file records the integration mode, human release tag,
++immutable upstream base SHA, and patch hash/size.  A missing or stale patch
++artifact therefore cannot make a committed local change disappear.
 +
 +## Regenerate after editing local customizations
 +
@@ -7840,10 +8032,8 @@ index 57cff41fdcb31b85673ba81fa2901684773e4af6..11c0af3d92b3931cc7cf37ebb567fccf
 +        stdout=reset_result.stdout,
 +        stderr=reset_result.stderr,
 +    )
- 
- 
--def _run_migrate_config_fresh(*, interactive: bool = False, quiet: bool = False) -> dict:
--    """Run config migration using freshly-reloaded modules.
++
++
 +def _validate_critical_files_syntax(root) -> tuple[bool, str | None, str | None]:
 +    """Strictly compile every required production file in a candidate.
  
@@ -7982,7 +8172,7 @@ index 57cff41fdcb31b85673ba81fa2901684773e4af6..11c0af3d92b3931cc7cf37ebb567fccf
      return True, None, None
  
  
-@@ -229,6 +5167,7 @@ def _validate_critical_files_syntax(root) -> tuple[bool, str | None, str | None]
+@@ -229,6 +5360,7 @@ def _validate_critical_files_syntax(root) -> tuple[bool, str | None, str | None]
  # is caught — a file can be syntactically perfect and still fail to import
  # because a name it pulls from a sibling module no longer exists.
  _UPDATE_CRITICAL_MODULES = (
@@ -7990,7 +8180,7 @@ index 57cff41fdcb31b85673ba81fa2901684773e4af6..11c0af3d92b3931cc7cf37ebb567fccf
      "hermes_cli.main",
      "run_agent",
      "model_tools",
-@@ -237,83 +5176,117 @@ _UPDATE_CRITICAL_MODULES = (
+@@ -237,83 +5369,117 @@ _UPDATE_CRITICAL_MODULES = (
  
  
  def _validate_critical_modules_import(root) -> tuple[bool, str | None, str | None]:
@@ -8001,7 +8191,8 @@ index 57cff41fdcb31b85673ba81fa2901684773e4af6..11c0af3d92b3931cc7cf37ebb567fccf
 -    ``tools/`` is old parses perfectly and still dies at startup with
 -    ``ImportError: cannot import name 'TODO_INJECTION_HEADER' from
 -    'tools.todo_tool'``. Every file is valid Python; the *combination* is not.
--
++    """Import every critical module from the candidate in an isolated process.
+ 
 -    That skew is reachable on the Windows ZIP-update path, whose copy loop
 -    walks top-level entries in ``os.listdir`` order and replaces each one
 -    independently — ``agent/`` lands long before ``tools/``, so a failure or
@@ -8010,8 +8201,7 @@ index 57cff41fdcb31b85673ba81fa2901684773e4af6..11c0af3d92b3931cc7cf37ebb567fccf
 -    Runs in a subprocess because importing these modules into the running
 -    updater would pollute ``sys.modules`` and execute import-time side effects
 -    against the half-updated tree. Costs ~0.4s.
-+    """Import every critical module from the candidate in an isolated process.
- 
+-
 -    Uses the project venv's interpreter when there is one (matching
 -    ``_venv_core_imports_healthy``): ``hermes update`` can be driven by a
 -    different Python than the install's own, and probing the wrong
@@ -8160,7 +8350,7 @@ index 57cff41fdcb31b85673ba81fa2901684773e4af6..11c0af3d92b3931cc7cf37ebb567fccf
  def _gateway_prompt(prompt_text: str, default: str = "", timeout: float = 300.0) -> str:
      """File-based IPC prompt for gateway mode.
  
-@@ -1208,43 +6181,45 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False):
+@@ -1418,43 +6584,45 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False):
      # git-update path for rationale (#30271).
      _finish_dashboard_update_cleanup(node_failures)
  
@@ -8231,7 +8421,7 @@ index 57cff41fdcb31b85673ba81fa2901684773e4af6..11c0af3d92b3931cc7cf37ebb567fccf
      push = subprocess.run(
          git_cmd + ["stash", "push", "--include-untracked", "-m", stash_name],
          cwd=cwd,
-@@ -1253,59 +6228,58 @@ def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[st
+@@ -1463,59 +6631,58 @@ def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[st
      )
      if push.stdout.strip():
          print(push.stdout.strip())
@@ -8268,11 +8458,11 @@ index 57cff41fdcb31b85673ba81fa2901684773e4af6..11c0af3d92b3931cc7cf37ebb567fccf
 -            # files in place and continue the update.
 -            if push.stderr.strip():
 -                print(push.stderr.strip())
-             print(
+-            print(
 -                "  ⚠ Some untracked files could not be removed from the "
 -                "working tree (permission denied)."
 -            )
--            print(
+             print(
 -                "    They were still saved to the stash and were left in "
 -                "place — the update will continue."
 -            )
@@ -8324,7 +8514,7 @@ index 57cff41fdcb31b85673ba81fa2901684773e4af6..11c0af3d92b3931cc7cf37ebb567fccf
  
  def _resolve_stash_selector(
      git_cmd: list[str], cwd: Path, stash_ref: str
-@@ -1372,6 +6346,9 @@ def _restore_stashed_changes(
+@@ -1582,6 +6749,9 @@ def _restore_stashed_changes(
      stash_ref: str,
      prompt_user: bool = False,
      input_fn=None,
@@ -8334,7 +8524,7 @@ index 57cff41fdcb31b85673ba81fa2901684773e4af6..11c0af3d92b3931cc7cf37ebb567fccf
  ) -> bool:
      if prompt_user:
          print()
-@@ -1400,8 +6377,12 @@ def _restore_stashed_changes(
+@@ -1610,8 +6780,12 @@ def _restore_stashed_changes(
              return False
  
      print("→ Restoring local changes...")
@@ -8348,7 +8538,7 @@ index 57cff41fdcb31b85673ba81fa2901684773e4af6..11c0af3d92b3931cc7cf37ebb567fccf
          cwd=cwd,
          capture_output=True,
          text=True, encoding="utf-8", errors="replace",
-@@ -1445,21 +6426,29 @@ def _restore_stashed_changes(
+@@ -1655,21 +6829,29 @@ def _restore_stashed_changes(
          print("\nYour stashed changes are preserved — nothing is lost.")
          print(f"  Stash ref: {stash_ref}")
  
@@ -8387,7 +8577,7 @@ index 57cff41fdcb31b85673ba81fa2901684773e4af6..11c0af3d92b3931cc7cf37ebb567fccf
      stash_selector = _resolve_stash_selector(git_cmd, cwd, stash_ref)
      if stash_selector is None:
          print(
-@@ -4131,157 +9120,26 @@ def _resume_windows_gateways_after_update(token: dict | None) -> None:
+@@ -4368,157 +9550,26 @@ def _resume_windows_gateways_after_update(token: dict | None) -> None:
          )
  
  def _discard_lockfile_churn(git_cmd, repo_root):
@@ -8506,7 +8696,8 @@ index 57cff41fdcb31b85673ba81fa2901684773e4af6..11c0af3d92b3931cc7cf37ebb567fccf
 -        if all_dirty is None or real_dirty is None:
 -            return None
 -        return all_dirty - real_dirty
--
++    """Compatibility no-op: never rewrite user bytes before autostash.
+ 
 -    try:
 -        effective = subprocess.run(
 -            git_cmd + ["config", "--get", "core.autocrlf"],
@@ -8539,8 +8730,7 @@ index 57cff41fdcb31b85673ba81fa2901684773e4af6..11c0af3d92b3931cc7cf37ebb567fccf
 -                # we failed to clear. Leave the checkout as we found it.
 -                return
 -            print(f"→ Normalized line-ending churn ({len(eol_only)} file(s))")
-+    """Compatibility no-op: never rewrite user bytes before autostash.
- 
+-
 -        subprocess.run(
 -            git_cmd + ["config", "core.autocrlf", "false"],
 -            cwd=repo_root,
@@ -8560,7 +8750,7 @@ index 57cff41fdcb31b85673ba81fa2901684773e4af6..11c0af3d92b3931cc7cf37ebb567fccf
  
  
  def _desktop_app_present(desktop_dir: Path) -> bool:
-@@ -4376,6 +9234,14 @@ def _cmd_update_impl(args, gateway_mode: bool):
+@@ -4616,6 +9667,14 @@ def _cmd_update_impl(args, gateway_mode: bool):
          else None
      )
      assume_yes = bool(getattr(args, "yes", False))
@@ -8575,7 +8765,7 @@ index 57cff41fdcb31b85673ba81fa2901684773e4af6..11c0af3d92b3931cc7cf37ebb567fccf
  
      # Whether this update is running without a human at the keyboard.
      # Interactive terminal updates always stash-and-ask (unchanged behavior);
-@@ -4526,7 +9392,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
+@@ -4766,7 +9825,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
  
      # On Windows, git can fail with "unable to write loose object file: Invalid argument"
      # due to filesystem atomicity issues. Set the recommended workaround.
@@ -8584,7 +8774,7 @@ index 57cff41fdcb31b85673ba81fa2901684773e4af6..11c0af3d92b3931cc7cf37ebb567fccf
          subprocess.run(
              [
                  "git",
-@@ -4553,11 +9419,13 @@ def _cmd_update_impl(args, gateway_mode: bool):
+@@ -4793,11 +9852,13 @@ def _cmd_update_impl(args, gateway_mode: bool):
      # tree dirty — forcing an autostash on every update and making branch
      # switches fragile. Restoring them first lets the common case (only
      # lockfile churn) update with a clean tree.
@@ -8603,7 +8793,7 @@ index 57cff41fdcb31b85673ba81fa2901684773e4af6..11c0af3d92b3931cc7cf37ebb567fccf
  
      # Detect if we're updating from a fork (before any branch logic)
      origin_url = _m()._get_origin_url(git_cmd, _m().PROJECT_ROOT)
-@@ -4581,31 +9449,55 @@ def _cmd_update_impl(args, gateway_mode: bool):
+@@ -4821,31 +9882,55 @@ def _cmd_update_impl(args, gateway_mode: bool):
  
      # Fetch and pull
      try:
@@ -8676,24 +8866,28 @@ index 57cff41fdcb31b85673ba81fa2901684773e4af6..11c0af3d92b3931cc7cf37ebb567fccf
          if fetch_result.returncode != 0:
              stderr = fetch_result.stderr.strip()
              if "Could not resolve host" in stderr or "unable to access" in stderr:
-@@ -4633,12 +9525,15 @@ def _cmd_update_impl(args, gateway_mode: bool):
+@@ -4873,6 +9958,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
          )
          current_branch = result.stdout.strip()
  
++        parked_branch_switched = False
 +        if release_tag:
 +            print(f"→ Target Release: {release_tag}")
 +            auto_stash_ref = None
          # If user is on a different branch than the update target, switch
          # to the target. When the target is "main" this is the historical
          # "always update against main" behavior; for any other target it's
-         # the same thing — get HEAD onto the requested branch first, then
-         # fast-forward.
+@@ -4886,8 +9975,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
+         # when the parked branch is clean AND fully merged into the target;
+         # otherwise warn loudly, mark the code update SKIPPED, and stop
+         # before the post-update steps reinforce the stale tree.
+-        parked_branch_switched = False
 -        if current_branch != branch:
 +        elif current_branch != branch:
-             label = (
-                 "detached HEAD"
-                 if current_branch == "HEAD"
-@@ -4688,31 +9583,70 @@ def _cmd_update_impl(args, gateway_mode: bool):
+             if current_branch != "HEAD":
+                 switch_safe, switch_block_reason = _m()._assess_parked_branch_switch(
+                     git_cmd, _m().PROJECT_ROOT, current_branch, branch
+@@ -4962,31 +10050,70 @@ def _cmd_update_impl(args, gateway_mode: bool):
              and (gateway_mode or (sys.stdin.isatty() and sys.stdout.isatty()))
          )
  
@@ -8786,7 +8980,7 @@ index 57cff41fdcb31b85673ba81fa2901684773e4af6..11c0af3d92b3931cc7cf37ebb567fccf
              from hermes_cli.banner import _github_compare_behind
  
              head_sha = subprocess.run(
-@@ -4853,14 +9787,20 @@ def _cmd_update_impl(args, gateway_mode: bool):
+@@ -5135,14 +10262,20 @@ def _cmd_update_impl(args, gateway_mode: bool):
              _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
              return
  
@@ -8809,7 +9003,7 @@ index 57cff41fdcb31b85673ba81fa2901684773e4af6..11c0af3d92b3931cc7cf37ebb567fccf
          update_succeeded = False
          # Capture the pre-pull SHA so we can auto-roll-back if the new code
          # has a syntax error in a critical-path file (PR #28452 incident:
-@@ -4869,19 +9809,42 @@ def _cmd_update_impl(args, gateway_mode: bool):
+@@ -5151,19 +10284,42 @@ def _cmd_update_impl(args, gateway_mode: bool):
          # the bad commit and the fix landing).
          pre_pull_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
          try:
@@ -8865,7 +9059,7 @@ index 57cff41fdcb31b85673ba81fa2901684773e4af6..11c0af3d92b3931cc7cf37ebb567fccf
                  # ff-only failed — local and remote have diverged (e.g. upstream
                  # force-pushed or rebase).  Since local changes are already
                  # stashed, reset to match the remote exactly.
-@@ -4909,9 +9872,15 @@ def _cmd_update_impl(args, gateway_mode: bool):
+@@ -5191,9 +10347,15 @@ def _cmd_update_impl(args, gateway_mode: bool):
              # ruff check), this catches it on the user side and rolls back
              # so the CLI stays bootable. The user can then retry ``hermes
              # update`` later once a fix lands upstream.
@@ -8884,7 +9078,7 @@ index 57cff41fdcb31b85673ba81fa2901684773e4af6..11c0af3d92b3931cc7cf37ebb567fccf
              if not syntax_ok:
                  print()
                  print("✗ Pulled code has a syntax error in a critical file:")
-@@ -4945,6 +9914,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
+@@ -5227,6 +10389,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
                  sys.exit(1)
  
              update_succeeded = True
@@ -8896,7 +9090,7 @@ index 57cff41fdcb31b85673ba81fa2901684773e4af6..11c0af3d92b3931cc7cf37ebb567fccf
          finally:
              if auto_stash_ref is not None:
                  # Don't attempt stash restore if the code update itself failed —
-@@ -4985,7 +9959,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
+@@ -5267,7 +10434,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
          # and post-pull HEAD; if they match, surface the no-op instead of
          # claiming success.
          post_pull_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
@@ -8905,31 +9099,31 @@ index 57cff41fdcb31b85673ba81fa2901684773e4af6..11c0af3d92b3931cc7cf37ebb567fccf
              print()
              print("✗ Code did not move — update was a no-op.")
              print(
-@@ -5164,8 +10138,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
+@@ -5469,8 +10636,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
              had_desktop_app_before_update=had_desktop_app_before_update,
          )
  
 -        print()
--        print("✓ Code updated!")
+-        print(f"✓ Code updated!{_branch_head_suffix(git_cmd, _m().PROJECT_ROOT)}")
 +        if not release_tag:
 +            print()
-+            print("✓ Code updated!")
++            print(f"✓ Code updated!{_branch_head_suffix(git_cmd, _m().PROJECT_ROOT)}")
  
          # ── Post-update state.db integrity guard (#68474) ─────────────────
          # Verify that state.db survived the update intact.  If the live file
-@@ -5545,7 +10520,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
+@@ -5850,7 +11018,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
              print("  Code and Python deps are updated, but the dashboard/TUI may")
              print("  be in a mixed state until the Node deps are rebuilt.")
          else:
--            _print_update_completion("✓ Update complete!")
+-            _print_update_completion(_update_complete_message(pre_update_version))
 +            if release_tag:
 +                release_completion_banner_pending = True
 +            else:
-+                _print_update_completion("✓ Update complete!")
++                _print_update_completion(_update_complete_message(pre_update_version))
  
          # Search-index optimization notice (v23). Existing installs keep their
          # working search index untouched on update; the compact v23 layout —
-@@ -6458,7 +11436,23 @@ def _cmd_update_impl(args, gateway_mode: bool):
+@@ -6782,7 +11953,23 @@ def _cmd_update_impl(args, gateway_mode: bool):
              sys.exit(1)
  
      except subprocess.CalledProcessError as e:
@@ -8954,7 +9148,7 @@ index 57cff41fdcb31b85673ba81fa2901684773e4af6..11c0af3d92b3931cc7cf37ebb567fccf
              print(f"⚠ Git update failed: {e}")
              print("→ Falling back to ZIP download...")
              print()
-@@ -6469,6 +11463,35 @@ def _cmd_update_impl(args, gateway_mode: bool):
+@@ -6793,6 +11980,35 @@ def _cmd_update_impl(args, gateway_mode: bool):
          else:
              print(f"✗ Update failed: {e}")
              sys.exit(1)
@@ -8991,10 +9185,10 @@ index 57cff41fdcb31b85673ba81fa2901684773e4af6..11c0af3d92b3931cc7cf37ebb567fccf
  # --- Hoisted from the body of _cmd_update_impl (self-contained, no closure state) ---
  
 diff --git a/hermes_state.py b/hermes_state.py
-index 73d3d9d917aceddc68c44d457465ee523ce02070..3dbddb5eb60599d9526c716909d101d8ad9f0062 100644
+index e5df0c816a1f5f24c0332506dd7182ed4849ada9..3a87732e15e268fde52c87e362efd2c7f29e1eed 100644
 --- a/hermes_state.py
 +++ b/hermes_state.py
-@@ -42,6 +42,7 @@ from agent.skill_commands import (
+@@ -43,6 +43,7 @@ from agent.skill_commands import (
      describe_skill_invocation,
  )
  from hermes_constants import get_hermes_home
@@ -9002,7 +9196,7 @@ index 73d3d9d917aceddc68c44d457465ee523ce02070..3dbddb5eb60599d9526c716909d101d8
  from hermes_cli.sqlite_runtime import (
      is_sqlite_wal_reset_vulnerable as _is_sqlite_wal_reset_vulnerable,
  )
-@@ -7003,6 +7004,86 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+@@ -7062,6 +7063,86 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
              self._delete_unreferenced_system_prompts(conn)
          self._execute_write(_do)
  
@@ -9327,7 +9521,7 @@ index 5b2e4ec4bd17d11d9d729889b25d1f8564bcdf51..1e379636e785471be12974990fef797c
  
      @staticmethod
 diff --git a/run_agent.py b/run_agent.py
-index f26384dfab1e1b77ebf8c7f45a653ad4a87f4f55..be3ffbe0dcc10e26cb7a2cde6b4785c676bbd466 100644
+index b09262eae4448015604c88eac27377fd1439d736..acda699bc381185713b94ac5b427f9ccf4bab428 100644
 --- a/run_agent.py
 +++ b/run_agent.py
 @@ -1101,7 +1101,9 @@ class AIAgent:
@@ -11938,7 +12132,7 @@ index dc0b6e9b59e58733b25a97dc5238b91bed429e1b..30cf644a8b005333efb666d125dd5f0a
  class TestGatewayHelpLines:
  
 diff --git a/tests/hermes_cli/test_gateway_restart_loop.py b/tests/hermes_cli/test_gateway_restart_loop.py
-index a859ce5bbec472881d23468dadec8da80dc46933..a4ba9cb088a59fa381134b195b512c84564188ca 100644
+index acf6b99d8c0b042c6fbe5f65ddc9ec25d6dd4ca1..c592fb9f7cf31632008f3c6f202c88e261d4946e 100644
 --- a/tests/hermes_cli/test_gateway_restart_loop.py
 +++ b/tests/hermes_cli/test_gateway_restart_loop.py
 @@ -540,6 +540,34 @@ class TestTerminalToolGatewayLifecycleGuard:
@@ -11976,7 +12170,7 @@ index a859ce5bbec472881d23468dadec8da80dc46933..a4ba9cb088a59fa381134b195b512c84
      def test_safe_systemctl_commands_pass_through(self, monkeypatch):
          """Non-hermes systemctl commands must not be blocked by this guard."""
          import tools.terminal_tool as tt
-@@ -1066,6 +1094,36 @@ class TestTerminalToolGatewayLifecycleGuardRemote:
+@@ -1202,6 +1230,36 @@ class TestTerminalToolGatewayLifecycleGuardRemote:
          assert "referenced script" in result["error"]
          assert any("head -c" in c for c in calls)
  
@@ -13019,7 +13213,7 @@ index 0000000000000000000000000000000000000000..ea03f8b33bc6f1cf08943d2fd61d1efd
 +        if expected is None:
 +            assert MICRO_COMPACT_OVERRIDE_KEY not in child_config
 diff --git a/tests/hermes_cli/test_profiles.py b/tests/hermes_cli/test_profiles.py
-index da0fd7aa7abcf3b6f0978c473cb3753f822c74a3..f2dc0d2251a49bc5712fff19bc80d159db96ca9e 100644
+index 48e4dce81bcbb90ce2466e8d9e767b2607748b0f..6319a2b966bcbddad48f283f6d4605c97f141915 100644
 --- a/tests/hermes_cli/test_profiles.py
 +++ b/tests/hermes_cli/test_profiles.py
 @@ -23,6 +23,8 @@ from hermes_cli.profiles import (
@@ -14161,10 +14355,10 @@ index 94ec64dae199b80ff4c965fb7b69808d386c9ad3..c6a27b379d1dd3b776a68ef5c2a82dfa
 +    assert error and "symlink" in error.lower()
 diff --git a/tests/hermes_cli/test_upgrade_candidate_validation.py b/tests/hermes_cli/test_upgrade_candidate_validation.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..af3b72e32375850054b33d00672e7e63b4c7fac6
+index 0000000000000000000000000000000000000000..8c9263981c6afb25e819c6e86f3279ec096985e8
 --- /dev/null
 +++ b/tests/hermes_cli/test_upgrade_candidate_validation.py
-@@ -0,0 +1,290 @@
+@@ -0,0 +1,344 @@
 +"""Fail-closed release-candidate validation and gitlink coverage."""
 +
 +from __future__ import annotations
@@ -14404,6 +14598,60 @@ index 0000000000000000000000000000000000000000..af3b72e32375850054b33d00672e7e63
 +    assert _git(repo, "status", "--porcelain=v1").stdout == b""
 +
 +
++def test_incremental_merge_reuses_recorded_rerere_resolution(tmp_path):
++    repo = tmp_path / "rerere-repo"
++    repo.mkdir()
++    _git(repo, "init", "-b", "main")
++    _git(repo, "config", "user.name", "Hermes Rerere Test")
++    _git(repo, "config", "user.email", "hermes-rerere@example.invalid")
++    conflict = repo / "conflict.txt"
++    conflict.write_text("base\n", encoding="utf-8")
++    _commit(repo, "base")
++
++    _git(repo, "switch", "-c", "maintenance")
++    conflict.write_text("local\n", encoding="utf-8")
++    maintenance_sha = _commit(repo, "local change")
++
++    _git(repo, "switch", "main")
++    conflict.write_text("upstream\n", encoding="utf-8")
++    target_sha = _commit(repo, "upstream change")
++
++    first = tmp_path / "candidate-first"
++    _git(repo, "worktree", "add", "-b", "candidate-first", str(first), maintenance_sha)
++    with pytest.raises(RuntimeError, match="conflict.txt"):
++        update_cmd._merge_release_into_candidate(
++            ["git"],
++            first,
++            maintenance_sha=maintenance_sha,
++            target_sha=target_sha,
++            release_tag="v2.0.0",
++        )
++    (first / "conflict.txt").write_text("local\nupstream\n", encoding="utf-8")
++    _git(first, "add", "conflict.txt")
++    _git(first, "-c", "rerere.enabled=true", "rerere")
++    _git(repo, "worktree", "remove", "--force", str(first))
++    _git(repo, "branch", "-D", "candidate-first")
++
++    second = tmp_path / "candidate-second"
++    _git(repo, "worktree", "add", "-b", "candidate-second", str(second), maintenance_sha)
++    candidate_sha = update_cmd._merge_release_into_candidate(
++        ["git"],
++        second,
++        maintenance_sha=maintenance_sha,
++        target_sha=target_sha,
++        release_tag="v2.0.0",
++    )
++
++    assert (second / "conflict.txt").read_text(encoding="utf-8") == "local\nupstream\n"
++    parents = (
++        _git(second, "rev-list", "--parents", "-n", "1", candidate_sha)
++        .stdout.decode()
++        .split()
++    )
++    assert parents == [candidate_sha, maintenance_sha, target_sha]
++    assert _git(repo, "config", "--get", "rerere.enabled", check=False).returncode == 1
++
++
 +def test_payload_apply_reports_actual_unmerged_paths(monkeypatch, tmp_path):
 +    def fake_run(command, **_kwargs):
 +        if command[-2:] == ["ls-files", "--unmerged"]:
@@ -14457,10 +14705,10 @@ index 0000000000000000000000000000000000000000..af3b72e32375850054b33d00672e7e63
 +        )
 diff --git a/tests/hermes_cli/test_upgrade_transaction_faults.py b/tests/hermes_cli/test_upgrade_transaction_faults.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..645d6d5f17f446af7a75b0ec4079234bf3d9cdf4
+index 0000000000000000000000000000000000000000..b355e6230eb9b6690cd466eefce4ac4a2f6624b7
 --- /dev/null
 +++ b/tests/hermes_cli/test_upgrade_transaction_faults.py
-@@ -0,0 +1,687 @@
+@@ -0,0 +1,700 @@
 +"""Real-Git failure-boundary tests for release-upgrade transactions.
 +
 +Each injected failure is narrow: the wrapper delegates every unrelated command to
@@ -14701,9 +14949,18 @@ index 0000000000000000000000000000000000000000..645d6d5f17f446af7a75b0ec4079234b
 +    real_run = subprocess.run
 +    seen_candidate = {}
 +
-+    def fail_after_payload(git_cmd, candidate, message):
++    def fail_after_merge(git_cmd, candidate, message):
 +        seen_candidate["path"] = candidate
 +        assert (candidate / "maintenance.txt").read_text(encoding="utf-8") == "maintenance payload\n"
++        assert (candidate / "release.txt").read_text(encoding="utf-8") == "release payload\n"
++        parents = real_run(
++            git_cmd + ["rev-list", "--parents", "-n", "1", "HEAD"],
++            cwd=candidate,
++            capture_output=True,
++            text=True,
++            check=True,
++        ).stdout.split()
++        assert parents[1:] == [fixture.old_sha, fixture.target_sha]
 +        staged = real_run(
 +            git_cmd + ["diff", "--cached", "--name-only"],
 +            cwd=candidate,
@@ -14711,10 +14968,14 @@ index 0000000000000000000000000000000000000000..645d6d5f17f446af7a75b0ec4079234b
 +            text=True,
 +            check=True,
 +        )
-+        assert "maintenance.txt" in staged.stdout.splitlines()
++        assert set(staged.stdout.splitlines()) == {
++            "local-patches/.release_base",
++            "local-patches/0001-local-maintenance.patch",
++            "local-patches/README.md",
++        }
 +        raise RuntimeError("synthetic candidate commit failure")
 +
-+    monkeypatch.setattr(update_cmd, "_commit_candidate_changes", fail_after_payload)
++    monkeypatch.setattr(update_cmd, "_commit_candidate_changes", fail_after_merge)
 +
 +    with pytest.raises(RuntimeError, match="synthetic candidate commit failure"):
 +        _prepare(fixture)
@@ -17117,10 +17378,10 @@ index 0000000000000000000000000000000000000000..7a5997366e1f69cdc49ab53de3c5fd9f
 +        assert f"git stash apply --index {SHA_STASH}" in guidance
 diff --git a/tests/hermes_cli/test_upgrade_transaction_safety.py b/tests/hermes_cli/test_upgrade_transaction_safety.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..8098c40387f23d9c0a1cd1a31e51787e62aa8513
+index 0000000000000000000000000000000000000000..011ef17ed6df69f4804e8539f4892d44511356df
 --- /dev/null
 +++ b/tests/hermes_cli/test_upgrade_transaction_safety.py
-@@ -0,0 +1,496 @@
+@@ -0,0 +1,603 @@
 +"""Real-Git regression coverage for release-upgrade transactions.
 +
 +These tests intentionally build temporary repositories.  The release path is
@@ -17181,6 +17442,16 @@ index 0000000000000000000000000000000000000000..8098c40387f23d9c0a1cd1a31e51787e
 +    _git(repo, "add", "--all")
 +    _git(repo, "commit", "-m", message)
 +    return _git(repo, "rev-parse", "HEAD").stdout.decode().strip()
++
++
++def _assert_merge_parents(repo: Path, merge_sha: str, *expected_parents: str) -> None:
++    fields = (
++        _git(repo, "rev-list", "--parents", "-n", "1", merge_sha)
++        .stdout.decode()
++        .strip()
++        .split()
++    )
++    assert fields == [merge_sha, *expected_parents]
 +
 +
 +def _test_candidate_validator(git_cmd, candidate):
@@ -17541,6 +17812,86 @@ index 0000000000000000000000000000000000000000..8098c40387f23d9c0a1cd1a31e51787e
 +    assert _git(repo, "ls-files", "--unmerged").stdout == b""
 +
 +
++def test_legacy_release_upgrade_migrates_to_incremental_merge_metadata(tmp_path):
++    repo = _init_repo(tmp_path)
++    base_sha = _git(repo, "rev-parse", "HEAD").stdout.decode().strip()
++    _git(repo, "tag", "-a", "v1.0.0", "-m", "v1.0.0")
++    _make_maintenance_from_tag(repo, "v1.0.0")
++    (repo / "local.txt").write_text("legacy maintenance\n", encoding="utf-8")
++    _commit(repo, "local maintenance")
++    _write_base_metadata(
++        repo,
++        tag="v1.0.0",
++        base_sha=base_sha,
++        patch_bytes=b"legacy artifact",
++    )
++    maintenance_sha = _git(repo, "rev-parse", "HEAD").stdout.decode().strip()
++    assert update_cmd._read_release_base_metadata(repo).format_version == 1
++
++    target_sha = _commit_upstream_release(
++        repo,
++        "v2.0.0",
++        filename="release.txt",
++        content="release two\n",
++    )
++    _git(repo, "switch", "hermes-release")
++
++    result = update_cmd._upgrade_release_transaction(
++        ["git"],
++        repo,
++        "v2.0.0",
++        target_sha,
++        candidate_validator=_test_candidate_validator,
++    )
++
++    assert result.old_sha == maintenance_sha
++    assert result.target_sha == target_sha
++    assert result.candidate_sha == _git(repo, "rev-parse", "HEAD").stdout.decode().strip()
++    merge_sha = _git(repo, "rev-parse", f"{result.candidate_sha}^").stdout.decode().strip()
++    _assert_merge_parents(repo, merge_sha, maintenance_sha, target_sha)
++
++    metadata = json.loads(
++        (repo / "local-patches" / ".release_base").read_text(encoding="utf-8")
++    )
++    assert metadata["format_version"] == 2
++    assert metadata["integration_mode"] == "incremental-merge"
++    assert metadata["tag"] == "v2.0.0"
++    assert metadata["base_sha"] == target_sha
++    assert metadata["target_sha"] == target_sha
++
++
++def test_non_descendant_release_target_leaves_live_state_untouched(tmp_path):
++    repo = _init_repo(tmp_path)
++    base_sha = _git(repo, "rev-parse", "HEAD").stdout.decode().strip()
++    _git(repo, "tag", "-a", "v1.0.0", "-m", "v1.0.0")
++    _make_maintenance_from_tag(repo, "v1.0.0")
++    (repo / "local.txt").write_text("local maintenance\n", encoding="utf-8")
++    _commit(repo, "local maintenance")
++    _write_base_metadata(repo, tag="v1.0.0", base_sha=base_sha)
++    maintenance_sha = _git(repo, "rev-parse", "HEAD").stdout.decode().strip()
++
++    _git(repo, "switch", "--orphan", "unrelated-release")
++    (repo / "unrelated-release.txt").write_text("unrelated\n", encoding="utf-8")
++    target_sha = _commit(repo, "unrelated release")
++    _git(repo, "tag", "-a", "v2.0.0", "-m", "v2.0.0")
++    _git(repo, "switch", "hermes-release")
++    before_status = _git(repo, "status", "--porcelain=v1").stdout
++
++    with pytest.raises(RuntimeError, match="does not descend from the recorded upstream base"):
++        update_cmd._upgrade_release_transaction(
++            ["git"],
++            repo,
++            "v2.0.0",
++            target_sha,
++            candidate_validator=_test_candidate_validator,
++        )
++
++    assert _git(repo, "rev-parse", "HEAD").stdout.decode().strip() == maintenance_sha
++    assert _git(repo, "status", "--porcelain=v1").stdout == before_status
++    assert _git(repo, "ls-files", "--unmerged").stdout == b""
++    transaction_root = update_cmd._git_common_dir(["git"], repo) / "hermes-upgrade-transactions"
++    assert not transaction_root.exists()
++
 +
 +def test_second_repository_lock_acquisition_fails_without_stealing(tmp_path):
 +    repo = _init_repo(tmp_path)
@@ -17575,8 +17926,9 @@ index 0000000000000000000000000000000000000000..8098c40387f23d9c0a1cd1a31e51787e
 +    (repo / "rename-me-local").write_text("rename content\nlocal\n", encoding="utf-8")
 +    (repo / "delete-me").unlink()
 +    (repo / "link-to-local").symlink_to("local-added")
-+    maintenance_sha = _commit(repo, "local binary mode rename symlink changes")
++    _commit(repo, "local binary mode rename symlink changes")
 +    _write_base_metadata(repo, tag="v1.0.0", base_sha=base_sha)
++    maintenance_sha = _git(repo, "rev-parse", "HEAD").stdout.decode().strip()
 +    _git(repo, "switch", "main")
 +    (repo / "upstream-release.txt").write_text("upstream release two\n", encoding="utf-8")
 +    r2 = _commit(repo, "release two")
@@ -17588,7 +17940,17 @@ index 0000000000000000000000000000000000000000..8098c40387f23d9c0a1cd1a31e51787e
 +        candidate_validator=_test_candidate_validator,
 +    )
 +
-+    assert result.candidate_sha == _git(repo, "rev-parse", "HEAD").stdout.decode().strip()
++    first_promoted_sha = result.candidate_sha
++    assert first_promoted_sha == _git(repo, "rev-parse", "HEAD").stdout.decode().strip()
++    first_merge_sha = _git(repo, "rev-parse", f"{first_promoted_sha}^").stdout.decode().strip()
++    _assert_merge_parents(repo, first_merge_sha, maintenance_sha, r2)
++    first_metadata = json.loads(
++        (repo / "local-patches" / ".release_base").read_text(encoding="utf-8")
++    )
++    assert first_metadata["format_version"] == 2
++    assert first_metadata["integration_mode"] == "incremental-merge"
++    assert first_metadata["base_sha"] == r2
++    assert first_metadata["target_sha"] == r2
 +    assert (repo / "tracked.txt").read_text(encoding="utf-8") == "upstream one\nlocal addition\n"
 +    assert (repo / "upstream-release.txt").read_text(encoding="utf-8") == "upstream release two\n"
 +    assert (repo / "blob.bin").read_bytes() == b"local\\x00binary\\x00\\xff"
@@ -17606,11 +17968,17 @@ index 0000000000000000000000000000000000000000..8098c40387f23d9c0a1cd1a31e51787e
 +    r3 = _commit(repo, "release three")
 +    _git(repo, "tag", "-a", "v3.0.0", "-m", "v3.0.0")
 +    _git(repo, "switch", "hermes-release")
-+    update_cmd._upgrade_release_transaction(
++    second_result = update_cmd._upgrade_release_transaction(
 +        ["git"], repo, "v3.0.0", r3,
 +        candidate_validator=_test_candidate_validator,
 +    )
 +
++    second_merge_sha = (
++        _git(repo, "rev-parse", f"{second_result.candidate_sha}^")
++        .stdout.decode()
++        .strip()
++    )
++    _assert_merge_parents(repo, second_merge_sha, first_promoted_sha, r3)
 +    assert "upstream release three" in (repo / "upstream-release.txt").read_text(encoding="utf-8")
 +    assert (repo / "blob.bin").read_bytes() == b"local\\x00binary\\x00\\xff"
 +    assert (repo / "link-to-local").is_symlink()
@@ -19001,7 +19369,7 @@ index 0000000000000000000000000000000000000000..2ee38a97ca5ddd6c0e9472654b90995d
 +            ("custom", "fallback-model"),
 +        ]
 diff --git a/tests/test_tui_gateway_server.py b/tests/test_tui_gateway_server.py
-index 75a2163adfd96461789bcdf04be87940d8bcc4b9..d39ec0020427d65be4f66d3d6d02c48427b6e47b 100644
+index 2f15a65015c35c3a1d2665c64c7d2ee06ffe858d..24474111ce395722a8fce7d2edb4aee9fd919bd4 100644
 --- a/tests/test_tui_gateway_server.py
 +++ b/tests/test_tui_gateway_server.py
 @@ -1463,6 +1463,40 @@ def test_tui_tool_output_risk_event_exposes_metadata_without_raw_output(monkeypa
@@ -21406,10 +21774,10 @@ index 0000000000000000000000000000000000000000..250e1622365f9e1d0d825d18c525ca8a
 +    assert new_session_key.call_count == 0
 +    assert dict(server._sessions) == before_sessions
 diff --git a/tools/delegate_tool.py b/tools/delegate_tool.py
-index a8da6988a5e8e1c996544ff544a92fc6e660afa0..844993318cf8f71ef37ac5d36ecf227e9915daa0 100644
+index 8699edb984707399c2bd07684108d02cebe4b0e5..0b2431e6423abd4a2f1c758bf84e0c1b2c7f681b 100644
 --- a/tools/delegate_tool.py
 +++ b/tools/delegate_tool.py
-@@ -997,8 +997,11 @@ _MIN_SUMMARY_CHARS = 2000
+@@ -1109,8 +1109,11 @@ _MIN_SUMMARY_CHARS = 2000
  # in via delegation.child_timeout_seconds.
  DEFAULT_CHILD_TIMEOUT: Optional[float] = None
  _HEARTBEAT_INTERVAL = 30  # seconds between parent activity heartbeats during delegation
@@ -21421,7 +21789,7 @@ index a8da6988a5e8e1c996544ff544a92fc6e660afa0..844993318cf8f71ef37ac5d36ecf227e
  #   - inside a tool (current_tool set) — probably running a legitimately long
  #     operation (terminal command, web fetch, large file read)
  # An in-flight model wait is NOT idle: direct_api_call refreshes
-@@ -2298,6 +2301,67 @@ def _apply_summary_budget(results: List[Dict[str, Any]], parent_agent) -> None:
+@@ -2423,6 +2426,67 @@ def _apply_summary_budget(results: List[Dict[str, Any]], parent_agent) -> None:
          )
  
  
@@ -21489,7 +21857,7 @@ index a8da6988a5e8e1c996544ff544a92fc6e660afa0..844993318cf8f71ef37ac5d36ecf227e
  def _run_single_child(
      task_index: int,
      goal: str,
-@@ -2362,6 +2426,9 @@ def _run_single_child(
+@@ -2487,6 +2551,9 @@ def _run_single_child(
                  continue
              # Pull detail from the child's own activity tracker
              desc = f"delegate_task: subagent {task_index} working"
@@ -21499,7 +21867,7 @@ index a8da6988a5e8e1c996544ff544a92fc6e660afa0..844993318cf8f71ef37ac5d36ecf227e
              try:
                  child_summary = child.get_activity_summary()
                  child_tool = child_summary.get("current_tool")
-@@ -2369,62 +2436,68 @@ def _run_single_child(
+@@ -2494,62 +2561,68 @@ def _run_single_child(
                  child_max = child_summary.get("max_iterations", 0)
                  child_activity_ts = child_summary.get("last_activity_ts")
  
@@ -21612,7 +21980,7 @@ index a8da6988a5e8e1c996544ff544a92fc6e660afa0..844993318cf8f71ef37ac5d36ecf227e
              except Exception:
                  pass
              try:
-@@ -2631,7 +2704,7 @@ def _run_single_child(
+@@ -2800,7 +2873,7 @@ def _run_single_child(
              _run_with_thread_capture,
          )
          try:
@@ -21621,7 +21989,7 @@ index a8da6988a5e8e1c996544ff544a92fc6e660afa0..844993318cf8f71ef37ac5d36ecf227e
          except Exception as _timeout_exc:
              # No consumer boundary remains once this owner stops waiting for
              # the child. Close acceptance before any completion callback and
-@@ -2647,7 +2720,7 @@ def _run_single_child(
+@@ -2816,7 +2889,7 @@ def _run_single_child(
              except Exception:
                  pass
  
@@ -21631,10 +21999,10 @@ index a8da6988a5e8e1c996544ff544a92fc6e660afa0..844993318cf8f71ef37ac5d36ecf227e
              logger.warning(
                  "Subagent %d %s after %.1fs",
 diff --git a/tui_gateway/methods_prompt.py b/tui_gateway/methods_prompt.py
-index 745a855e3d6b36cecc00fe0b0f8c6204a97d99a2..63dd00f54759f53b6ea8cfee339a35d12db68947 100644
+index bb8f329db3c5e4fc87d954b1c8ee755b80aaf99a..e0660ba395326d96f395bc5232e6b1284164adb3 100644
 --- a/tui_gateway/methods_prompt.py
 +++ b/tui_gateway/methods_prompt.py
-@@ -312,399 +312,429 @@ def _(rid, params: dict) -> dict:
+@@ -316,399 +316,429 @@ def _(rid, params: dict) -> dict:
      session, err = _sess_nowait(params, rid)
      if err:
          return err
@@ -22423,9 +22791,9 @@ index 745a855e3d6b36cecc00fe0b0f8c6204a97d99a2..63dd00f54759f53b6ea8cfee339a35d1
 -        _start_inflight_turn(session, text)
  
      if turn_isolation:
-         isolated_response = _submit_prompt_to_compute_host(rid, sid, session, text)
+         isolated_response = _submit_prompt_to_compute_host(
 diff --git a/tui_gateway/methods_session.py b/tui_gateway/methods_session.py
-index 281a18b53fe1f68fb2847a436d7fef9848ae0585..ae368c7323bddfc6b56a48378c767b925661c282 100644
+index 29ebbf332edc721390d646d3453f1fc51c5068fa..af764e4210f9a6428790e9351efd4295f5151c2e 100644
 --- a/tui_gateway/methods_session.py
 +++ b/tui_gateway/methods_session.py
 @@ -4,6 +4,8 @@ Handler bodies are byte-identical to their pre-split server.py form; they
@@ -22484,7 +22852,7 @@ index 281a18b53fe1f68fb2847a436d7fef9848ae0585..ae368c7323bddfc6b56a48378c767b92
      with _profile_db(params) as db:
          if db is None:
              return _db_unavailable_error(rid, code=5006)
-@@ -230,6 +237,11 @@ def _(rid, params: dict) -> dict:
+@@ -236,6 +243,11 @@ def _(rid, params: dict) -> dict:
      Honors ``params.profile`` so app-global remote mode lists from the
      focused profile's ``state.db`` (mirrors ``session.resume``).
      """
@@ -22496,7 +22864,7 @@ index 281a18b53fe1f68fb2847a436d7fef9848ae0585..ae368c7323bddfc6b56a48378c767b92
      with _profile_db(params) as db:
          if db is None:
              return _ok(rid, {"session_id": None})
-@@ -306,6 +318,12 @@ def _(rid, params: dict) -> dict:
+@@ -312,6 +324,12 @@ def _(rid, params: dict) -> dict:
  
  @method("session.resume")
  def _(rid, params: dict) -> dict:
@@ -22509,7 +22877,7 @@ index 281a18b53fe1f68fb2847a436d7fef9848ae0585..ae368c7323bddfc6b56a48378c767b92
      target = params.get("session_id", "")
      if not target:
          return _err(rid, 4006, "session_id required")
-@@ -313,10 +331,6 @@ def _(rid, params: dict) -> dict:
+@@ -319,10 +337,6 @@ def _(rid, params: dict) -> dict:
          cols = int(params.get("cols", 80))
      except (TypeError, ValueError):
          cols = 80
@@ -22520,7 +22888,7 @@ index 281a18b53fe1f68fb2847a436d7fef9848ae0585..ae368c7323bddfc6b56a48378c767b92
      defer_history = is_truthy_value(params.get("defer_history", False))
      # Desktop hydrates persisted transcripts through the authenticated REST
      # route in parallel. Suppress the duplicate WebSocket transcript only when
-@@ -415,7 +429,7 @@ def _(rid, params: dict) -> dict:
+@@ -421,7 +435,7 @@ def _(rid, params: dict) -> dict:
              profile_home
          )
  
@@ -22529,7 +22897,7 @@ index 281a18b53fe1f68fb2847a436d7fef9848ae0585..ae368c7323bddfc6b56a48378c767b92
              payload = _live_session_payload(
                  sid,
                  session,
-@@ -423,7 +437,10 @@ def _(rid, params: dict) -> dict:
+@@ -429,7 +443,10 @@ def _(rid, params: dict) -> dict:
                  touch=True,
                  transport=current_transport() or _stdio_transport,
                  omit_messages=omit_messages,
@@ -22540,7 +22908,7 @@ index 281a18b53fe1f68fb2847a436d7fef9848ae0585..ae368c7323bddfc6b56a48378c767b92
              payload["resumed"] = target
              if defer_history:
                  payload["messages"] = []
-@@ -442,8 +459,11 @@ def _(rid, params: dict) -> dict:
+@@ -448,8 +465,11 @@ def _(rid, params: dict) -> dict:
          # Fast path: if the session is already live, reuse it under the lock.
          with _session_resume_lock:
              live = _find_live_session_by_key(target)
@@ -22554,7 +22922,7 @@ index 281a18b53fe1f68fb2847a436d7fef9848ae0585..ae368c7323bddfc6b56a48378c767b92
  
          # Lazy/watch resume: register the live session WITHOUT building an agent.
          # Used by the desktop's subagent windows — the child runs inside the
-@@ -483,8 +503,14 @@ def _(rid, params: dict) -> dict:
+@@ -489,8 +509,14 @@ def _(rid, params: dict) -> dict:
                  profile_home=profile_home,
                  lazy=True,
              )
@@ -22571,7 +22939,7 @@ index 281a18b53fe1f68fb2847a436d7fef9848ae0585..ae368c7323bddfc6b56a48378c767b92
              # A delegated child mid-run emits no session events of its own — report
              # its liveness from the relay registry so the window shows a busy turn.
              child_running = _child_run_active(target)
-@@ -554,8 +580,14 @@ def _(rid, params: dict) -> dict:
+@@ -560,8 +586,14 @@ def _(rid, params: dict) -> dict:
              record["resume_history_ready"] = threading.Event()
              record["resume_hydrating"] = True
              record["resume_message_count"] = int(found.get("message_count") or 0)
@@ -22588,7 +22956,7 @@ index 281a18b53fe1f68fb2847a436d7fef9848ae0585..ae368c7323bddfc6b56a48378c767b92
  
              _schedule_resume_hydration(sid, target, db, close_db=owns_db)
              # The hydration worker now owns a profile-scoped handle and closes it
-@@ -647,8 +679,14 @@ def _(rid, params: dict) -> dict:
+@@ -653,8 +685,14 @@ def _(rid, params: dict) -> dict:
                  model_override=overrides.get("model_override"),
                  resume_runtime_overrides=overrides or None,
              )
@@ -22605,7 +22973,7 @@ index 281a18b53fe1f68fb2847a436d7fef9848ae0585..ae368c7323bddfc6b56a48378c767b92
  
              _schedule_agent_build(sid)
              _schedule_session_cap_enforcement()  # trim detached idle sessions over the cap
-@@ -766,7 +804,10 @@ def _(rid, params: dict) -> dict:
+@@ -772,7 +810,10 @@ def _(rid, params: dict) -> dict:
                      touch=True,
                      transport=current_transport() or _stdio_transport,
                      omit_messages=omit_messages,
@@ -22616,7 +22984,7 @@ index 281a18b53fe1f68fb2847a436d7fef9848ae0585..ae368c7323bddfc6b56a48378c767b92
                  payload["resumed"] = target
                  return _ok(rid, payload)
              try:
-@@ -1060,6 +1101,12 @@ def _(rid, params: dict) -> dict:
+@@ -1066,6 +1107,12 @@ def _(rid, params: dict) -> dict:
      Honors ``params.profile`` so app-global remote mode deletes from the
      focused profile's ``state.db`` + sessions dir (mirrors ``session.resume``).
      """
@@ -22629,7 +22997,7 @@ index 281a18b53fe1f68fb2847a436d7fef9848ae0585..ae368c7323bddfc6b56a48378c767b92
      target = params.get("session_id", "")
      if not target:
          return _err(rid, 4006, "session_id required")
-@@ -1078,8 +1125,6 @@ def _(rid, params: dict) -> dict:
+@@ -1084,8 +1131,6 @@ def _(rid, params: dict) -> dict:
      active = {s.get("session_key") for s in snapshot if s.get("session_key")}
      if target in active:
          return _err(rid, 4023, "cannot delete an active session")
@@ -22638,7 +23006,7 @@ index 281a18b53fe1f68fb2847a436d7fef9848ae0585..ae368c7323bddfc6b56a48378c767b92
      with _profile_db(params) as db:
          if db is None:
              return _db_unavailable_error(rid, code=5036)
-@@ -2627,12 +2672,13 @@ def _(rid, params: dict) -> dict:
+@@ -2654,12 +2699,13 @@ def _(rid, params: dict) -> dict:
      return _ok(rid, {"removed": removed})
  
  
@@ -22658,7 +23026,7 @@ index 281a18b53fe1f68fb2847a436d7fef9848ae0585..ae368c7323bddfc6b56a48378c767b92
      if _session_uses_compute_host(session):
          sid = str(params.get("session_id") or "")
          focus_topic = str(params.get("focus_topic", "") or "").strip()
-@@ -2653,16 +2699,10 @@ def _(rid, params: dict) -> dict:
+@@ -2680,16 +2726,10 @@ def _(rid, params: dict) -> dict:
          host_result = ack.get("result")
          if isinstance(host_result, dict):
              # The host owns the isolated session's agent/history, so preserve
@@ -22676,7 +23044,7 @@ index 281a18b53fe1f68fb2847a436d7fef9848ae0585..ae368c7323bddfc6b56a48378c767b92
          host_ack = {key: value for key, value in ack.items() if key != "messages"}
          return _ok(
              rid,
-@@ -2675,13 +2715,7 @@ def _(rid, params: dict) -> dict:
+@@ -2702,13 +2742,7 @@ def _(rid, params: dict) -> dict:
                  "usage": host_info.get("usage") if isinstance(host_info.get("usage"), dict) else {},
              },
          )
@@ -22691,7 +23059,7 @@ index 281a18b53fe1f68fb2847a436d7fef9848ae0585..ae368c7323bddfc6b56a48378c767b92
      from agent.conversation_compression import (
          finalize_context_engine_compression_notification,
      )
-@@ -2727,8 +2761,6 @@ def _(rid, params: dict) -> dict:
+@@ -2754,8 +2788,6 @@ def _(rid, params: dict) -> dict:
              with session["history_lock"]:
                  messages = list(session.get("history", []))
              after_count = len(messages)
@@ -22700,7 +23068,7 @@ index 281a18b53fe1f68fb2847a436d7fef9848ae0585..ae368c7323bddfc6b56a48378c767b92
              _sys_prompt_after = (
                  getattr(_agent, "_cached_system_prompt", "") or _sys_prompt
              )
-@@ -2743,7 +2775,11 @@ def _(rid, params: dict) -> dict:
+@@ -2770,7 +2802,11 @@ def _(rid, params: dict) -> dict:
                  else 0
              )
              agent = session["agent"]
@@ -22713,7 +23081,7 @@ index 281a18b53fe1f68fb2847a436d7fef9848ae0585..ae368c7323bddfc6b56a48378c767b92
              summary = summarize_manual_compression(
                  before_messages,
                  messages,
-@@ -2769,28 +2805,23 @@ def _(rid, params: dict) -> dict:
+@@ -2796,28 +2832,23 @@ def _(rid, params: dict) -> dict:
                      "summary": summary,
                      "usage": usage,
                      "info": info,
@@ -22751,7 +23119,7 @@ index 281a18b53fe1f68fb2847a436d7fef9848ae0585..ae368c7323bddfc6b56a48378c767b92
      except Exception as e:
          finalize_context_engine_compression_notification(
              session["agent"],
-@@ -2799,6 +2830,21 @@ def _(rid, params: dict) -> dict:
+@@ -2826,6 +2857,21 @@ def _(rid, params: dict) -> dict:
          return _err(rid, 5005, str(e))
  
  
@@ -22773,7 +23141,7 @@ index 281a18b53fe1f68fb2847a436d7fef9848ae0585..ae368c7323bddfc6b56a48378c767b92
  @method("session.save")
  def _(rid, params: dict) -> dict:
      session, err = _sess(params, rid)
-@@ -2879,6 +2925,8 @@ def _(rid, params: dict) -> dict:
+@@ -2906,6 +2952,8 @@ def _(rid, params: dict) -> dict:
      # keep every unrelated session.resume waiting behind it.
      with _session_resume_lock:
          session = _pop_session_by_id(sid)
@@ -22782,7 +23150,7 @@ index 281a18b53fe1f68fb2847a436d7fef9848ae0585..ae368c7323bddfc6b56a48378c767b92
      closed = _teardown_popped_session(session, end_reason="tui_close")
      return _ok(rid, {"closed": closed})
  
-@@ -3467,3 +3515,10 @@ def _(rid, params: dict) -> dict:
+@@ -3494,3 +3542,10 @@ def _(rid, params: dict) -> dict:
  def register(server) -> None:
      """Bind this module's handlers onto ``server``'s globals and registry."""
      _registry.install(server)
@@ -22794,7 +23162,7 @@ index 281a18b53fe1f68fb2847a436d7fef9848ae0585..ae368c7323bddfc6b56a48378c767b92
 +        _run_session_compression.__closure__,
 +    )
 diff --git a/tui_gateway/methods_tools.py b/tui_gateway/methods_tools.py
-index e5b64c4bd3a21116b4a1cd6e5c9f88d862be24eb..bfc14406666a4c88fc8e08e72fef016e4d0bcd44 100644
+index 7eff80ca10bcfaecec4e1da0135c15ba2a9b4a32..44d63213757374f3ccfbc76f3153051ce4d3257e 100644
 --- a/tui_gateway/methods_tools.py
 +++ b/tui_gateway/methods_tools.py
 @@ -4,6 +4,8 @@ Handler bodies are byte-identical to their pre-split server.py form; they
@@ -23165,7 +23533,7 @@ index e5b64c4bd3a21116b4a1cd6e5c9f88d862be24eb..bfc14406666a4c88fc8e08e72fef016e
          return _ok(rid, {"output": live_output or "(no output)"})
  
      if _cmd_base in _PENDING_INPUT_COMMANDS:
-@@ -2500,3 +2599,10 @@ def _(rid, params: dict) -> dict:
+@@ -2535,3 +2634,10 @@ def _(rid, params: dict) -> dict:
  def register(server) -> None:
      """Bind this module's handlers onto ``server``'s globals and registry."""
      _registry.install(server)
@@ -23177,7 +23545,7 @@ index e5b64c4bd3a21116b4a1cd6e5c9f88d862be24eb..bfc14406666a4c88fc8e08e72fef016e
 +        _dispatch_manual_compression.__closure__,
 +    )
 diff --git a/tui_gateway/server.py b/tui_gateway/server.py
-index b57e63ca010d9708f1ee9760ee403252b1d370bd..3912131e32d7395668e1359648bc12e594ff474f 100644
+index 70213607c70777f9b7b14d1b4e14c735bf97f2bc..c7951ab22c44d4686bed17998bf3008ae8cd4374 100644
 --- a/tui_gateway/server.py
 +++ b/tui_gateway/server.py
 @@ -3,6 +3,7 @@ import concurrent.futures
@@ -23726,7 +24094,7 @@ index b57e63ca010d9708f1ee9760ee403252b1d370bd..3912131e32d7395668e1359648bc12e5
          if home is None:
              return handler(rid, params)
          token = set_hermes_home_override(home)
-@@ -2028,6 +2352,10 @@ def _err(rid, code: int, msg: str, data=None) -> dict:
+@@ -2032,6 +2356,10 @@ def _err(rid, code: int, msg: str, data=None) -> dict:
      return {"jsonrpc": "2.0", "id": rid, "error": error}
  
  
@@ -23737,7 +24105,7 @@ index b57e63ca010d9708f1ee9760ee403252b1d370bd..3912131e32d7395668e1359648bc12e5
  def method(name: str):
      def dec(fn):
          _methods[name] = fn
-@@ -3088,8 +3416,8 @@ def _persist_branch_seed(session: dict) -> None:
+@@ -3100,8 +3428,8 @@ def _persist_branch_seed(session: dict) -> None:
  
  
  @contextlib.contextmanager
@@ -23748,7 +24116,7 @@ index b57e63ca010d9708f1ee9760ee403252b1d370bd..3912131e32d7395668e1359648bc12e5
  
      Mirrors :func:`_ensure_session_db_row`: a remote/profile session persists
      into its own profile's ``state.db`` (a fresh handle we close on exit);
-@@ -3097,7 +3425,6 @@ def _session_db(session: dict):
+@@ -3109,7 +3437,6 @@ def _session_db(session: dict):
      None when the db is unavailable.
      """
      db, close_db = None, False
@@ -23756,7 +24124,7 @@ index b57e63ca010d9708f1ee9760ee403252b1d370bd..3912131e32d7395668e1359648bc12e5
      if profile_home:
          from hermes_state import SessionDB
  
-@@ -3114,6 +3441,396 @@ def _session_db(session: dict):
+@@ -3126,6 +3453,396 @@ def _session_db(session: dict):
              with contextlib.suppress(Exception):
                  db.close()
  
@@ -24153,7 +24521,7 @@ index b57e63ca010d9708f1ee9760ee403252b1d370bd..3912131e32d7395668e1359648bc12e5
  
  def _persist_session_git_meta(session: dict, cwd: str, generation: int) -> None:
      """Resolve + persist a session's git branch / repo root WITHOUT blocking.
-@@ -5163,12 +5880,24 @@ def _compress_session_history(
+@@ -5237,12 +5954,24 @@ def _compress_session_history(
      return len(history) - len(compressed), usage
  
  
@@ -24179,7 +24547,7 @@ index b57e63ca010d9708f1ee9760ee403252b1d370bd..3912131e32d7395668e1359648bc12e5
  ) -> None:
      """Re-anchor session_key when AIAgent._compress_context rotates session_id.
  
-@@ -5188,6 +5917,14 @@ def _sync_session_key_after_compress(
+@@ -5262,6 +5991,14 @@ def _sync_session_key_after_compress(
              if the caller manages the worker lifecycle separately.
      """
      agent = session.get("agent")
@@ -24194,7 +24562,7 @@ index b57e63ca010d9708f1ee9760ee403252b1d370bd..3912131e32d7395668e1359648bc12e5
      new_session_id = getattr(agent, "session_id", None) or ""
      old_key = session.get("session_key", "") or ""
      if not new_session_id or new_session_id == old_key:
-@@ -5219,7 +5956,18 @@ def _sync_session_key_after_compress(
+@@ -5293,7 +6030,18 @@ def _sync_session_key_after_compress(
              unregister_gateway_notify(old_key)
          except Exception:
              pass
@@ -24214,7 +24582,7 @@ index b57e63ca010d9708f1ee9760ee403252b1d370bd..3912131e32d7395668e1359648bc12e5
          try:
              yolo_was_on = is_session_yolo_enabled(old_key)
          except Exception:
-@@ -5241,7 +5989,18 @@ def _sync_session_key_after_compress(
+@@ -5315,7 +6063,18 @@ def _sync_session_key_after_compress(
          # Even if the approval module fails to import, still anchor the
          # session_key on the new continuation id so downstream lookups
          # don't keep targeting the ended row.
@@ -24234,7 +24602,7 @@ index b57e63ca010d9708f1ee9760ee403252b1d370bd..3912131e32d7395668e1359648bc12e5
  
      # #84417 (belt): invalidate any in-flight ``_drain_queued_prompt`` claim
      # that captured generation under the pre-rotation session_key. A raced
-@@ -5262,7 +6021,465 @@ def _sync_session_key_after_compress(
+@@ -5336,7 +6095,465 @@ def _sync_session_key_after_compress(
              pass
  
  
@@ -24701,7 +25069,7 @@ index b57e63ca010d9708f1ee9760ee403252b1d370bd..3912131e32d7395668e1359648bc12e5
      g = lambda k, fb=None: getattr(agent, k, 0) or (getattr(agent, fb, 0) if fb else 0)
      usage = {
          "model": getattr(agent, "model", "") or "",
-@@ -5319,6 +6536,22 @@ def _get_usage(agent) -> dict:
+@@ -5393,6 +6610,22 @@ def _get_usage(agent) -> dict:
                  usage["dev_credits_spent_micros"] = int(spent)
          except Exception:
              pass
@@ -24724,7 +25092,7 @@ index b57e63ca010d9708f1ee9760ee403252b1d370bd..3912131e32d7395668e1359648bc12e5
      return usage
  
  
-@@ -5396,13 +6629,25 @@ def _current_profile_name() -> str:
+@@ -5470,13 +6703,25 @@ def _current_profile_name() -> str:
  DESKTOP_BACKEND_CONTRACT = 6
  
  
@@ -24752,7 +25120,7 @@ index b57e63ca010d9708f1ee9760ee403252b1d370bd..3912131e32d7395668e1359648bc12e5
      return dict(mirror_usage) if isinstance(mirror_usage, dict) else {}
  
  
-@@ -6966,6 +8211,7 @@ def _init_session(
+@@ -7040,6 +8285,7 @@ def _init_session(
              "history": history,
              "history_lock": threading.Lock(),
              "history_version": 0,
@@ -24760,7 +25128,7 @@ index b57e63ca010d9708f1ee9760ee403252b1d370bd..3912131e32d7395668e1359648bc12e5
              "inflight_turn": None,
              "created_at": now,
              "last_active": now,
-@@ -7724,6 +8970,16 @@ def _auto_continue_note(prompt: str) -> str:
+@@ -7798,6 +9044,16 @@ def _auto_continue_note(prompt: str) -> str:
      )
  
  
@@ -24777,7 +25145,7 @@ index b57e63ca010d9708f1ee9760ee403252b1d370bd..3912131e32d7395668e1359648bc12e5
  def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> dict | None:
      """Kick off a continuation turn for a crash-interrupted session.
  
-@@ -7749,7 +9005,11 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) ->
+@@ -7823,7 +9079,11 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) ->
          return None
      session["_auto_continue_scheduled"] = True
      attempt = marker["attempts"] + 1
@@ -24790,7 +25158,7 @@ index b57e63ca010d9708f1ee9760ee403252b1d370bd..3912131e32d7395668e1359648bc12e5
  
      def kickoff() -> None:
          rid = f"__auto_continue__{int(time.time() * 1000)}"
-@@ -8338,6 +9598,7 @@ def _deferred_session_record(
+@@ -8412,6 +9672,7 @@ def _deferred_session_record(
          "history": history,
          "history_lock": threading.Lock(),
          "history_version": 0,
@@ -24798,7 +25166,7 @@ index b57e63ca010d9708f1ee9760ee403252b1d370bd..3912131e32d7395668e1359648bc12e5
          "image_counter": 0,
          "inflight_turn": None,
          "last_active": now,
-@@ -8360,13 +9621,19 @@ def _deferred_session_record(
+@@ -8434,13 +9695,19 @@ def _deferred_session_record(
  
  def _claim_or_reuse_live(
      sid: str, session_key: str, record: dict, lease
@@ -24820,7 +25188,7 @@ index b57e63ca010d9708f1ee9760ee403252b1d370bd..3912131e32d7395668e1359648bc12e5
              if lease is not None:
                  lease.release()
              return live
-@@ -8545,6 +9812,13 @@ def _find_live_session_by_key(session_key: str) -> tuple[str, dict] | None:
+@@ -8619,6 +9886,13 @@ def _find_live_session_by_key(session_key: str) -> tuple[str, dict] | None:
              continue
          if _session_lookup_key(session, fallback=sid) == session_key:
              return sid, session
@@ -24834,7 +25202,7 @@ index b57e63ca010d9708f1ee9760ee403252b1d370bd..3912131e32d7395668e1359648bc12e5
      return None
  
  
-@@ -8656,8 +9930,11 @@ def _live_session_payload(
+@@ -8730,8 +10004,11 @@ def _live_session_payload(
      touch: bool = False,
      transport: Transport | None = None,
      omit_messages: bool = False,
@@ -24847,7 +25215,7 @@ index b57e63ca010d9708f1ee9760ee403252b1d370bd..3912131e32d7395668e1359648bc12e5
          if cols is not None:
              session["cols"] = cols
          if transport is not None:
-@@ -10467,6 +11744,8 @@ def _run_prompt_submit(
+@@ -10545,6 +11822,8 @@ def _run_prompt_submit(
          secret_token = None
          goal_followup = None  # set by the post-turn goal hook below
          result = None  # turn outcome; read after the finally for leftover /steer
@@ -24856,7 +25224,7 @@ index b57e63ca010d9708f1ee9760ee403252b1d370bd..3912131e32d7395668e1359648bc12e5
          tts_queue = None  # streaming-TTS feed for this turn (voice mode)
          thinking_started = False  # ambient thinking sound armed for this turn
          one_turn_restore = session.pop("one_turn_model_restore", None)
-@@ -10739,7 +12018,17 @@ def _run_prompt_submit(
+@@ -10822,7 +12101,17 @@ def _run_prompt_submit(
              )
              _usage_stop, _usage_thread = _start_usage_ticker(sid, agent)
              try:
@@ -24875,7 +25243,7 @@ index b57e63ca010d9708f1ee9760ee403252b1d370bd..3912131e32d7395668e1359648bc12e5
              finally:
                  # Stop AND join before anything below emits: an in-flight tick
                  # surviving past message.complete would roll the client's final
-@@ -10900,6 +12189,7 @@ def _run_prompt_submit(
+@@ -10983,6 +12272,7 @@ def _run_prompt_submit(
                      if result.get("interrupted")
                      else "error" if result.get("error") else "complete"
                  )
@@ -24883,7 +25251,7 @@ index b57e63ca010d9708f1ee9760ee403252b1d370bd..3912131e32d7395668e1359648bc12e5
                  # When the backend produced no visible response AND reported a
                  # real error (e.g. invalid model slug → provider 4xx), surface
                  # that error as the visible text instead of shipping an empty
-@@ -10963,7 +12253,22 @@ def _run_prompt_submit(
+@@ -11046,7 +12336,22 @@ def _run_prompt_submit(
                      (result.get("error") if isinstance(result, dict) else "") or raw
                  )
                  payload["recoverable"] = True
@@ -24907,7 +25275,7 @@ index b57e63ca010d9708f1ee9760ee403252b1d370bd..3912131e32d7395668e1359648bc12e5
              _emit("message.complete", sid, payload)
  
              # ── /goal continuation (Ralph-style loop) ─────────────────
-@@ -11242,7 +12547,8 @@ def _run_prompt_submit(
+@@ -11325,7 +12630,8 @@ def _run_prompt_submit(
              )
              # Backstop for turns that never reached a terminal frame (the
              # frame paths retire the marker as they emit).
@@ -24917,7 +25285,7 @@ index b57e63ca010d9708f1ee9760ee403252b1d370bd..3912131e32d7395668e1359648bc12e5
              session.pop("_auto_continue_scheduled", None)
              _emit_settled_session_info(sid, session, agent)
  
-@@ -11262,6 +12568,14 @@ def _run_prompt_submit(
+@@ -11345,6 +12651,14 @@ def _run_prompt_submit(
          if _drain_queued_prompt(rid, sid, session):
              return
  
@@ -24932,7 +25300,7 @@ index b57e63ca010d9708f1ee9760ee403252b1d370bd..3912131e32d7395668e1359648bc12e5
          # Chain a goal-continuation turn if the judge said so. We do
          # this AFTER the finally releases session["running"], so the
          # nested _run_prompt_submit doesn't deadlock on the busy
-@@ -13458,8 +14772,10 @@ _LIVE_SESSION_DIRECT_COMMANDS = frozenset(
+@@ -13541,8 +14855,10 @@ _LIVE_SESSION_DIRECT_COMMANDS = frozenset(
      {
          "clear",
          "compress",
@@ -24943,7 +25311,7 @@ index b57e63ca010d9708f1ee9760ee403252b1d370bd..3912131e32d7395668e1359648bc12e5
          "models",
          "prompt",
          "rename",
-@@ -13646,9 +14962,83 @@ def _format_live_model_output(session: dict) -> str:
+@@ -13729,9 +15045,83 @@ def _format_live_model_output(session: dict) -> str:
      return "Current model: (unknown)"
  
  
@@ -25028,7 +25396,7 @@ index b57e63ca010d9708f1ee9760ee403252b1d370bd..3912131e32d7395668e1359648bc12e5
      if name == "model" and not arg.strip():
          return _format_live_model_output(session or {})
      if name not in _LIVE_SESSION_DIRECT_COMMANDS:
-@@ -13663,10 +15053,15 @@ def _live_slash_command_output(sid: str, session: Optional[dict], name: str, arg
+@@ -13746,10 +15136,15 @@ def _live_slash_command_output(sid: str, session: Optional[dict], name: str, arg
          session is not None and _session_uses_compute_host(session)
      ):
          return None
@@ -25046,7 +25414,7 @@ index b57e63ca010d9708f1ee9760ee403252b1d370bd..3912131e32d7395668e1359648bc12e5
      if name == "usage":
          if session is None:
              return "(._.) No active agent -- send a message first."
-@@ -13706,7 +15101,13 @@ def _live_slash_command_output(sid: str, session: Optional[dict], name: str, arg
+@@ -13789,7 +15184,13 @@ def _live_slash_command_output(sid: str, session: Optional[dict], name: str, arg
  
  
  
@@ -25061,7 +25429,7 @@ index b57e63ca010d9708f1ee9760ee403252b1d370bd..3912131e32d7395668e1359648bc12e5
      """Apply side effects that must also hit the gateway's live agent."""
      parts = command.lstrip("/").split(None, 1)
      if not parts:
-@@ -13724,6 +15125,26 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
+@@ -13807,6 +15208,26 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
          # notification wiring below is never exercised for that route.
          name = "compress"
  
@@ -25088,7 +25456,7 @@ index b57e63ca010d9708f1ee9760ee403252b1d370bd..3912131e32d7395668e1359648bc12e5
      # Reject agent-mutating commands during an in-flight turn.  These
      # all do read-then-mutate on live agent/session state that the
      # worker thread running agent.run_conversation is using.  Parity
-@@ -13802,6 +15223,10 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
+@@ -13885,6 +15306,10 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
                      describe_compression_lock_skip,
                  )
                  return describe_compression_lock_skip(e.holder)
@@ -25190,7 +25558,7 @@ index 31e3c9a0cb751f16a579a59c5fb0c5160e550fc3..8930d9c7b29b7944766f8833ab86b673
  
  | Parameter | Default | Range | Description |
 diff --git a/website/docs/reference/slash-commands.md b/website/docs/reference/slash-commands.md
-index bbf996ac840f6ebf1ea82c306685235418faebd1..b4a6e50f0128732be7805791c5d56d7656781974 100644
+index 419a275d4a2833b2596d04f92ea9605099f9bb17..465998b8ce3c435d1ba0356ba7574a12a1476573 100644
 --- a/website/docs/reference/slash-commands.md
 +++ b/website/docs/reference/slash-commands.md
 @@ -74,6 +74,7 @@ Type `/` in the CLI to open the autocomplete menu. Built-in commands are case-in
@@ -25229,7 +25597,7 @@ index bbf996ac840f6ebf1ea82c306685235418faebd1..b4a6e50f0128732be7805791c5d56d76
  - In the TUI, `/sessions` shows live sessions in the current TUI process. Use `/resume [name]` or `hermes --tui --resume <id-or-title>` for saved or closed transcripts.
  
 diff --git a/website/docs/user-guide/configuration.md b/website/docs/user-guide/configuration.md
-index 6bf1376e655098f41c6f8a26966b7cb98f064c7a..11024b9f68cb9c33de22c39de56a1094908489ad 100644
+index 0eccf2d5aa51903f39fdfbbe9375612a784eae8d..e5f2b77e06ff7e3b053759920d2d163249ec3522 100644
 --- a/website/docs/user-guide/configuration.md
 +++ b/website/docs/user-guide/configuration.md
 @@ -115,6 +115,65 @@ You can also set `providers.<id>.stale_timeout_seconds` for the non-streaming st
