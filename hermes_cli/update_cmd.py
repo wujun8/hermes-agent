@@ -4758,6 +4758,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
         return
 
     # Fetch and pull
+    update_succeeded = False
     try:
 
         # Resolve the target branch up front so the fetch can be scoped to it.
@@ -5081,7 +5082,6 @@ def _cmd_update_impl(args, gateway_mode: bool):
             print("→ Updates available (commit count unknown on this shallow checkout)")
 
         print("→ Pulling updates...")
-        update_succeeded = False
         # Capture the pre-pull SHA so we can auto-roll-back if the new code
         # has a syntax error in a critical-path file (PR #28452 incident:
         # orphan merge-conflict markers in hermes_cli/config.py bricked

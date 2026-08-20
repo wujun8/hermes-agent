@@ -188,3 +188,33 @@ def test_windows_does_not_zip_fallback_after_git_update_then_subprocess_failure(
     out = capsys.readouterr().out
     assert "✗ Update failed:" in out
     assert "Falling back to ZIP download" not in out
+
+
+def test_windows_early_git_failure_falls_back_to_zip(
+    monkeypatch, tmp_path, capsys
+):
+    """An early check=True Git failure must invoke the Windows ZIP fallback."""
+    args = SimpleNamespace(branch=None, yes=False, force=True, force_venv=True)
+    base_run = _make_head_moved_side_effect()
+
+    def run_side_effect(cmd, **kwargs):
+        if "rev-parse" in cmd and "--abbrev-ref" in cmd:
+            assert kwargs["check"] is True
+            raise hermes_main.subprocess.CalledProcessError(1, cmd)
+        return base_run(cmd, **kwargs)
+
+    _patch_update_deps(monkeypatch, tmp_path, run_side_effect)
+    monkeypatch.setattr(hermes_main, "_is_windows", lambda: True)
+    zip_calls = []
+
+    def update_via_zip(*zip_args, **zip_kwargs):
+        zip_calls.append((zip_args, zip_kwargs))
+
+    monkeypatch.setattr(update_cmd, "_update_via_zip", update_via_zip)
+
+    hermes_main.cmd_update(args)
+
+    assert len(zip_calls) == 1
+    out = capsys.readouterr().out
+    assert "Falling back to ZIP download" in out
+    assert "UnboundLocalError" not in out
