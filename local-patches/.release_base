@@ -1,9 +1,0 @@
-{
-  "base_sha": "e624e9fde561e1add9388384012b295fde669ade",
-  "format_version": 2,
-  "integration_mode": "incremental-merge",
-  "patch_bytes": 1070584,
-  "patch_sha256": "66693b9fd3d6a51d2fd055ae27d22836aa72f4fcd2d9934eee79188675ff41d1",
-  "tag": "v2026.8.18",
-  "target_sha": "e624e9fde561e1add9388384012b295fde669ade"
-}
