@@ -1,9 +1,8 @@
 """Tests for the ordinary post-pull syntax guard in ``hermes update``.
 
-Release candidates use a strict validator: every critical path must exist and
-be a regular, contained file.  Ordinary updates retain compatibility with
-older checkout layouts: they compile every critical file that exists, while
-still rejecting unsafe paths and syntax errors in those files.
+Older checkout layouts may omit a critical file, so ordinary updates tolerate
+missing legacy paths while still rejecting unsafe paths and syntax errors in
+files that do exist.
 """
 
 from __future__ import annotations

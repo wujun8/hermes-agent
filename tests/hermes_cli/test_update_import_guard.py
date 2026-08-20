@@ -71,7 +71,7 @@ def test_import_guard_passes_on_consistent_tree(monkeypatch, tmp_path):
 
 
 def test_import_guard_rejects_import_time_exceptions(monkeypatch, tmp_path):
-    """Any candidate import exception is unsafe before release promotion."""
+    """Any updated-checkout import exception is unsafe before update completes."""
     (tmp_path / "consumer.py").write_text(
         "raise RuntimeError('no API key configured')\n"
     )
@@ -84,7 +84,7 @@ def test_import_guard_rejects_import_time_exceptions(monkeypatch, tmp_path):
 
 
 def test_import_guard_fails_closed_when_probe_cannot_run(monkeypatch, tmp_path):
-    """A release cannot be promoted when its import probe cannot run."""
+    """An ordinary update cannot complete when its import probe cannot run."""
 
     def boom(*_a, **_kw):
         raise OSError("cannot spawn")
@@ -92,7 +92,7 @@ def test_import_guard_fails_closed_when_probe_cannot_run(monkeypatch, tmp_path):
     monkeypatch.setattr(update_cmd.subprocess, "run", boom)
     ok, module, error = update_cmd._validate_critical_modules_import(tmp_path)
     assert ok is False
-    assert module == "candidate import probe"
+    assert module == "updated checkout import probe"
     assert error and "cannot spawn" in error
 
 
@@ -161,9 +161,9 @@ def test_import_guard_prefers_the_project_venv_interpreter(monkeypatch, tmp_path
 def test_import_guard_ignores_missing_third_party_dependency(monkeypatch, tmp_path):
     """A new third-party requirement is not a partially-updated tree.
 
-    On the git path this guard runs BEFORE the dependency sync, so a release
-    that adds a dependency would otherwise look like breakage and trigger a
-    spurious `git reset --hard` rollback of a perfectly good update.
+    On the git path this guard runs BEFORE dependency sync, so an ordinary
+    update that adds a dependency would otherwise look like breakage and
+    trigger a spurious `git reset --hard` rollback of a perfectly good update.
     """
     (tmp_path / "consumer.py").write_text("import totally_not_installed_pkg\n")
     monkeypatch.setattr(update_cmd, "_UPDATE_CRITICAL_MODULES", ("consumer",))

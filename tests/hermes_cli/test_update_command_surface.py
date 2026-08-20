@@ -41,3 +41,24 @@ def test_update_help_keeps_the_official_update_options(tmp_path: Path) -> None:
     assert result.returncode == 0
     for expected in ("--branch", "default (main)", "--backup", "--no-backup"):
         assert expected in result.stdout
+
+
+def test_update_module_has_no_in_core_release_engine() -> None:
+    """The release updater is external; ordinary update owns no engine."""
+    from hermes_cli import update_cmd
+
+    forbidden_symbols = (
+        "ReleaseUpgradeContext",
+        "_prepare_and_promote_release",
+        "_find_unfinished_release_transaction",
+        "RepositoryUpdateLock",
+    )
+    assert all(not hasattr(update_cmd, name) for name in forbidden_symbols)
+
+    source = Path(update_cmd.__file__).read_text(encoding="utf-8")
+    for forbidden_text in (
+        "local-patches",
+        "hermes upgrade",
+        "release_tag",
+    ):
+        assert forbidden_text not in source

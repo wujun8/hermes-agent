@@ -160,7 +160,9 @@ def _patch_ordinary_update_runtime(monkeypatch, repo: Path) -> None:
     monkeypatch.setattr(update_cmd, "_update_node_dependencies", lambda: [])
     monkeypatch.setattr(update_cmd, "_write_update_incomplete_marker", lambda: None)
     monkeypatch.setattr(update_cmd, "_write_lazy_refresh_incomplete_marker", lambda: None)
-    monkeypatch.setattr(update_cmd, "_finish_dashboard_update_cleanup", lambda *_args: None)
+    monkeypatch.setattr(
+        update_cmd, "_finish_dashboard_update_cleanup", lambda *_args, **_kwargs: None
+    )
 
     monkeypatch.setattr("hermes_cli.config.load_config", lambda: {})
     monkeypatch.setattr("hermes_cli.config.get_missing_env_vars", lambda required_only=True: [])
