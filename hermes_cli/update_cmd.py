@@ -6720,7 +6720,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             sys.exit(1)
 
     except subprocess.CalledProcessError as e:
-        if _m()._is_windows():
+        if _m()._is_windows() and not update_succeeded:
             print(f"⚠ Git update failed: {e}")
             print("→ Falling back to ZIP download...")
             print()

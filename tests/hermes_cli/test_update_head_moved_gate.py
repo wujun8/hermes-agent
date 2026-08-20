@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import pytest
 
 from hermes_cli import main as hermes_main
+from hermes_cli import update_cmd
 
 
 def _make_head_moved_side_effect(pre_sha="abc123", post_sha="def456"):
@@ -147,3 +148,43 @@ def test_update_fails_loudly_when_head_pinned(monkeypatch, tmp_path, capsys):
     assert "Code did not move" in out
     assert "✓ Code updated!" not in out
     assert "checkout main" in out
+
+
+def test_windows_does_not_zip_fallback_after_git_update_then_subprocess_failure(
+    monkeypatch, tmp_path, capsys
+):
+    """A later subprocess failure must not redo an already successful git update."""
+    args = SimpleNamespace(branch=None, yes=False, force=True, force_venv=True)
+    base_run = _make_head_moved_side_effect()
+    git_update_finished = False
+
+    def run_side_effect(cmd, **kwargs):
+        nonlocal git_update_finished
+        if "merge" in cmd and "--ff-only" in cmd:
+            git_update_finished = True
+        if (
+            git_update_finished
+            and "rev-parse" in cmd
+            and "--abbrev-ref" in cmd
+        ):
+            raise hermes_main.subprocess.CalledProcessError(1, cmd)
+        return base_run(cmd, **kwargs)
+
+    _patch_update_deps(monkeypatch, tmp_path, run_side_effect)
+    monkeypatch.setattr(hermes_main, "_is_windows", lambda: True)
+    zip_calls = []
+
+    def fail_zip(*zip_args, **zip_kwargs):
+        zip_calls.append((zip_args, zip_kwargs))
+        raise AssertionError("_update_via_zip called after git update succeeded")
+
+    monkeypatch.setattr(update_cmd, "_update_via_zip", fail_zip)
+
+    with pytest.raises(SystemExit) as exc_info:
+        hermes_main.cmd_update(args)
+
+    assert exc_info.value.code == 1
+    assert zip_calls == []
+    out = capsys.readouterr().out
+    assert "✗ Update failed:" in out
+    assert "Falling back to ZIP download" not in out
