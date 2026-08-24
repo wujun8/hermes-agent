@@ -19,6 +19,7 @@ from tools.delegate_tool import (
     _unregister_subagent,
     delegate_task,
     get_subagent_attribution,
+    interrupt_subagent,
 )
 
 
@@ -206,16 +207,44 @@ def test_stop_interrupts_owned_child(monkeypatch):
     _register("sid-ctl-stop-1", child)
     interrupted = []
     monkeypatch.setattr(
-        dt, "request_hard_interrupt", lambda agent, reason: interrupted.append(agent) or True
+        dt,
+        "request_hard_interrupt",
+        lambda agent, reason: interrupted.append((agent, reason)) or True,
     )
     try:
         out = json.loads(
             _handle_control_action("stop", "sid-ctl-stop-1", None, parent)
         )
         assert out["status"] == "interrupt_requested"
-        assert interrupted == [child]
+        assert interrupted[0][0] is child
+        assert interrupted[0][1] == (
+            "[delegate_task parent-control] stop requested (sid-ctl-stop-1)"
+        )
+        assert "parent_stop" in out["note"]
+        assert "interrupted" in out["note"]
+        assert "steer" in out["note"].lower()
+        assert "completed" in out["note"]
     finally:
         _unregister_subagent("sid-ctl-stop-1")
+
+
+def test_interrupt_subagent_default_reason_is_tui_contract(monkeypatch):
+    import tools.delegate_tool as dt
+
+    child = _StubChild(_StubParent())
+    _register("sid-ctl-stop-tui", child)
+    interrupted = []
+    monkeypatch.setattr(
+        dt,
+        "request_hard_interrupt",
+        lambda agent, reason: interrupted.append((agent, reason)) or True,
+    )
+    try:
+        assert interrupt_subagent("sid-ctl-stop-tui") is True
+        assert interrupted[0][0] is child
+        assert interrupted[0][1] == "Interrupted via TUI (sid-ctl-stop-tui)"
+    finally:
+        _unregister_subagent("sid-ctl-stop-tui")
 
 
 def test_stop_foreign_child_is_refused(monkeypatch):

@@ -263,13 +263,16 @@ def _close_subagent_steering(subagent_id: str, agent: Any) -> Optional[str]:
         return pending if isinstance(pending, str) and pending.strip() else None
 
 
-def interrupt_subagent(subagent_id: str) -> bool:
+def interrupt_subagent(subagent_id: str, *, reason: Optional[str] = None) -> bool:
     """Request that a single running subagent stop at its next iteration boundary.
 
     Does not hard-kill the worker thread (Python can't); sets the child's
     interrupt flag which propagates to in-flight tools and recurses into
     grandchildren via AIAgent.interrupt().  Returns True if a matching
     subagent was found.
+
+    Default *reason* is the legacy TUI contract. Model-facing parent-control
+    stop must pass an explicit override so child results map to parent_stop.
     """
     with _active_subagents_lock:
         record = _active_subagents.get(subagent_id)
@@ -278,8 +281,13 @@ def interrupt_subagent(subagent_id: str) -> bool:
     agent = record.get("agent")
     if agent is None:
         return False
+    interrupt_reason = (
+        reason
+        if reason is not None
+        else f"Interrupted via TUI ({subagent_id})"
+    )
     try:
-        if not request_hard_interrupt(agent, f"Interrupted via TUI ({subagent_id})"):
+        if not request_hard_interrupt(agent, interrupt_reason):
             return False
     except Exception as exc:
         logger.debug("interrupt_subagent(%s) failed: %s", subagent_id, exc)
@@ -530,17 +538,22 @@ def _handle_control_action(
         )
 
     if action == "stop":
-        if interrupt_subagent(sid):
+        if interrupt_subagent(
+            sid,
+            reason=f"[delegate_task parent-control] stop requested ({sid})",
+        ):
             return json.dumps(
                 {
                     "action": "stop",
                     "subagent_id": sid,
                     "status": "interrupt_requested",
                     "note": (
-                        "The subagent stops at its next iteration boundary "
-                        "(in-flight tool calls are asked to cancel). Its "
-                        "partial result still re-enters the conversation as a "
-                        "completion message — do not wait or poll."
+                        "Hard stop requested. Prefer action='steer' before "
+                        "stop when the child can still converge. The child "
+                        "halts at its next iteration boundary; the result "
+                        "re-enters as status=interrupted with "
+                        "exit_reason=parent_stop — do not treat it as "
+                        "completed, and do not wait or poll."
                     ),
                 },
                 ensure_ascii=False,
@@ -3092,15 +3105,71 @@ def _run_single_child(
         # it instead of silently accepting zero-content "success".
         _empty_sentinel = summary.strip() == "(empty)"
 
+        raw_turn_exit = result.get("turn_exit_reason")
+        turn_exit_reason = (
+            raw_turn_exit.strip()
+            if isinstance(raw_turn_exit, str) and raw_turn_exit.strip()
+            else ""
+        )
+        raw_interrupt_msg = result.get("interrupt_message")
+        if isinstance(raw_interrupt_msg, str):
+            interrupt_message = raw_interrupt_msg
+        elif raw_interrupt_msg is None:
+            interrupt_message = ""
+        else:
+            interrupt_message = str(raw_interrupt_msg)
+
+        failed_flag = bool(result.get("failed"))
+        raw_error = result.get("error")
+        if raw_error is None:
+            error_text = ""
+        elif isinstance(raw_error, str):
+            error_text = raw_error
+        else:
+            try:
+                error_text = str(raw_error)
+            except Exception:
+                error_text = repr(raw_error)
+        has_error = bool(error_text.strip())
+
+        is_iter_exhaust = turn_exit_reason.startswith(
+            "max_iterations_reached("
+        ) or turn_exit_reason == "budget_exhausted"
+
+        # Classify from structured child fields — do not infer provider
+        # errors as max_iterations just because completed=False.
         if interrupted:
             status = "interrupted"
-        elif summary and not _empty_sentinel:
-            # A summary means the subagent produced usable output.
-            # exit_reason ("completed" vs "max_iterations") already
-            # tells the parent *how* the task ended.
-            status = "completed"
-        else:
+            exit_reason = (
+                "parent_stop"
+                if interrupt_message.startswith("[delegate_task parent-control]")
+                else "interrupted"
+            )
+            truncated = False
+        elif is_iter_exhaust:
+            exit_reason = "max_iterations"
+            truncated = True
+            # Budget exhaustion with a usable summary stays completed so the
+            # parent can still consume partial work; truncated=True marks it.
+            status = "completed" if (summary and not _empty_sentinel) else "incomplete"
+        elif failed_flag or has_error:
+            status = "error"
+            exit_reason = "error"
+            truncated = False
+        elif _empty_sentinel or (completed and not summary.strip()):
+            # No usable summary: keep legacy failed status (empty LLM sentinel
+            # or completed-with-blank). Real incomplete exits land below.
             status = "failed"
+            exit_reason = "completed" if completed else (turn_exit_reason or "incomplete")
+            truncated = False
+        elif completed:
+            status = "completed"
+            exit_reason = "completed"
+            truncated = False
+        else:
+            status = "incomplete"
+            exit_reason = turn_exit_reason or "incomplete"
+            truncated = False
 
         # Build tool trace from conversation messages (already in memory).
         # Uses tool_call_id to correctly pair parallel tool calls with results.
@@ -3140,14 +3209,6 @@ def _run_single_child(
                         # Fallback for messages without tool_call_id
                         tool_trace[-1].update(result_meta)
 
-        # Determine exit reason
-        if interrupted:
-            exit_reason = "interrupted"
-        elif completed:
-            exit_reason = "completed"
-        else:
-            exit_reason = "max_iterations"
-
         # Extract token counts (safe for mock objects)
         _input_tokens = getattr(child, "session_prompt_tokens", 0)
         _output_tokens = getattr(child, "session_completion_tokens", 0)
@@ -3161,13 +3222,11 @@ def _run_single_child(
             "duration_seconds": duration,
             "model": _model if isinstance(_model, str) else None,
             "exit_reason": exit_reason,
-            # Explicit, parent-visible truncation flag. A subagent that
-            # exhausts its per-child iteration budget still returns a summary,
-            # so `status` stays "completed" (see above) — without this the
-            # parent can't tell truncated-but-summarized from cleanly-finished
-            # work except by parsing the summary prose. exit_reason is computed
-            # authoritatively from the child's `completed` flag.
-            "truncated": exit_reason == "max_iterations",
+            # Explicit, parent-visible truncation flag. Iteration-budget
+            # exhaustion with a usable summary keeps status=completed; this
+            # flag (and exit_reason=max_iterations) distinguish it from a
+            # clean finish. Other terminal classes leave truncated=False.
+            "truncated": truncated,
             "tokens": {
                 "input": (
                     _input_tokens if isinstance(_input_tokens, (int, float)) else 0
@@ -3206,8 +3265,24 @@ def _run_single_child(
             _cost_status if isinstance(_cost_status, str) and _cost_status
             else "unknown"
         )
-        if status == "failed":
-            entry["error"] = result.get("error", "Subagent did not produce a response.")
+        if status in ("failed", "error"):
+            entry["error"] = (
+                error_text
+                if has_error
+                else (result.get("error") or "Subagent did not produce a response.")
+            )
+        if turn_exit_reason:
+            entry["turn_exit_reason"] = turn_exit_reason
+        raw_failure_reason = result.get("failure_reason")
+        if isinstance(raw_failure_reason, str) and raw_failure_reason.strip():
+            entry["failure_reason"] = raw_failure_reason
+        elif raw_failure_reason is not None and not isinstance(raw_failure_reason, str):
+            try:
+                _fr = str(raw_failure_reason).strip()
+            except Exception:
+                _fr = ""
+            if _fr:
+                entry["failure_reason"] = _fr
 
         # T1-24: schema-validation outcome — emitted ONLY when a schema was
         # requested, so legacy (schema-less) payloads keep their exact shape.
@@ -4363,11 +4438,12 @@ def delegate_task(
             if any(isinstance(s, str) and s for s in _sids):
                 payload["subagent_ids"] = _sids
                 payload["control_hint"] = (
-                    "While a child runs you can orchestrate it live with this "
-                    "same tool: delegate_task(action='list') to see live "
-                    "children, action='steer' with subagent_id + message to "
-                    "redirect one, action='stop' with subagent_id to end one "
-                    "early."
+                    "While a child runs, prefer action='steer' (subagent_id + "
+                    "message) to redirect and close out; use action='list' to "
+                    "see live children; reserve action='stop' for unsafe work, "
+                    "explicit cancel, unresponsive children, or after one "
+                    "steer still not converging (returns interrupted/"
+                    "parent_stop, not completed)."
                 )
             if live_paths:
                 payload["live_transcripts"] = list(live_paths)
@@ -4690,14 +4766,16 @@ def _build_top_level_description() -> str:
         "you. Provide 'goal' for a single task or 'tasks' for a parallel batch "
         "(limits and nesting rules are in the parameter descriptions).\n\n"
         "Runs in the background: dispatch returns immediately with live "
-        "transcript paths, and the completed result (one consolidated message "
-        "for a batch) re-enters the conversation on its own. Do NOT wait or "
-        "poll; continue other work.\n\n"
-        "LIVE ORCHESTRATION: while children run, this tool also controls "
-        "them — action='list' (live children + ids), action='steer' "
-        "(subagent_id + message, redirect without stopping), action='stop' "
-        "(subagent_id, end early; partial result still returns). Steer when "
-        "a live transcript shows a child drifting.\n\n"
+        "transcript paths; the completed result (one consolidated message for "
+        "a batch) re-enters on its own. Do NOT wait or poll; continue other "
+        "work.\n\n"
+        "LIVE ORCHESTRATION: action='list', action='steer' (subagent_id + "
+        "message), action='stop' (subagent_id). Prefer steer first — when "
+        "narrowing scope, keeping existing artifacts, reviewing outdated work, "
+        "or preparing to take over, steer and require the next response to "
+        "close. Reserve stop for unsafe work, explicit cancel, confirmed "
+        "unresponsive children, or after one steer still not converging. Stop "
+        "returns interrupted/parent_stop — never treat it as completed.\n\n"
         "USE FOR: reasoning-heavy subtasks, work that would flood your context "
         "with intermediate data, or independent parallel workstreams.\n"
         "DO NOT USE FOR (use these instead):\n"
@@ -4709,20 +4787,19 @@ def _build_top_level_description() -> str:
         "process exit discards running subagents.\n\n"
         "RULES:\n"
         "- Children know nothing of this conversation: pass everything needed "
-        "via 'context', including any required output language, tone, or "
-        "style (e.g. \"respond in Chinese\").\n"
-        "- Child summaries are SELF-REPORTS, not verified facts: a child "
-        "claiming \"uploaded successfully\" or \"file written\" may be wrong. "
-        "For external side effects (uploads, remote writes, publishing), "
-        "require a verifiable handle (URL, ID, absolute path) and verify it "
-        "yourself — fetch the URL, stat the file, read back the content — "
-        "before telling the user the operation succeeded.\n"
-        "- Leaf children (the default) cannot call delegate_task, clarify, "
+        "via 'context', including language/tone/style (e.g. \"respond in "
+        "Chinese\").\n"
+        "- Child summaries are SELF-REPORTS, not verified facts. For external "
+        "side effects (uploads, remote writes, publishing), require a "
+        "verifiable handle (URL, ID, path) and verify it — fetch the URL, "
+        "stat the file, read back content — before telling the user it "
+        "succeeded.\n"
+        "- Leaf children (default) cannot call delegate_task, clarify, "
         "memory, send_message, or cronjob; orchestrators regain only "
         "delegate_task.\n"
-        "- Children inherit the parent model and fallback chain unless pinned "
-        "globally via delegation.provider / delegation.model in config.yaml. "
-        "Results are returned as an array, one entry per task."
+        "- Children inherit the parent model/fallback unless pinned via "
+        "delegation.provider / delegation.model in config.yaml. Results are "
+        "an array, one entry per task."
     )
 
 

@@ -108,6 +108,30 @@ class TestDelegateRequirements(unittest.TestCase):
         ):
             self.assertIn(keyword, desc, f"top-level description lost: {keyword!r}")
 
+    def test_top_level_description_steer_first_stop_reserved_parent_stop(self):
+        """LIVE ORCHESTRATION must teach steer-first, reserved stop, and
+        that parent hard-stop returns interrupted/parent_stop — never a
+        completed submission."""
+        from tools.delegate_tool import _build_top_level_description
+
+        desc = _build_top_level_description()
+        desc_l = desc.lower()
+        self.assertLessEqual(len(desc), 2200)
+        self.assertIn("steer first", desc_l)
+        self.assertIn("narrowing", desc_l)
+        self.assertTrue(
+            any(tok in desc_l for tok in ("unsafe", "cancel", "unresponsive")),
+            "description must reserve stop for unsafe/cancel/unresponsive cases",
+        )
+        self.assertIn("after one steer", desc_l)
+        self.assertIn("parent_stop", desc_l)
+        self.assertIn("interrupted", desc_l)
+        self.assertRegex(
+            desc_l,
+            r"(never|not|do not).{0,40}completed",
+            "description must warn that stop results must not be treated as completed",
+        )
+
     def test_dynamic_limits_moved_to_param_descriptions(self):
         """Concurrency and nesting ceilings must reach the model through the
         tasks/role parameter descriptions (the top-level text no longer

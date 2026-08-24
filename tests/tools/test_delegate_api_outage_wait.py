@@ -201,3 +201,133 @@ def test_run_single_child_keeps_heartbeat_and_timeout_alive_during_outage(
     parent._touch_activity.assert_any_call(
         "delegate_task: subagent waiting for API recovery (iteration 1/30)"
     )
+
+
+class _StructuredResultChild(_OutageChild):
+    def __init__(self, result):
+        super().__init__()
+        self._result = result
+
+    def run_conversation(self, user_message, task_id=None, stream_callback=None):
+        return dict(self._result)
+
+
+@pytest.mark.parametrize(
+    ("child_result", "expected"),
+    [
+        (
+            {
+                "final_response": "provider failed",
+                "completed": False,
+                "failed": True,
+                "error": "HTTP 403",
+                "failure_reason": "provider",
+                "turn_exit_reason": "non_retryable_client_error",
+                "api_calls": 14,
+            },
+            {
+                "status": "error",
+                "exit_reason": "error",
+                "truncated": False,
+            },
+        ),
+        (
+            {
+                "final_response": "usable summary",
+                "completed": False,
+                "failed": False,
+                "turn_exit_reason": "max_iterations_reached(70/70)",
+                "api_calls": 70,
+            },
+            {
+                "status": "completed",
+                "exit_reason": "max_iterations",
+                "truncated": True,
+            },
+        ),
+    ],
+)
+def test_run_single_child_classifies_structured_provider_failure_and_max_iteration(
+    monkeypatch, child_result, expected
+):
+    child = _StructuredResultChild(child_result)
+    parent = MagicMock()
+    parent._current_task_id = None
+    monkeypatch.setattr(delegate_tool, "_get_child_timeout", lambda: 1.0)
+
+    result = delegate_tool._run_single_child(
+        task_index=4, goal="classify", child=child, parent_agent=parent
+    )
+
+    for key, value in expected.items():
+        assert result[key] == value
+    if child_result.get("failed"):
+        assert result["error"] == "HTTP 403"
+        assert result["turn_exit_reason"] == "non_retryable_client_error"
+        assert result["failure_reason"] == "provider"
+
+
+def test_run_single_child_parent_stop_and_generic_interrupt_have_distinct_reasons(
+    monkeypatch,
+):
+    parent = MagicMock()
+    parent._current_task_id = None
+    monkeypatch.setattr(delegate_tool, "_get_child_timeout", lambda: 1.0)
+
+    parent_stop = delegate_tool._run_single_child(
+        task_index=5,
+        goal="stop",
+        child=_StructuredResultChild(
+            {
+                "final_response": "",
+                "completed": False,
+                "interrupted": True,
+                "interrupt_message": "[delegate_task parent-control] stop requested",
+                "turn_exit_reason": "interrupted",
+            }
+        ),
+        parent_agent=parent,
+    )
+    generic = delegate_tool._run_single_child(
+        task_index=6,
+        goal="interrupt",
+        child=_StructuredResultChild(
+            {
+                "final_response": "",
+                "completed": False,
+                "interrupted": True,
+                "interrupt_message": "Operation interrupted by user",
+                "turn_exit_reason": "interrupted_by_user",
+            }
+        ),
+        parent_agent=parent,
+    )
+
+    assert parent_stop["status"] == "interrupted"
+    assert parent_stop["exit_reason"] == "parent_stop"
+    assert parent_stop["truncated"] is False
+    assert generic["status"] == "interrupted"
+    assert generic["exit_reason"] == "interrupted"
+    assert generic["truncated"] is False
+
+
+def test_run_single_child_preserves_non_failure_incomplete_reason(monkeypatch):
+    child = _StructuredResultChild(
+        {
+            "final_response": "",
+            "completed": False,
+            "failed": False,
+            "turn_exit_reason": "partial_stream_recovery",
+        }
+    )
+    parent = MagicMock()
+    parent._current_task_id = None
+    monkeypatch.setattr(delegate_tool, "_get_child_timeout", lambda: 1.0)
+
+    result = delegate_tool._run_single_child(
+        task_index=7, goal="incomplete", child=child, parent_agent=parent
+    )
+
+    assert result["status"] == "incomplete"
+    assert result["exit_reason"] == "partial_stream_recovery"
+    assert result["truncated"] is False
