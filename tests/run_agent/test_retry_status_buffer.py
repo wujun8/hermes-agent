@@ -139,7 +139,7 @@ def test_agent_reads_show_retry_status_as_boolean(configured, expected):
         patch("run_agent.check_toolset_requirements", return_value={}),
         patch("run_agent.OpenAI"),
         patch(
-            "hermes_cli.config.load_config",
+            "hermes_cli.config.load_config_readonly",
             return_value={"agent": {"show_retry_status": configured}},
         ),
     ):

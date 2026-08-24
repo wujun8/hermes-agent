@@ -335,7 +335,7 @@ def _make_agent(
         patch("run_agent.check_toolset_requirements", return_value={}),
         patch("run_agent.OpenAI", return_value=MagicMock()),
         patch(
-            "hermes_cli.config.load_config",
+            "hermes_cli.config.load_config_readonly",
             return_value={
                 "agent": {
                     "api_max_retries": max_retries,
@@ -363,14 +363,6 @@ def _make_agent(
     # Keep the fixture independent from config-loader internals across Hermes
     # upgrades. These are the runtime fields exercised by conversation_loop.
     agent._api_max_retries = max_retries
-    agent._api_outage_recovery_config = ApiOutageRecoveryConfig.from_mapping(
-        {
-            "enabled": True,
-            "probe_command": probe_command,
-            "probe_interval_seconds": 600,
-            "probe_timeout_seconds": 60,
-        }
-    )
     return agent
 
 
