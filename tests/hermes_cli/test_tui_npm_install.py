@@ -2,6 +2,7 @@
 
 import json
 import os
+import subprocess
 import types
 from pathlib import Path
 
@@ -43,6 +44,95 @@ def _assert_utf8_replace_capture(kwargs: dict) -> None:
 
 
 
+
+
+def _init_git_checkout(root: Path, lock_content: bytes) -> Path:
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    lock = root / "package-lock.json"
+    lock.write_bytes(lock_content)
+    subprocess.run(["git", "add", "package-lock.json"], cwd=root, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Hermes Tests",
+            "-c",
+            "user.email=tests@example.com",
+            "commit",
+            "-qm",
+            "baseline",
+        ],
+        cwd=root,
+        check=True,
+    )
+    return lock
+
+
+def _run_fake_tui_install(
+    tmp_path: Path, main_mod, monkeypatch, lock: Path, installed_lock: bytes
+) -> None:
+    tui_dir = tmp_path / "ui-tui"
+    tui_dir.mkdir()
+    (tui_dir / "package.json").write_text("{}")
+
+    monkeypatch.delenv("HERMES_TUI_DIR", raising=False)
+    monkeypatch.delenv("TERMUX_VERSION", raising=False)
+    monkeypatch.setattr(main_mod, "_ensure_tui_node", lambda: None)
+    monkeypatch.setattr(main_mod, "_find_bundled_tui", lambda: None)
+    monkeypatch.setattr(main_mod, "_is_termux_startup_environment", lambda: False)
+    monkeypatch.setattr(main_mod, "_tui_need_npm_install", lambda _root: True)
+
+    real_which = main_mod.shutil.which
+    monkeypatch.setattr(
+        main_mod.shutil,
+        "which",
+        lambda name: real_which(name) if name == "git" else f"/bin/{name}",
+    )
+    real_run = main_mod.subprocess.run
+    install_calls = 0
+
+    def fake_run(*args, **kwargs):
+        nonlocal install_calls
+        command = args[0]
+        if Path(command[0]).name == "npm":
+            if command[1] == "install":
+                install_calls += 1
+                lock.write_bytes(installed_lock)
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(main_mod.subprocess, "run", fake_run)
+    main_mod._make_tui_argv(tui_dir, tui_dev=False)
+    assert install_calls == 1
+
+
+def test_successful_tui_install_restores_clean_tracked_workspace_lock(
+    tmp_path: Path, main_mod, monkeypatch
+) -> None:
+    original_lock = b'{"lockfileVersion":3,"packages":{}}\n'
+    installed_lock = b'{"lockfileVersion":3,"packages":{},"npm":"rewrote"}\n'
+    lock = _init_git_checkout(tmp_path, original_lock)
+    sentinel = tmp_path / "untracked-sentinel.txt"
+    sentinel.write_bytes(b"keep me")
+
+    _run_fake_tui_install(tmp_path, main_mod, monkeypatch, lock, installed_lock)
+
+    assert lock.read_bytes() == original_lock
+    assert sentinel.read_bytes() == b"keep me"
+
+
+def test_successful_tui_install_preserves_preexisting_dirty_workspace_lock(
+    tmp_path: Path, main_mod, monkeypatch
+) -> None:
+    committed_lock = b'{"lockfileVersion":3,"packages":{}}\n'
+    dirty_lock = b'{"lockfileVersion":3,"packages":{},"local":"keep"}\n'
+    installed_lock = b'{"lockfileVersion":3,"packages":{},"npm":"rewrote"}\n'
+    lock = _init_git_checkout(tmp_path, committed_lock)
+    lock.write_bytes(dirty_lock)
+
+    _run_fake_tui_install(tmp_path, main_mod, monkeypatch, lock, installed_lock)
+
+    assert lock.read_bytes() == dirty_lock
 
 
 def test_make_tui_argv_uses_bundled_tui_when_workspace_missing(

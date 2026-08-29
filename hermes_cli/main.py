@@ -2514,6 +2514,75 @@ def _npm_lifecycle_env(env: dict[str, str] | None = None) -> dict[str, str]:
     return run_env
 
 
+def _tui_lockfile_state(lock: Path) -> tuple[str, bytes | None] | None:
+    """Capture the root lockfile state so a successful npm install can undo churn.
+
+    A ``None`` byte snapshot means the worktree matched the index before the
+    install; restoring from the index preserves any staged lockfile content.
+    A byte snapshot means an unstaged edit already existed and must be put back
+    byte-for-byte.  Non-Git and untracked lockfiles are left alone.
+    """
+    git = shutil.which("git")
+    if not git or not lock.is_file():
+        return None
+    if not any((parent / ".git").exists() for parent in (lock.parent, *lock.parent.parents)):
+        return None
+    try:
+        tracked = subprocess.run(
+            [git, "ls-files", "--error-unmatch", "--", lock.name],
+            cwd=str(lock.parent),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        if tracked.returncode != 0:
+            return None
+        diff = subprocess.run(
+            [git, "diff", "--quiet", "--", lock.name],
+            cwd=str(lock.parent),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+    except OSError:
+        return None
+    if diff.returncode == 0:
+        return git, None
+    if diff.returncode != 1:
+        return None
+    try:
+        return git, lock.read_bytes()
+    except OSError:
+        return None
+
+
+def _restore_tui_lockfile(lock: Path, state: tuple[str, bytes | None]) -> None:
+    """Restore only the TUI workspace root lockfile after a successful install."""
+    git, dirty_content = state
+    if dirty_content is not None:
+        try:
+            lock.write_bytes(dirty_content)
+        except OSError:
+            pass
+        return
+    try:
+        subprocess.run(
+            [git, "restore", "--worktree", "--", lock.name],
+            cwd=str(lock.parent),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+    except OSError:
+        pass
+
+
 def _make_tui_argv(tui_dir: Path, tui_dev: bool) -> tuple[list[str], Path]:
     """TUI: --dev → tsx src; else node dist (HERMES_TUI_DIR prebuilt or esbuild)."""
     _ensure_tui_node()
@@ -2647,6 +2716,8 @@ def _make_tui_argv(tui_dir: Path, tui_dev: bool) -> tuple[list[str], Path]:
                 env=_npm_lifecycle_env(with_hermes_node_path()),
             )
 
+        lockfile = npm_cwd / "package-lock.json"
+        lockfile_state = _tui_lockfile_state(lockfile)
         result = _run_tui_install()
         if result.returncode != 0:
             # An npm outside the root package.json's `engines.npm` range fails
@@ -2668,6 +2739,8 @@ def _make_tui_argv(tui_dir: Path, tui_dev: bool) -> tuple[list[str], Path]:
             if preview:
                 print(preview)
             sys.exit(1)
+        if lockfile_state is not None:
+            _restore_tui_lockfile(lockfile, lockfile_state)
         did_install = True
 
     if tui_dev:
