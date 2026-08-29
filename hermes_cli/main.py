@@ -435,7 +435,7 @@ import stat
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Optional
+from typing import NamedTuple, Optional
 
 
 import functools as _functools
@@ -2053,6 +2053,60 @@ def _workspace_root(dir: Path) -> Path:
         and (dir.parent / "package-lock.json").is_file()
     ):
         return dir.parent
+    # A tracked workspace-root lockfile can be absent from the worktree (for
+    # example, an unstaged or staged deletion).  Ask Git for the canonical root
+    # before falling back to the standalone-project interpretation; otherwise a
+    # successful npm install would never know which absence it must preserve.
+    if (
+        (dir / "package.json").is_file()
+        and not (dir / "package-lock.json").is_file()
+        and any((parent / ".git").exists() for parent in (dir, *dir.parents))
+    ):
+        git = shutil.which("git")
+        if git:
+            try:
+                root_result = subprocess.run(
+                    [git, "rev-parse", "--show-toplevel"],
+                    cwd=str(dir),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    check=False,
+                )
+            except OSError:
+                root_result = None
+            if root_result is not None and root_result.returncode == 0:
+                root_lines = (root_result.stdout or "").splitlines()
+                if len(root_lines) == 1 and root_lines[0].strip():
+                    candidate = Path(root_lines[0].strip())
+                    if candidate.is_absolute():
+                        try:
+                            tracked = subprocess.run(
+                                [
+                                    git,
+                                    "ls-files",
+                                    "--error-unmatch",
+                                    "--",
+                                    "package-lock.json",
+                                ],
+                                cwd=str(candidate),
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
+                                text=True,
+                                encoding="utf-8",
+                                errors="replace",
+                                check=False,
+                            )
+                        except OSError:
+                            tracked = None
+                        if tracked is not None and tracked.returncode == 0:
+                            return candidate
+                        if candidate.resolve(strict=False) == dir.parent.resolve(strict=False) and (
+                            candidate / "package.json"
+                        ).is_file():
+                            return candidate
     return dir
 
 
@@ -2514,23 +2568,148 @@ def _npm_lifecycle_env(env: dict[str, str] | None = None) -> dict[str, str]:
     return run_env
 
 
-def _tui_lockfile_state(lock: Path) -> tuple[str, bytes | None] | None:
-    """Capture the root lockfile state so a successful npm install can undo churn.
+class _TuiLockfileStateError(RuntimeError):
+    """A managed TUI lockfile cannot be inspected or restored safely."""
 
-    A ``None`` byte snapshot means the worktree matched the index before the
-    install; restoring from the index preserves any staged lockfile content.
-    A byte snapshot means an unstaged edit already existed and must be put back
-    byte-for-byte.  Non-Git and untracked lockfiles are left alone.
+
+class _TuiLockfileState(NamedTuple):
+    git: str
+    git_root: Path
+    relative_path: str
+    index_entry: bytes | None
+    worktree_bytes: bytes | None
+    worktree_mode: int | None
+
+
+def _tui_command_text(value) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value or "")
+
+
+def _tui_git_failure(operation: str, result) -> _TuiLockfileStateError:
+    detail = _tui_command_text(getattr(result, "stderr", "")).strip()
+    if not detail:
+        detail = _tui_command_text(getattr(result, "stdout", "")).strip()
+    suffix = f": {detail}" if detail else ""
+    return _TuiLockfileStateError(
+        f"git {operation} failed with exit status {result.returncode}{suffix}"
+    )
+
+
+def _tui_git_index_entry(
+    git: str, git_root: Path, relative_path: str
+) -> bytes | None:
+    try:
+        result = subprocess.run(
+            [git, "ls-files", "--stage", "-z", "--", relative_path],
+            cwd=str(git_root),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+    except OSError as exc:
+        raise _TuiLockfileStateError(
+            f"could not inspect the Git index for {relative_path}: {exc}"
+        ) from exc
+    if result.returncode != 0:
+        raise _tui_git_failure(f"ls-files for {relative_path}", result)
+    raw = result.stdout or b""
+    if isinstance(raw, str):
+        raw = raw.encode("utf-8", errors="surrogateescape")
+    entries = [entry for entry in raw.split(b"\0") if entry]
+    if len(entries) > 1:
+        raise _TuiLockfileStateError(
+            f"Git index has multiple stages for managed lockfile {relative_path}"
+        )
+    if not entries:
+        return None
+    entry = entries[0]
+    prefix, separator, path = entry.partition(b"\t")
+    fields = prefix.split()
+    if not separator or len(fields) != 3:
+        raise _TuiLockfileStateError(
+            f"Git index returned an invalid entry for managed lockfile {relative_path}"
+        )
+    try:
+        indexed_path = path.decode("utf-8")
+        mode = fields[0].decode("ascii")
+        stage = fields[2].decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise _TuiLockfileStateError(
+            f"Git index returned an undecodable entry for managed lockfile {relative_path}"
+        ) from exc
+    if indexed_path != relative_path or stage != "0":
+        raise _TuiLockfileStateError(
+            f"Git index entry does not uniquely identify managed lockfile {relative_path}"
+        )
+    if mode == "120000":
+        raise _TuiLockfileStateError(
+            f"managed TUI lockfile is a symlink in the Git index: {relative_path}"
+        )
+    if mode not in {"100644", "100755"}:
+        raise _TuiLockfileStateError(
+            f"managed TUI lockfile has unsupported Git mode {mode}: {relative_path}"
+        )
+    if fields[1] == b"0" * 40:
+        raise _TuiLockfileStateError(
+            f"Git index has no blob for managed lockfile {relative_path}"
+        )
+    return entry
+
+
+def _tui_worktree_lock_snapshot(lock: Path) -> tuple[bytes, int] | None:
+    try:
+        metadata = lock.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise _TuiLockfileStateError(
+            f"could not inspect managed lockfile {lock}: {exc}"
+        ) from exc
+    if stat.S_ISLNK(metadata.st_mode):
+        raise _TuiLockfileStateError(
+            f"managed TUI lockfile is a symlink: {lock}"
+        )
+    if not stat.S_ISREG(metadata.st_mode):
+        raise _TuiLockfileStateError(
+            f"managed TUI lockfile is not a regular file: {lock}"
+        )
+    try:
+        content = lock.read_bytes()
+    except OSError as exc:
+        raise _TuiLockfileStateError(
+            f"could not read managed lockfile {lock}: {exc}"
+        ) from exc
+    return content, stat.S_IMODE(metadata.st_mode)
+
+
+def _tui_lockfile_state(
+    lock: Path, *, npm_root: Path | None = None
+) -> _TuiLockfileState | None:
+    """Capture a managed lockfile's exact worktree and index state.
+
+    ``None`` means the path is outside Git or is genuinely untracked, preserving
+    the historical npm behavior for those layouts.  A tracked path must be
+    fully inspectable before npm runs; ambiguity is an error, not a reason to
+    skip restoration.
     """
+    lock = Path(lock)
+    npm_root = Path(npm_root) if npm_root is not None else lock.parent
+    lock_abs = Path(os.path.abspath(os.fspath(lock)))
+    npm_root_abs = Path(os.path.abspath(os.fspath(npm_root)))
+    if lock_abs.parent != npm_root_abs:
+        raise _TuiLockfileStateError(
+            f"managed lockfile parent {lock_abs.parent} is not the npm workspace root {npm_root_abs}"
+        )
+
     git = shutil.which("git")
-    if not git or not lock.is_file():
-        return None
-    if not any((parent / ".git").exists() for parent in (lock.parent, *lock.parent.parents)):
+    if not git:
         return None
     try:
-        tracked = subprocess.run(
-            [git, "ls-files", "--error-unmatch", "--", lock.name],
-            cwd=str(lock.parent),
+        root_result = subprocess.run(
+            [git, "rev-parse", "--show-toplevel"],
+            cwd=str(npm_root_abs),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -2538,40 +2717,87 @@ def _tui_lockfile_state(lock: Path) -> tuple[str, bytes | None] | None:
             errors="replace",
             check=False,
         )
-        if tracked.returncode != 0:
+    except OSError as exc:
+        raise _TuiLockfileStateError(
+            f"could not resolve the Git root for {npm_root_abs}: {exc}"
+        ) from exc
+    if root_result.returncode != 0:
+        detail = _tui_command_text(root_result.stderr).lower()
+        if "not a git repository" in detail:
             return None
-        diff = subprocess.run(
-            [git, "diff", "--quiet", "--", lock.name],
-            cwd=str(lock.parent),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
+        raise _tui_git_failure("rev-parse --show-toplevel", root_result)
+    root_lines = (root_result.stdout or "").splitlines()
+    if len(root_lines) != 1 or not root_lines[0].strip():
+        raise _TuiLockfileStateError(
+            f"git rev-parse returned an invalid root for {npm_root_abs}"
         )
-    except OSError:
-        return None
-    if diff.returncode == 0:
-        return git, None
-    if diff.returncode != 1:
-        return None
+    git_root = Path(root_lines[0].strip())
+    if not git_root.is_absolute():
+        raise _TuiLockfileStateError(
+            f"git rev-parse returned a non-absolute root for {npm_root_abs}: {git_root}"
+        )
+    git_root_abs = Path(os.path.abspath(os.fspath(git_root)))
+    resolved_git_root = git_root_abs.resolve(strict=False)
+    resolved_npm_root = npm_root_abs.resolve(strict=False)
+    if git_root_abs != resolved_git_root:
+        raise _TuiLockfileStateError(
+            f"Git root is a symlink path alias: {git_root_abs}"
+        )
+    if npm_root_abs != resolved_npm_root:
+        raise _TuiLockfileStateError(
+            f"npm workspace root is a symlink path alias: {npm_root_abs}"
+        )
     try:
-        return git, lock.read_bytes()
-    except OSError:
-        return None
+        resolved_npm_root.relative_to(resolved_git_root)
+    except ValueError as exc:
+        raise _TuiLockfileStateError(
+            f"npm workspace root {npm_root_abs} is outside Git root {git_root_abs}"
+        ) from exc
+    if lock.is_symlink():
+        raise _TuiLockfileStateError(f"managed TUI lockfile is a symlink: {lock_abs}")
+    if lock_abs.resolve(strict=False) != lock_abs:
+        raise _TuiLockfileStateError(
+            f"managed lockfile path is a symlink alias: {lock_abs}"
+        )
+    try:
+        relative_path = lock_abs.relative_to(git_root_abs).as_posix()
+    except ValueError as exc:
+        raise _TuiLockfileStateError(
+            f"managed lockfile {lock_abs} is outside Git root {git_root_abs}"
+        ) from exc
 
-
-def _restore_tui_lockfile(lock: Path, state: tuple[str, bytes | None]) -> None:
-    """Restore only the TUI workspace root lockfile after a successful install."""
-    git, dirty_content = state
-    if dirty_content is not None:
+    index_entry = _tui_git_index_entry(git, git_root_abs, relative_path)
+    if index_entry is None:
         try:
-            lock.write_bytes(dirty_content)
-        except OSError:
-            pass
-        return
+            staged_result = subprocess.run(
+                [git, "diff", "--cached", "--name-status", "--", relative_path],
+                cwd=str(git_root_abs),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+        except OSError as exc:
+            raise _TuiLockfileStateError(
+                f"could not inspect staged Git state for {relative_path}: {exc}"
+            ) from exc
+        if staged_result.returncode != 0:
+            raise _tui_git_failure(
+                f"diff --cached for {relative_path}", staged_result
+            )
+        staged_lines = (staged_result.stdout or "").splitlines()
+        if not staged_lines:
+            return None
+        if staged_lines != [f"D\t{relative_path}"]:
+            raise _TuiLockfileStateError(
+                f"Git index has an ambiguous staged state for managed lockfile {relative_path}"
+            )
     try:
-        subprocess.run(
-            [git, "restore", "--worktree", "--", lock.name],
-            cwd=str(lock.parent),
+        diff_result = subprocess.run(
+            [git, "diff", "--quiet", "--", relative_path],
+            cwd=str(git_root_abs),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -2579,10 +2805,105 @@ def _restore_tui_lockfile(lock: Path, state: tuple[str, bytes | None]) -> None:
             errors="replace",
             check=False,
         )
-    except OSError:
-        pass
+    except OSError as exc:
+        raise _TuiLockfileStateError(
+            f"could not inspect Git worktree state for {relative_path}: {exc}"
+        ) from exc
+    if diff_result.returncode not in {0, 1}:
+        raise _tui_git_failure(f"diff for {relative_path}", diff_result)
+    snapshot = _tui_worktree_lock_snapshot(lock)
+    if snapshot is None:
+        return _TuiLockfileState(git, git_root_abs, relative_path, index_entry, None, None)
+    return _TuiLockfileState(
+        git,
+        git_root_abs,
+        relative_path,
+        index_entry,
+        snapshot[0],
+        snapshot[1],
+    )
 
 
+def _tui_remove_lockfile(lock: Path) -> None:
+    try:
+        metadata = lock.lstat()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise _TuiLockfileStateError(
+            f"could not inspect replacement lockfile {lock}: {exc}"
+        ) from exc
+    if stat.S_ISDIR(metadata.st_mode):
+        raise _TuiLockfileStateError(
+            f"cannot restore lockfile absence over a directory: {lock}"
+        )
+    if not (stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode)):
+        raise _TuiLockfileStateError(
+            f"cannot safely remove replacement lockfile: {lock}"
+        )
+    try:
+        lock.unlink()
+    except OSError as exc:
+        raise _TuiLockfileStateError(
+            f"could not restore lockfile absence at {lock}: {exc}"
+        ) from exc
+
+
+def _tui_replace_lockfile(lock: Path, content: bytes, mode: int) -> None:
+    temporary: str | None = None
+    try:
+        fd, temporary = tempfile.mkstemp(
+            prefix=f".{lock.name}.hermes-", dir=str(lock.parent)
+        )
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, mode)
+        # os.replace replaces a symlink entry rather than following it.
+        os.replace(temporary, lock)
+        temporary = None
+    except OSError as exc:
+        raise _TuiLockfileStateError(
+            f"could not restore managed lockfile {lock}: {exc}"
+        ) from exc
+    finally:
+        if temporary is not None:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+
+
+def _restore_tui_lockfile(lock: Path, state: _TuiLockfileState) -> None:
+    """Restore and verify the exact tracked TUI lockfile worktree state."""
+    if state.worktree_bytes is None:
+        _tui_remove_lockfile(lock)
+    else:
+        _tui_replace_lockfile(lock, state.worktree_bytes, state.worktree_mode or 0o644)
+
+    snapshot = _tui_worktree_lock_snapshot(lock)
+    if state.worktree_bytes is None:
+        if snapshot is not None:
+            raise _TuiLockfileStateError(
+                f"lockfile absence verification failed: {lock} still exists"
+            )
+    elif snapshot is None or snapshot[0] != state.worktree_bytes:
+        raise _TuiLockfileStateError(
+            f"lockfile byte verification failed after restore: {lock}"
+        )
+    elif state.worktree_mode is not None and snapshot[1] != state.worktree_mode:
+        raise _TuiLockfileStateError(
+            f"lockfile mode verification failed after restore: {lock}"
+        )
+
+    current_index_entry = _tui_git_index_entry(
+        state.git, state.git_root, state.relative_path
+    )
+    if current_index_entry != state.index_entry:
+        raise _TuiLockfileStateError(
+            f"Git index changed while restoring managed lockfile {lock}"
+        )
 def _make_tui_argv(tui_dir: Path, tui_dev: bool) -> tuple[list[str], Path]:
     """TUI: --dev → tsx src; else node dist (HERMES_TUI_DIR prebuilt or esbuild)."""
     _ensure_tui_node()
@@ -2717,7 +3038,11 @@ def _make_tui_argv(tui_dir: Path, tui_dev: bool) -> tuple[list[str], Path]:
             )
 
         lockfile = npm_cwd / "package-lock.json"
-        lockfile_state = _tui_lockfile_state(lockfile)
+        try:
+            lockfile_state = _tui_lockfile_state(lockfile, npm_root=npm_cwd)
+        except Exception as exc:
+            print(f"TUI lockfile preflight failed: {exc}", file=sys.stderr)
+            sys.exit(1)
         result = _run_tui_install()
         if result.returncode != 0:
             # An npm outside the root package.json's `engines.npm` range fails
@@ -2740,7 +3065,11 @@ def _make_tui_argv(tui_dir: Path, tui_dev: bool) -> tuple[list[str], Path]:
                 print(preview)
             sys.exit(1)
         if lockfile_state is not None:
-            _restore_tui_lockfile(lockfile, lockfile_state)
+            try:
+                _restore_tui_lockfile(lockfile, lockfile_state)
+            except Exception as exc:
+                print(f"TUI lockfile restore failed: {exc}", file=sys.stderr)
+                sys.exit(1)
         did_install = True
 
     if tui_dev:

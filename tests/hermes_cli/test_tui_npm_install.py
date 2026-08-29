@@ -48,6 +48,7 @@ def _assert_utf8_replace_capture(kwargs: dict) -> None:
 
 def _init_git_checkout(root: Path, lock_content: bytes) -> Path:
     subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    (root / "package.json").write_text("{}")
     lock = root / "package-lock.json"
     lock.write_bytes(lock_content)
     subprocess.run(["git", "add", "package-lock.json"], cwd=root, check=True)
@@ -133,6 +134,313 @@ def test_successful_tui_install_preserves_preexisting_dirty_workspace_lock(
     _run_fake_tui_install(tmp_path, main_mod, monkeypatch, lock, installed_lock)
 
     assert lock.read_bytes() == dirty_lock
+
+
+def _git_lock_status(root: Path) -> str | None:
+    result = subprocess.run(
+        ["git", "status", "--short", "--untracked-files=all"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    for line in result.stdout.splitlines():
+        if line[3:] == "package-lock.json":
+            return line[:2]
+    return None
+
+
+def _git_index_lock_bytes(root: Path) -> bytes | None:
+    result = subprocess.run(
+        ["git", "show", ":package-lock.json"],
+        cwd=root,
+        check=False,
+        capture_output=True,
+    )
+    return result.stdout if result.returncode == 0 else None
+
+
+def _run_real_git_tui_install(
+    tmp_path: Path,
+    main_mod,
+    monkeypatch,
+    lock: Path,
+    mutate,
+    *,
+    results: tuple[int, ...] = (0,),
+    git_interceptor=None,
+) -> tuple[list[list[str]], int]:
+    tui_dir = tmp_path / "ui-tui"
+    tui_dir.mkdir(exist_ok=True)
+    (tui_dir / "package.json").write_text("{}")
+
+    monkeypatch.delenv("HERMES_TUI_DIR", raising=False)
+    monkeypatch.delenv("TERMUX_VERSION", raising=False)
+    monkeypatch.setattr(main_mod, "_ensure_tui_node", lambda: None)
+    monkeypatch.setattr(main_mod, "_find_bundled_tui", lambda: None)
+    monkeypatch.setattr(main_mod, "_is_termux_startup_environment", lambda: False)
+    monkeypatch.setattr(main_mod, "_tui_need_npm_install", lambda _root: True)
+
+    real_which = main_mod.shutil.which
+    monkeypatch.setattr(
+        main_mod.shutil,
+        "which",
+        lambda name: real_which(name) if name == "git" else f"/bin/{name}",
+    )
+    real_run = main_mod.subprocess.run
+    calls: list[list[str]] = []
+    install_attempts = 0
+
+    def fake_run(*args, **kwargs):
+        nonlocal install_attempts
+        command = list(args[0])
+        if git_interceptor is not None:
+            intercepted = git_interceptor(command, kwargs)
+            if intercepted is not None:
+                return intercepted
+        if Path(command[0]).name.startswith("npm"):
+            calls.append(command)
+            if len(command) > 1 and command[1] == "install":
+                attempt = install_attempts
+                install_attempts += 1
+                mutate(lock, attempt)
+                result_code = results[min(attempt, len(results) - 1)]
+                return types.SimpleNamespace(
+                    returncode=result_code,
+                    stdout="npm output",
+                    stderr="npm error" if result_code else "",
+                )
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(main_mod.subprocess, "run", fake_run)
+    main_mod._make_tui_argv(tui_dir, tui_dev=False)
+    return calls, install_attempts
+
+
+def test_successful_tui_install_preserves_staged_workspace_lock(
+    tmp_path: Path, main_mod, monkeypatch
+) -> None:
+    committed_lock = b'{"lockfileVersion":3,"state":"committed"}\n'
+    staged_lock = b'{"lockfileVersion":3,"state":"staged"}\n'
+    lock = _init_git_checkout(tmp_path, committed_lock)
+    lock.write_bytes(staged_lock)
+    subprocess.run(["git", "add", "package-lock.json"], cwd=tmp_path, check=True)
+
+    _run_real_git_tui_install(
+        tmp_path,
+        main_mod,
+        monkeypatch,
+        lock,
+        lambda path, _attempt: path.write_bytes(b"npm rewrite\n"),
+    )
+
+    assert lock.read_bytes() == staged_lock
+    assert _git_index_lock_bytes(tmp_path) == staged_lock
+    assert _git_lock_status(tmp_path) == "M "
+
+
+def test_successful_tui_install_preserves_staged_and_unstaged_workspace_lock(
+    tmp_path: Path, main_mod, monkeypatch
+) -> None:
+    committed_lock = b'{"lockfileVersion":3,"state":"committed"}\n'
+    staged_lock = b'{"lockfileVersion":3,"state":"staged"}\n'
+    unstaged_lock = b'{"lockfileVersion":3,"state":"unstaged"}\n'
+    lock = _init_git_checkout(tmp_path, committed_lock)
+    lock.write_bytes(staged_lock)
+    subprocess.run(["git", "add", "package-lock.json"], cwd=tmp_path, check=True)
+    lock.write_bytes(unstaged_lock)
+
+    _run_real_git_tui_install(
+        tmp_path,
+        main_mod,
+        monkeypatch,
+        lock,
+        lambda path, _attempt: path.write_bytes(b"npm rewrite\n"),
+    )
+
+    assert lock.read_bytes() == unstaged_lock
+    assert _git_index_lock_bytes(tmp_path) == staged_lock
+    assert _git_lock_status(tmp_path) == "MM"
+
+
+def test_successful_tui_install_restores_preexisting_unstaged_lock_deletion(
+    tmp_path: Path, main_mod, monkeypatch
+) -> None:
+    committed_lock = b'{"lockfileVersion":3,"state":"committed"}\n'
+    lock = _init_git_checkout(tmp_path, committed_lock)
+    lock.unlink()
+
+    _run_real_git_tui_install(
+        tmp_path,
+        main_mod,
+        monkeypatch,
+        lock,
+        lambda path, _attempt: path.write_bytes(b"npm rewrite\n"),
+    )
+
+    assert not lock.exists()
+    assert _git_index_lock_bytes(tmp_path) == committed_lock
+    assert _git_lock_status(tmp_path) == " D"
+
+
+def test_successful_tui_install_restores_preexisting_staged_lock_deletion(
+    tmp_path: Path, main_mod, monkeypatch
+) -> None:
+    committed_lock = b'{"lockfileVersion":3,"state":"committed"}\n'
+    lock = _init_git_checkout(tmp_path, committed_lock)
+    lock.unlink()
+    subprocess.run(["git", "add", "--update", "package-lock.json"], cwd=tmp_path, check=True)
+
+    _run_real_git_tui_install(
+        tmp_path,
+        main_mod,
+        monkeypatch,
+        lock,
+        lambda path, _attempt: path.write_bytes(b"npm rewrite\n"),
+    )
+
+    assert not lock.exists()
+    assert _git_index_lock_bytes(tmp_path) is None
+    assert _git_lock_status(tmp_path) == "D "
+
+
+def test_managed_lockfile_symlink_fails_closed_before_npm(
+    tmp_path: Path, main_mod, monkeypatch, capsys
+) -> None:
+    committed_lock = b'{"lockfileVersion":3,"state":"committed"}\n'
+    outside = tmp_path / "outside-lock.json"
+    outside.write_bytes(b"outside sentinel\n")
+    lock = _init_git_checkout(tmp_path, committed_lock)
+    lock.unlink()
+    lock.symlink_to(outside)
+
+    with pytest.raises(SystemExit):
+        _run_real_git_tui_install(
+            tmp_path,
+            main_mod,
+            monkeypatch,
+            lock,
+            lambda path, _attempt: path.write_bytes(b"npm must not run\n"),
+        )
+
+    captured = capsys.readouterr()
+    assert "TUI lockfile preflight failed" in captured.err
+    assert "symlink" in captured.err.lower()
+    assert outside.read_bytes() == b"outside sentinel\n"
+    assert _git_lock_status(tmp_path) in {" T", " D"}
+
+
+def test_git_lockfile_state_error_fails_closed_before_npm(
+    tmp_path: Path, main_mod, monkeypatch, capsys
+) -> None:
+    committed_lock = b'{"lockfileVersion":3,"state":"committed"}\n'
+    lock = _init_git_checkout(tmp_path, committed_lock)
+    npm_calls: list[list[str]] = []
+
+    def reject_diff(command, _kwargs):
+        if (
+            Path(command[0]).name == "git"
+            and len(command) >= 3
+            and command[1:3] == ["diff", "--quiet"]
+        ):
+            return types.SimpleNamespace(
+                returncode=2,
+                stdout="",
+                stderr="fatal: injected git state error",
+            )
+        return None
+
+    with pytest.raises(SystemExit):
+        _run_real_git_tui_install(
+            tmp_path,
+            main_mod,
+            monkeypatch,
+            lock,
+            lambda path, _attempt: (npm_calls.append(["npm"]), path.write_bytes(b"npm rewrite\n")),
+            git_interceptor=reject_diff,
+        )
+
+    captured = capsys.readouterr()
+    assert "TUI lockfile preflight failed" in captured.err
+    assert "injected git state error" in captured.err
+    assert npm_calls == []
+    assert lock.read_bytes() == committed_lock
+
+
+def test_lockfile_restore_error_fails_closed_after_successful_npm(
+    tmp_path: Path, main_mod, monkeypatch, capsys
+) -> None:
+    committed_lock = b'{"lockfileVersion":3,"state":"committed"}\n'
+    lock = _init_git_checkout(tmp_path, committed_lock)
+
+    def fail_restore(*_args, **_kwargs):
+        raise OSError("injected restore error")
+
+    monkeypatch.setattr(main_mod, "_restore_tui_lockfile", fail_restore)
+    with pytest.raises(SystemExit):
+        _run_real_git_tui_install(
+            tmp_path,
+            main_mod,
+            monkeypatch,
+            lock,
+            lambda path, _attempt: path.write_bytes(b"npm rewrite\n"),
+        )
+
+    captured = capsys.readouterr()
+    assert "TUI lockfile restore failed" in captured.err
+    assert "injected restore error" in captured.err
+    assert lock.read_bytes() == b"npm rewrite\n"
+
+
+def test_failed_tui_install_does_not_restore_lockfile(
+    tmp_path: Path, main_mod, monkeypatch
+) -> None:
+    committed_lock = b'{"lockfileVersion":3,"state":"committed"}\n'
+    failed_install_lock = b'{"lockfileVersion":3,"state":"failed-install"}\n'
+    lock = _init_git_checkout(tmp_path, committed_lock)
+
+    with pytest.raises(SystemExit):
+        _run_real_git_tui_install(
+            tmp_path,
+            main_mod,
+            monkeypatch,
+            lock,
+            lambda path, _attempt: path.write_bytes(failed_install_lock),
+            results=(1,),
+        )
+
+    assert lock.read_bytes() == failed_install_lock
+
+
+def test_successful_retry_restores_lockfile_once_after_engine_repair(
+    tmp_path: Path, main_mod, monkeypatch
+) -> None:
+    committed_lock = b'{"lockfileVersion":3,"state":"committed"}\n'
+    lock = _init_git_checkout(tmp_path, committed_lock)
+    repaired_npm = "/bin/npm-repaired"
+
+    import hermes_cli.npm_engine as npm_engine
+
+    repair_calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        npm_engine,
+        "maybe_repair_npm_engine",
+        lambda npm, output: (repair_calls.append((npm, output)) or repaired_npm),
+    )
+    calls, install_attempts = _run_real_git_tui_install(
+        tmp_path,
+        main_mod,
+        monkeypatch,
+        lock,
+        lambda path, attempt: path.write_bytes(f"npm attempt {attempt}\n".encode()),
+        results=(1, 0),
+    )
+
+    assert install_attempts == 2
+    assert sum(1 for command in calls if len(command) > 1 and command[1] == "install") == 2
+    assert repair_calls and repair_calls[0][0].endswith("npm")
+    assert lock.read_bytes() == committed_lock
 
 
 def test_make_tui_argv_uses_bundled_tui_when_workspace_missing(
@@ -461,6 +769,7 @@ def test_make_tui_argv_scopes_npm_install_on_termux_workspace(
     monkeypatch.setattr(main_mod, "_tui_need_npm_install", lambda _root: True)
     monkeypatch.setattr(main_mod, "_tui_need_rebuild", lambda _root: True)
     monkeypatch.setattr(main_mod.shutil, "which", lambda name: f"/bin/{name}")
+    monkeypatch.setattr(main_mod, "_tui_lockfile_state", lambda *_args, **_kwargs: None)
     calls = []
 
     def fake_run(*args, **kwargs):
@@ -498,6 +807,7 @@ def test_make_tui_argv_keeps_desktop_workspace_install_behaviour(
     monkeypatch.setenv("PREFIX", "/usr")
     monkeypatch.setattr(main_mod, "_tui_need_npm_install", lambda _root: True)
     monkeypatch.setattr(main_mod.shutil, "which", lambda name: f"/bin/{name}")
+    monkeypatch.setattr(main_mod, "_tui_lockfile_state", lambda *_args, **_kwargs: None)
     calls = []
 
     def fake_run(*args, **kwargs):
@@ -542,6 +852,7 @@ def test_make_tui_argv_npm_install_forces_include_dev(
     monkeypatch.setenv("NODE_ENV", "production")
     monkeypatch.setattr(main_mod, "_tui_need_npm_install", lambda _root: True)
     monkeypatch.setattr(main_mod.shutil, "which", lambda name: f"/bin/{name}")
+    monkeypatch.setattr(main_mod, "_tui_lockfile_state", lambda *_args, **_kwargs: None)
     calls = []
 
     def fake_run(*args, **kwargs):
@@ -845,6 +1156,7 @@ def test_make_tui_argv_omits_workspace_and_scrubs_esbuild_override(
     monkeypatch.setenv("ESBUILD_BINARY_PATH", "/opt/esbuild-0.28.2")
     monkeypatch.setattr(main_mod, "_tui_need_npm_install", lambda _root: True)
     monkeypatch.setattr(main_mod.shutil, "which", lambda name: f"/bin/{name}")
+    monkeypatch.setattr(main_mod, "_tui_lockfile_state", lambda *_args, **_kwargs: None)
     calls = []
 
     def fake_run(*args, **kwargs):
