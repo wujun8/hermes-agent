@@ -2880,7 +2880,11 @@ def _restore_tui_lockfile(lock: Path, state: _TuiLockfileState) -> None:
     if state.worktree_bytes is None:
         _tui_remove_lockfile(lock)
     else:
-        _tui_replace_lockfile(lock, state.worktree_bytes, state.worktree_mode or 0o644)
+        _tui_replace_lockfile(
+            lock,
+            state.worktree_bytes,
+            state.worktree_mode if state.worktree_mode is not None else 0o644,
+        )
 
     snapshot = _tui_worktree_lock_snapshot(lock)
     if state.worktree_bytes is None:

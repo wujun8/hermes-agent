@@ -393,6 +393,29 @@ def test_lockfile_restore_error_fails_closed_after_successful_npm(
     assert lock.read_bytes() == b"npm rewrite\n"
 
 
+def test_restore_tui_lockfile_preserves_zero_mode(
+    tmp_path: Path, main_mod, monkeypatch
+) -> None:
+    lock = tmp_path / "package-lock.json"
+    restored = b"restored\n"
+    index_entry = b"index entry"
+    state = main_mod._TuiLockfileState(
+        "git", tmp_path, "package-lock.json", index_entry, restored, 0
+    )
+    monkeypatch.setattr(
+        main_mod, "_tui_worktree_lock_snapshot", lambda _lock: (restored, 0)
+    )
+    monkeypatch.setattr(
+        main_mod,
+        "_tui_git_index_entry",
+        lambda _git, _root, _relative_path: index_entry,
+    )
+
+    main_mod._restore_tui_lockfile(lock, state)
+
+    assert (lock.stat().st_mode & 0o777) == 0
+
+
 def test_failed_tui_install_does_not_restore_lockfile(
     tmp_path: Path, main_mod, monkeypatch
 ) -> None:
