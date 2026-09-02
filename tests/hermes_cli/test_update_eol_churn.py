@@ -145,6 +145,10 @@ def _patch_ordinary_update_runtime(monkeypatch, repo: Path) -> None:
     monkeypatch.setattr(hermes_main, "_clear_update_incomplete_marker", lambda: None)
     monkeypatch.setattr(hermes_main, "_clear_lazy_refresh_incomplete_marker", lambda: None)
     monkeypatch.setattr(hermes_main, "_kill_stale_dashboard_processes", lambda **_kwargs: None)
+    # The live updater purges cached Hermes modules before restarting the
+    # gateway.  Disable that production-only reload boundary here so the
+    # hermetic gateway/uv doubles below cannot be replaced by real host code.
+    monkeypatch.setattr(hermes_main, "_purge_stale_hermes_modules", lambda: None)
 
     monkeypatch.setattr("hermes_cli.managed_uv.ensure_uv", lambda **_kwargs: None)
     monkeypatch.setattr("hermes_cli.managed_uv.update_managed_uv", lambda **_kwargs: None)
@@ -162,6 +166,33 @@ def _patch_ordinary_update_runtime(monkeypatch, repo: Path) -> None:
     monkeypatch.setattr(update_cmd, "_write_lazy_refresh_incomplete_marker", lambda: None)
     monkeypatch.setattr(
         update_cmd, "_finish_dashboard_update_cleanup", lambda *_args, **_kwargs: None
+    )
+
+    # Keep the EOL/stash tests hermetic: the update's fleet plan, restart phase,
+    # and post-restart version probe must never inspect or touch live services.
+    monkeypatch.setattr(
+        "hermes_cli.update_inventory.collect_runtime_inventory",
+        lambda: SimpleNamespace(runtimes=[], to_dict=lambda: {}),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.update_inventory.record_plan_in_receipt",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr("hermes_cli.gateway.is_macos", lambda: False)
+    monkeypatch.setattr("hermes_cli.gateway.supports_systemd_services", lambda: False)
+    monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", lambda **_kwargs: [])
+    monkeypatch.setattr(
+        "hermes_cli.gateway.find_profile_gateway_processes",
+        lambda **_kwargs: [],
+    )
+    monkeypatch.setattr("hermes_cli.gateway._get_service_pids", lambda **_kwargs: set())
+    monkeypatch.setattr(
+        "hermes_cli.update_receipt.collect_fleet_versions",
+        lambda **_kwargs: [],
+    )
+    monkeypatch.setattr(
+        "hermes_cli.update_receipt.print_fleet_version_matrix",
+        lambda *_args, **_kwargs: False,
     )
 
     monkeypatch.setattr("hermes_cli.config.load_config", lambda: {})

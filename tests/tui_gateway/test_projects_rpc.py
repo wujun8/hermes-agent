@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import os
 import subprocess
+import threading
 from pathlib import Path
 
 import pytest
@@ -496,6 +497,66 @@ def test_desktop_launch_cwd_is_not_persisted_as_a_workspace():
     ) == "/picked/repo"
 
 
+def test_desktop_launch_cwd_is_marked_as_context_artifact():
+    assert server._context_cwd_is_launch_artifact(
+        {"source": "desktop", "cwd": "/opt/hermes"}
+    ) is True
+
+
+def test_explicit_desktop_and_terminal_cwds_are_context_workspaces():
+    assert server._context_cwd_is_launch_artifact(
+        {"source": "desktop", "cwd": "/picked/repo", "explicit_cwd": True}
+    ) is False
+    assert server._context_cwd_is_launch_artifact(
+        {"source": "tui", "cwd": "/opt/hermes"}
+    ) is False
+
+
+@pytest.mark.parametrize(
+    ("explicit_cwd", "launch_artifact"),
+    [(True, False), (False, True)],
+)
+def test_desktop_agent_rebuild_preserves_workspace_provenance(
+    monkeypatch, explicit_cwd, launch_artifact
+):
+    captured = {}
+    session = {
+        "agent": object(),
+        "attached_images": [],
+        "cwd": "/picked/repo" if explicit_cwd else "/opt/hermes",
+        "edit_snapshots": {},
+        "explicit_cwd": explicit_cwd,
+        "history": ["old"],
+        "history_lock": threading.Lock(),
+        "history_version": 0,
+        "image_counter": 0,
+        "running": False,
+        "session_key": "stored-session",
+        "show_reasoning": False,
+        "source": "desktop",
+        "tool_progress_mode": "off",
+        "tool_started_at": {},
+    }
+
+    def _make_agent(*_args, **kwargs):
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(server, "_set_session_context", lambda _key: [])
+    monkeypatch.setattr(server, "_clear_session_context", lambda _tokens: None)
+    monkeypatch.setattr(server, "_make_agent", _make_agent)
+    monkeypatch.setattr(server, "_config_model_target", lambda: None)
+    monkeypatch.setattr(server, "_load_show_reasoning", lambda: False)
+    monkeypatch.setattr(server, "_load_tool_progress_mode", lambda: "off")
+    monkeypatch.setattr(server, "_session_info", lambda *_args: {})
+    monkeypatch.setattr(server, "_emit", lambda *_args: None)
+    monkeypatch.setattr(server, "_restart_slash_worker", lambda *_args: None)
+
+    server._reset_session_agent("live-session", session)
+
+    assert captured["context_cwd_is_launch_artifact"] is launch_artifact
+
+
 def test_home_container_dirs_are_never_a_workspace(tmp_path):
     """`/home` and `/Users` hold homes; they are not workspaces themselves.
 
@@ -603,14 +664,28 @@ def _profile_dir(tmp_path: Path, name: str) -> Path:
 
 
 def _bind_profiles(monkeypatch, tmp_path: Path, homes: dict[str, Path]) -> None:
-    """Resolve profile names to this test's throwaway homes.
+    """Bind strict profile resolution to canonical, served test homes."""
+    from hermes_cli import profiles as profiles_mod
 
-    Unmapped names resolve to a path that does not exist, which is how the
-    gateway detects "not a real profile on this host" and stays on launch.
-    """
+    default_home = homes["default"]
+    profiles_root = tmp_path / "homes"
+    served = [("default", default_home), ("coder", homes["coder"])]
+
+    monkeypatch.setattr(server, "_hermes_home", default_home)
+    monkeypatch.setattr(server, "_current_profile_name", lambda: "default")
     monkeypatch.setattr(
-        "hermes_cli.profiles.get_profile_dir",
-        lambda name: homes.get(name, tmp_path / "homes" / "missing" / name),
+        profiles_mod, "_get_default_hermes_home", lambda: default_home
+    )
+    monkeypatch.setattr(profiles_mod, "_get_profiles_root", lambda: profiles_root)
+    monkeypatch.setattr(
+        profiles_mod,
+        "profiles_to_serve",
+        lambda multiplex, profile_allowlist=None: served,
+    )
+    monkeypatch.setattr(
+        profiles_mod,
+        "get_profile_dir",
+        lambda name: homes.get(name, profiles_root / "missing" / name),
     )
 
 
@@ -795,7 +870,7 @@ def test_record_repos_writes_to_the_requested_profiles_projects_db(monkeypatch, 
 
 
 def test_projects_without_a_profile_stay_on_the_launch_home(monkeypatch, tmp_path):
-    """Omitted/blank/unknown profile is a no-op — the pre-scoping behavior."""
+    """Omitted/blank profiles stay on launch; unavailable names fail closed."""
     launch_home = _profile_dir(tmp_path, "launch")
     coder_home = _profile_dir(tmp_path, "coder")
     repo = tmp_path / "repos" / "launch-only"
@@ -810,11 +885,16 @@ def test_projects_without_a_profile_stay_on_the_launch_home(monkeypatch, tmp_pat
 
         omitted = _call("projects.list")
         blank = _call("projects.list", {"profile": ""})
-        unknown = _call("projects.list", {"profile": "not-a-profile"})
+        unknown = server._methods["projects.list"](
+            1, {"profile": "not-a-profile"}
+        )
 
     assert [p["name"] for p in omitted["projects"]] == ["Launch only"]
     assert blank == omitted
-    assert unknown == omitted
+    assert unknown["error"] == {
+        "code": 4026,
+        "message": "invalid or unavailable profile",
+    }
     assert omitted["active_id"] == created["id"]
 
     assert _cached_repo_labels(launch_home) == ["only"]

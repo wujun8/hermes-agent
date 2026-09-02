@@ -237,6 +237,212 @@ def test_explicit_interrupt_does_not_schedule_runtime_continuation(
     assert read_turn_marker(marker_home, "session-key") is None
 
 
+def test_hosted_terminal_receipt_commits_before_marker_retire(
+    emits, turn_env, marker_home
+):
+    observed = []
+
+    def _run(message, **kwargs):
+        return {"final_response": "done"}
+
+    def _terminal(receipt):
+        observed.append((receipt, read_turn_marker(marker_home, "session-key")))
+
+    agent = types.SimpleNamespace(
+        session_id="session-key", run_conversation=_run, clear_interrupt=lambda: None
+    )
+    session = _session(agent=agent, running=True, source="bot_room")
+
+    server._run_prompt_submit(
+        "rid",
+        "sid",
+        session,
+        "do the thing",
+        terminal_callback=_terminal,
+    )
+
+    assert observed[0][0]["status"] == "settled"
+    assert observed[0][1] is not None
+    assert read_turn_marker(marker_home, "session-key") is None
+
+
+def test_hosted_terminal_receipt_failure_keeps_crash_marker(
+    emits, turn_env, marker_home
+):
+    def _run(message, **kwargs):
+        return {"final_response": "done"}
+
+    def _terminal(_receipt):
+        raise RuntimeError("state store unavailable")
+
+    agent = types.SimpleNamespace(
+        session_id="session-key", run_conversation=_run, clear_interrupt=lambda: None
+    )
+    session = _session(agent=agent, running=True, source="bot_room")
+
+    server._run_prompt_submit(
+        "rid",
+        "sid",
+        session,
+        "do the thing",
+        terminal_callback=_terminal,
+    )
+
+    assert read_turn_marker(marker_home, "session-key") is not None
+
+
+def test_api_recovery_hosted_receipt_preserves_both_owners_and_schedules(
+    emits, turn_env, marker_home, monkeypatch
+):
+    scheduled: list[tuple[str, str]] = []
+    receipts: list[tuple[dict, dict | None]] = []
+    hosted_task = {
+        "room_id": "room",
+        "task_id": "task",
+        "thread_id": "thread",
+        "turn_id": "turn",
+        "execution_generation": 1,
+    }
+
+    def _run(message, **kwargs):
+        return {
+            "final_response": "Operation interrupted while waiting for API outage recovery.",
+            "interrupted": True,
+            "completed": False,
+            "resume_reason": "api_outage_recovery",
+        }
+
+    def _terminal(receipt):
+        receipts.append((dict(receipt), read_turn_marker(marker_home, "session-key")))
+
+    monkeypatch.setattr(
+        server,
+        "_maybe_schedule_auto_continue",
+        lambda sid, session, key: scheduled.append((sid, key)) or {"attempt": 1},
+    )
+    agent = types.SimpleNamespace(
+        session_id="session-key", run_conversation=_run, clear_interrupt=lambda: None
+    )
+    session = _session(
+        agent=agent,
+        running=True,
+        source="bot_room",
+        _hosted_room_task=dict(hosted_task),
+    )
+
+    server._run_prompt_submit(
+        "rid",
+        "sid",
+        session,
+        "do the thing",
+        terminal_callback=_terminal,
+    )
+
+    assert len(receipts) == 1
+    receipt, marker_at_callback = receipts[0]
+    assert receipt["status"] == "cancelled"
+    assert marker_at_callback is not None
+    assert marker_at_callback["resume_reason"] == "api_outage_recovery"
+    assert read_turn_marker(marker_home, "session-key") is not None
+    assert session["_hosted_room_task"] == hosted_task
+    assert scheduled == [("sid", "session-key")]
+
+
+def test_hosted_terminal_receipt_failure_preserves_marker_and_task(
+    emits, turn_env, marker_home
+):
+    hosted_task = {
+        "room_id": "room",
+        "task_id": "task",
+        "thread_id": "thread",
+        "turn_id": "turn",
+        "execution_generation": 1,
+    }
+    attempted: list[dict] = []
+
+    def _run(message, **kwargs):
+        return {"final_response": "done"}
+
+    def _terminal(receipt):
+        attempted.append(dict(receipt))
+        raise RuntimeError("state store unavailable")
+
+    agent = types.SimpleNamespace(
+        session_id="session-key", run_conversation=_run, clear_interrupt=lambda: None
+    )
+    session = _session(
+        agent=agent,
+        running=True,
+        source="bot_room",
+        _hosted_room_task=dict(hosted_task),
+    )
+
+    server._run_prompt_submit(
+        "rid",
+        "sid",
+        session,
+        "do the thing",
+        terminal_callback=_terminal,
+    )
+
+    assert len(attempted) == 1
+    assert read_turn_marker(marker_home, "session-key") is not None
+    assert session["_hosted_room_task"] == hosted_task
+
+
+def test_stale_hosted_callback_cannot_clear_newer_task(
+    emits, turn_env, marker_home
+):
+    old_task = {
+        "room_id": "room",
+        "task_id": "old-task",
+        "thread_id": "thread",
+        "turn_id": "old-turn",
+        "execution_generation": 1,
+    }
+    new_task = {
+        "room_id": "room",
+        "task_id": "new-task",
+        "thread_id": "thread",
+        "turn_id": "new-turn",
+        "execution_generation": 2,
+    }
+    callback_calls: list[dict] = []
+    session: dict
+
+    def _run(message, **kwargs):
+        with session["history_lock"]:
+            session["_turn_generation"] += 1
+            session["_hosted_room_task"] = dict(new_task)
+        return {"final_response": "old task finished"}
+
+    def _terminal(receipt):
+        callback_calls.append(dict(receipt))
+
+    agent = types.SimpleNamespace(
+        session_id="session-key", run_conversation=_run, clear_interrupt=lambda: None
+    )
+    session = _session(
+        agent=agent,
+        running=True,
+        source="bot_room",
+        _hosted_room_task=dict(old_task),
+    )
+
+    server._run_prompt_submit(
+        "rid",
+        "sid",
+        session,
+        "old task",
+        terminal_callback=_terminal,
+    )
+
+    assert callback_calls == []
+    assert session["_turn_generation"] == 2
+    assert session["_hosted_room_task"] == new_task
+    assert read_turn_marker(marker_home, "session-key") is not None
+
+
 def test_continuation_turn_records_attempt_and_original_prompt(
     emits, turn_env, marker_home
 ):
@@ -346,6 +552,20 @@ def test_api_recovery_marker_uses_continue_note(emits, schedule_env, marker_home
     assert text == server._api_outage_recovery_note()
     assert "CONTINUE the interrupted task" in text
     assert kwargs["display_kind"] == "auto_continue"
+
+
+def test_hosted_room_marker_is_left_to_the_driver(schedule_env, marker_home):
+    record_turn_start(marker_home, "session-key", "hosted prompt")
+
+    result = server._maybe_schedule_auto_continue(
+        "sid",
+        _session(source="bot_room"),
+        "session-key",
+    )
+
+    assert result is None
+    assert not schedule_env
+    assert read_turn_marker(marker_home, "session-key") is not None
 
 
 def test_stale_marker_is_cleared_not_continued(schedule_env, marker_home, monkeypatch):
