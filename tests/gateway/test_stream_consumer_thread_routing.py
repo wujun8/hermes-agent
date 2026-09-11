@@ -156,7 +156,7 @@ class TestFeishuFallbackThreadRouting:
         assert body.reply_in_thread is True
 
     @pytest.mark.asyncio
-    async def test_missing_thread_message_creates_in_chat(self):
+    async def test_missing_thread_message_creates_in_thread(self):
         adapter = self._make_adapter()
         adapter._fetch_last_message_in_thread = AsyncMock(return_value=None)
 
@@ -165,9 +165,9 @@ class TestFeishuFallbackThreadRouting:
         adapter._client.im.v1.message.reply.assert_not_called()
         adapter._client.im.v1.message.create.assert_called_once()
         request = adapter._client.im.v1.message.create.call_args.args[0]
-        assert request.receive_id_type == "chat_id"
+        assert request.receive_id_type == "thread_id"
         body = getattr(request, "body", None) or request.request_body
-        assert body.receive_id == "oc_main_chat"
+        assert body.receive_id == "omt_topic_abc"
 
     @pytest.mark.asyncio
     async def test_explicit_reply_anchor_still_replies(self):
@@ -187,4 +187,3 @@ class TestFeishuFallbackThreadRouting:
         assert request.message_id == "om_explicit_message"
         body = getattr(request, "body", None) or request.request_body
         assert body.reply_in_thread is True
-

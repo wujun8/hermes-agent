@@ -33,7 +33,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from gateway.config import GatewayConfig, HomeChannel, Platform
-from gateway.platforms.base import MessageEvent, MessageType, SendResult
+from gateway.platforms.base import SendResult
+from gateway.platforms.event import MessageEvent, MessageType
 from gateway.run import (
     _AGENT_PENDING_SENTINEL,
     _auto_continue_freshness_window,
@@ -769,6 +770,60 @@ async def test_api_outage_recovery_resume_is_scoped_and_skips_restart_guard():
     guard.assert_not_called()
     adapter.handle_message.assert_awaited_once()
     assert adapter.handle_message.await_args.args[0].internal is True
+
+
+@pytest.mark.asyncio
+async def test_api_outage_recovery_marks_then_schedules_after_turn_release():
+    """The runtime continuation must not race the slot and lease owned by its interrupted turn."""
+    from gateway.run import GatewayRunner
+
+    source = make_restart_source(chat_id="api-recovery-order")
+    event = MessageEvent(text="continue", message_type=MessageType.TEXT, source=source)
+    session_key = "agent:main:telegram:dm:api-recovery-order"
+    result = {"interrupted": True, "resume_reason": "api_outage_recovery"}
+    order: list[str] = []
+
+    runner = MagicMock()
+    runner._external_drain_active = False
+    runner._hm_admit_event = AsyncMock(return_value=(event, source, False))
+    runner._hm_estop_gate.return_value = None
+    runner._session_key_for_source.return_value = session_key
+    runner._hm_pending_reply_intercepts = AsyncMock(return_value=None)
+    runner._is_session_running.return_value = False
+    runner._hm_dispatch_idle_commands = AsyncMock(return_value=(False, None))
+    runner._is_telegram_topic_root_lobby.return_value = False
+    runner._claim_active_session_slot.return_value = (None, None)
+    runner._hm_rescue_orphaned_fifo.return_value = (event, source, False)
+    runner._begin_session_run_generation.return_value = 7
+    runner._handle_message_with_agent = AsyncMock(return_value=result)
+    runner._run_post_turn_hooks = AsyncMock()
+    runner._clear_durable_active_turn = AsyncMock()
+    runner.async_session_store.mark_resume_pending = AsyncMock(
+        side_effect=lambda *_args: order.append("mark")
+    )
+    runner._release_running_agent_state.side_effect = lambda *_args: order.append("slot")
+    runner._release_turn_lease.side_effect = lambda *_args: order.append("lease")
+    runner._schedule_resume_pending_sessions.side_effect = (
+        lambda **_kwargs: order.append("schedule")
+    )
+
+    returned = await GatewayRunner._handle_message(runner, event)
+
+    assert returned is result
+    runner.async_session_store.mark_resume_pending.assert_awaited_once_with(
+        session_key, "api_outage_recovery"
+    )
+    runner._run_post_turn_hooks.assert_not_awaited()
+    assert order == ["mark", "slot", "lease"]
+
+    await asyncio.sleep(0)
+
+    assert order == ["mark", "slot", "lease", "schedule"]
+    runner._schedule_resume_pending_sessions.assert_called_once_with(
+        platform=Platform.TELEGRAM,
+        session_key=session_key,
+        record_restart_guard=False,
+    )
 
 
 @pytest.mark.asyncio

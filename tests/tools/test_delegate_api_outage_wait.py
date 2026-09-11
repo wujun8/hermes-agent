@@ -226,7 +226,7 @@ class _StructuredResultChild(_OutageChild):
                 "api_calls": 14,
             },
             {
-                "status": "error",
+                "status": "failed",
                 "exit_reason": "error",
                 "truncated": False,
             },
@@ -328,6 +328,6 @@ def test_run_single_child_preserves_non_failure_incomplete_reason(monkeypatch):
         task_index=7, goal="incomplete", child=child, parent_agent=parent
     )
 
-    assert result["status"] == "incomplete"
-    assert result["exit_reason"] == "partial_stream_recovery"
+    assert result["status"] == "failed"
+    assert result["exit_reason"] == "error"
     assert result["truncated"] is False

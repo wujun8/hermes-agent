@@ -586,6 +586,45 @@ def test_prompt_control_race_releases_only_new_active_session_lease(gateway, mon
     assert "result" in micro_result["response"]
 
 
+def test_prompt_claim_releases_lease_when_session_is_closed_while_claiming(gateway, monkeypatch):
+    server, db, _home = gateway
+    agent = LiveAgent(db, "prompt-close-claim-race")
+    sid = "sid-prompt-close-claim-race"
+    session = _session(server, db, sid, "prompt-close-claim-race", agent)
+    lease = RecordingLease("prompt-close-claim-race")
+    claim_entered = threading.Event()
+    claim_release = threading.Event()
+    claim_result: dict = {}
+
+    def blocked_claim(*_args, **_kwargs):
+        claim_entered.set()
+        assert claim_release.wait(5), "active-session claim was not released"
+        return lease, None
+
+    monkeypatch.setattr(server, "_claim_active_session_slot", blocked_claim)
+
+    def run_claim() -> None:
+        claim_result["value"] = server._claim_active_session_slot_for_prompt(sid, session)
+
+    claim_thread = threading.Thread(target=run_claim)
+    claim_thread.start()
+    assert claim_entered.wait(2), "prompt did not reach active-session claim"
+
+    popped = server._pop_session_by_id(sid)
+    assert popped is session
+    assert server._teardown_popped_session(popped) is True
+
+    claim_release.set()
+    claim_thread.join(timeout=5)
+    assert not claim_thread.is_alive()
+    assert claim_result["value"] == (None, None)
+    assert sid not in server._sessions
+    assert session.get("_closing") is True
+    assert session.get("_finalized") is True
+    assert session.get("active_session_lease") is None
+    assert lease.release_calls == 1
+
+
 def test_prompt_control_race_preserves_preexisting_active_session_lease(gateway, monkeypatch):
     server, db, _home = gateway
     agent = LiveAgent(db, "prompt-control-preexisting")

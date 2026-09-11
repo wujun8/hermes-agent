@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shlex
 import signal
 import subprocess
@@ -12,6 +13,35 @@ from typing import Any, Callable, Mapping
 
 
 _TRUE_VALUES = frozenset({"true", "1", "yes", "on"})
+API_OUTAGE_RECOVERY_RESUME_REASON = "api_outage_recovery"
+
+_STALE_CIRCUIT_BREAKER_ERROR_RE = re.compile(
+    r"^Provider has been unresponsive \(no response received\) for "
+    r"\d+ consecutive stale attempts — aborting this call to avoid an indefinite stall\. "
+    r"Switch models or start a new session, then retry\.$"
+)
+
+
+def should_auto_resume_api_outage_result(result: Any) -> bool:
+    """Return whether an interrupted recovery wait was system-owned.
+
+    A populated ``interrupt_message`` means a user command, new message, or another
+    explicit control action ended the turn. Those interruptions retain their normal
+    stop/redirect semantics instead of being replayed.
+    """
+    return bool(
+        isinstance(result, dict)
+        and result.get("interrupted")
+        and result.get("resume_reason") == API_OUTAGE_RECOVERY_RESUME_REASON
+        and not result.get("interrupt_message")
+    )
+
+
+def is_stale_circuit_breaker_error(error: Any) -> bool:
+    """Identify only the RuntimeError emitted by the stale-call breaker."""
+    return isinstance(error, RuntimeError) and bool(
+        _STALE_CIRCUIT_BREAKER_ERROR_RE.fullmatch(str(error))
+    )
 
 
 @dataclass(frozen=True)
@@ -70,7 +100,7 @@ class ApiOutageRecoveryWaiter:
             return
         try:
             if os.name == "posix":
-                os.killpg(process.pid, signal.SIGTERM)
+                os.killpg(process.pid, signal.SIGTERM)  # windows-footgun: ok
             else:
                 process.terminate()
             process.wait(timeout=1.0)
@@ -79,7 +109,7 @@ class ApiOutageRecoveryWaiter:
             pass
         try:
             if os.name == "posix":
-                os.killpg(process.pid, signal.SIGKILL)
+                os.killpg(process.pid, signal.SIGKILL)  # windows-footgun: ok
             else:
                 process.kill()
         except OSError:
@@ -202,3 +232,48 @@ class ApiOutageRecoveryWaiter:
                 # Cleanup observability is best-effort and must not replace the
                 # wait result or an exception from a status callback.
                 pass
+
+
+def park_for_api_outage_recovery(
+    agent: Any,
+    messages: list[dict[str, Any]],
+    conversation_history: Any,
+) -> dict[str, Any] | None:
+    """Park the active API boundary, returning only when explicitly interrupted.
+
+    ``None`` means the external probe recovered and the caller should retry the same
+    request boundary without replaying transcript messages.
+    """
+    config = getattr(agent, "_api_outage_recovery_config", None)
+    if not config or not config.enabled:
+        return None
+    waiter = getattr(agent, "_api_outage_recovery_waiter", None)
+    if not isinstance(waiter, ApiOutageRecoveryWaiter) and not hasattr(waiter, "wait"):
+        waiter = ApiOutageRecoveryWaiter(config)
+        agent._api_outage_recovery_waiter = waiter
+    endpoint_key = "|".join(
+        str(value or "")
+        for value in (agent.provider, agent.model, agent.base_url, agent.api_mode)
+    )
+    outcome = waiter.wait(agent, endpoint_key, agent._emit_status, agent._emit_status)
+    if outcome == "recovered":
+        return None
+
+    from agent.message_sanitization import close_interrupted_tool_sequence
+
+    interrupt_text = "Operation interrupted while waiting for API outage recovery."
+    interrupt_message = getattr(agent, "_interrupt_message", None)
+    close_interrupted_tool_sequence(messages, interrupt_text)
+    agent._persist_session(messages, conversation_history)
+    agent.clear_interrupt()
+    result = {
+        "final_response": interrupt_text,
+        "messages": messages,
+        "api_calls": agent._api_call_count,
+        "completed": False,
+        "interrupted": True,
+        "resume_reason": API_OUTAGE_RECOVERY_RESUME_REASON,
+    }
+    if interrupt_message:
+        result["interrupt_message"] = interrupt_message
+    return result

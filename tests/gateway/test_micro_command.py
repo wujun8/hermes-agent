@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -11,7 +12,7 @@ import pytest
 from gateway.config import GatewayConfig, Platform
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.run import GatewayRunner
-from gateway.session import AsyncSessionStore, SessionSource, SessionStore
+from gateway.session import AsyncSessionStore, SessionEntry, SessionSource, SessionStore
 from hermes_cli.commands import resolve_command
 from hermes_state import SessionDB
 
@@ -22,15 +23,46 @@ class _Store:
         self.calls: list[SessionSource] = []
         self.peek_calls: list[str] = []
         self.session_key_entries: dict[str, str] = {}
+        self.active_turns: dict[str, str] = {}
         self._store = None
 
-    async def get_or_create_session(self, source):
+    async def get_or_create_session(self, source, *, touch_activity=True):
         self.calls.append(source)
-        return SimpleNamespace(session_id=self.entries[self._key(source)])
+        session_id = self.entries[self._key(source)]
+        session_key = next(
+            key for key, value in self.session_key_entries.items() if value == session_id
+        )
+        created_at = datetime.now(timezone.utc)
+        return SessionEntry(
+            session_key=session_key,
+            session_id=session_id,
+            created_at=created_at,
+            updated_at=created_at + timedelta(microseconds=1),
+            origin=source,
+            platform=source.platform,
+            chat_type=source.chat_type,
+        )
 
     async def peek_session_id(self, session_key):
         self.peek_calls.append(session_key)
         return self.session_key_entries.get(session_key)
+
+    async def load_transcript(self, session_id):
+        return []
+
+    async def has_any_sessions(self):
+        return False
+
+    async def mark_turn_active(self, session_key):
+        token = f"turn:{session_key}"
+        self.active_turns[session_key] = token
+        return token
+
+    async def clear_turn_active(self, session_key, token):
+        if self.active_turns.get(session_key) != token:
+            return False
+        del self.active_turns[session_key]
+        return True
 
     @staticmethod
     def _key(source: SessionSource) -> tuple:
@@ -113,7 +145,7 @@ def _runner(
     runner._agent_cache = _CountingCache()
     runner._agent_cache_lock = threading.RLock()
     route_keys = route_keys or {}
-    runner.config = SimpleNamespace(multiplex_profiles=False)
+    runner.config = GatewayConfig(multiplex_profiles=False)
     runner._async_session_store.session_key_entries = {
         route_keys.get(key[2], f"route:{key[2]}"): session_id
         for key, session_id in entries.items()
@@ -367,7 +399,10 @@ async def test_gateway_normal_typed_dispatch_reaches_micro_handler(db):
     runner._peek_session_state = lambda _key: None
     runner._is_session_running = lambda _key: False
     runner._check_slash_access = lambda *_args: None
-    runner.hooks = SimpleNamespace(emit_collect=AsyncMock(return_value=[]))
+    runner.hooks = SimpleNamespace(
+        emit=AsyncMock(return_value=None),
+        emit_collect=AsyncMock(return_value=[]),
+    )
 
     result = await runner._handle_message(_event(source, "on"))
 

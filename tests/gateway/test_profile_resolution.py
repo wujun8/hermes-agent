@@ -14,7 +14,8 @@ from gateway.run import (
 )
 from gateway.profile_routing import ProfileRoute, ProfileRouteRejected
 from gateway.config import GatewayConfig, Platform
-from gateway.platforms.base import BasePlatformAdapter, MessageEvent
+from gateway.platforms.base import BasePlatformAdapter
+from gateway.platforms.event import MessageEvent
 
 
 @pytest.fixture
@@ -26,6 +27,8 @@ def mock_runner():
     runner._profile_name_for_source = GatewayRunner._profile_name_for_source.__get__(runner)
     runner._served_profile_names_for_source = GatewayRunner._served_profile_names_for_source.__get__(runner)
     runner._resolve_profile_home_for_source = GatewayRunner._resolve_profile_home_for_source.__get__(runner)
+    # _handle_message's ingress gates (profile route rejection) live in this helper.
+    runner._hm_admit_event = GatewayRunner._hm_admit_event.__get__(runner)
     return runner
 
 
@@ -240,6 +243,69 @@ class TestGatewayRunnerInjection:
         assert hasattr(BasePlatformAdapter, "gateway_runner")
         assert BasePlatformAdapter.gateway_runner is None
 
+    def test_factory_binds_every_adapter_to_runner(self, monkeypatch):
+        """``_create_adapter`` binds the runner regardless of which branch
+        built the adapter (plugin registry OR built-in if/elif) — every
+        lifecycle path (startup, reconnect, secondary profiles) goes through
+        it, so this is the single seam that makes profile_routes reachable
+        for built-ins like Signal (#68332 / #70831)."""
+        from gateway.config import PlatformConfig
+
+        runner = object.__new__(GatewayRunner)
+        adapter = MagicMock(spec=BasePlatformAdapter)
+        monkeypatch.setattr(runner, "_instantiate_adapter", lambda platform, config: adapter)
+        assert runner._create_adapter(Platform.SIGNAL, PlatformConfig(enabled=True)) is adapter
+        assert adapter.gateway_runner is runner
+        monkeypatch.setattr(runner, "_instantiate_adapter", lambda platform, config: None)
+        assert runner._create_adapter(Platform.SIGNAL, PlatformConfig(enabled=True)) is None
+
+    @pytest.mark.asyncio
+    async def test_real_signal_factory_routes_inbound_group_event(self, monkeypatch):
+        """A factory-built (built-in) Signal adapter resolves profile_routes
+        for a real inbound envelope — fails on main where the Signal branch
+        returned a bare ``SignalAdapter(config)`` with no runner."""
+        from gateway.config import PlatformConfig
+
+        group_id = "test-signal-route"
+        monkeypatch.setenv("SIGNAL_GROUP_ALLOWED_USERS", group_id)
+        runner = object.__new__(GatewayRunner)
+        runner.config = GatewayConfig(
+            multiplex_profiles=True,
+            profile_routes=[
+                ProfileRoute(name="signal", platform="signal", profile="ops", chat_id=f"group:{group_id}"),
+            ],
+        )
+        adapter = runner._create_adapter(
+            Platform.SIGNAL,
+            PlatformConfig(enabled=True, extra={"http_url": "http://127.0.0.1:18080", "account": "+15555550123"}),
+        )
+        assert adapter is not None and adapter.gateway_runner is runner
+
+        captured = {}
+
+        async def capture_event(event):
+            captured["event"] = event
+
+        adapter.handle_message = capture_event
+        with patch(
+            "hermes_cli.profiles.profiles_to_serve",
+            return_value=[("default", Path("/profiles/default")), ("ops", Path("/profiles/ops"))],
+        ):
+            await adapter._handle_envelope({
+                "envelope": {
+                    "sourceNumber": "+15555550124",
+                    "sourceName": "Test Operator",
+                    "timestamp": 1700000000000,
+                    "dataMessage": {
+                        "message": "diagnose the cluster",
+                        "groupInfo": {"groupId": group_id, "groupName": "US East 7"},
+                    },
+                },
+            })
+        source = captured["event"].source
+        assert source.profile == "ops"
+        assert build_session_key(source, profile=source.profile).startswith("agent:ops:")
+
 
 # A concrete adapter we can instantiate without the full platform stack.
 # ``build_source`` only reads ``self.platform`` and ``self.gateway_runner``, so a
@@ -378,7 +444,6 @@ class TestMultiplexGate:
 
         assert mock_runner._profile_name_for_source(discord_source) is None
 
-
 class TestProfileRouteContainment:
     """Runner authorization is separate from filesystem discovery and fallback."""
 
@@ -408,6 +473,25 @@ class TestProfileRouteContainment:
         runner.config = GatewayConfig(multiplex_profiles=True, profile_routes=[])
         runner._served_profile_names = set(served)
         return runner
+
+    def test_non_multiplex_rejects_explicit_unserved_profile(self, tmp_path, monkeypatch):
+        default, _root, _secondary, _active, _hidden, _outside = self._tree(
+            tmp_path, monkeypatch
+        )
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = GatewayConfig(multiplex_profiles=False, profile_routes=[])
+        source = SessionSource(
+            platform=Platform.DISCORD, chat_id="secondary", profile="secondary"
+        )
+
+        with patch(
+            "hermes_cli.profiles.get_active_profile_name", return_value="default"
+        ), patch("hermes_cli.profiles.resolve_profile_home") as resolve_home:
+            with pytest.raises(ProfileRouteRejectedError):
+                runner._resolve_profile_home_for_source(source)
+
+        resolve_home.assert_not_called()
+        assert default.is_dir()
 
     def test_invalid_and_existing_unserved_routes_do_not_touch_outside_files(
         self, tmp_path, monkeypatch
@@ -485,6 +569,40 @@ class TestProfileRouteContainment:
             assert asyncio.run(runner._start_secondary_profile_adapters()) == 0
 
         assert runner._served_profile_names == {"default", "secondary"}
+
+    def test_startup_fallback_does_not_authorize_raw_route_target(
+        self, tmp_path, monkeypatch
+    ):
+        default, _root, _secondary, _active, hidden, _outside = self._tree(
+            tmp_path, monkeypatch
+        )
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = GatewayConfig(
+            multiplex_profiles=True,
+            multiplex_profile_allowlist=[],
+            profile_routes=[
+                ProfileRoute(
+                    name="hidden-route",
+                    platform="telegram",
+                    profile="hidden",
+                    chat_id="route-chat",
+                )
+            ],
+        )
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="route-chat",
+            profile="hidden",
+        )
+
+        with patch(
+            "hermes_cli.profiles.get_active_profile_name", return_value="default"
+        ), patch("hermes_cli.profiles.resolve_profile_home") as resolve_home:
+            with pytest.raises(ProfileRouteRejectedError):
+                runner._resolve_profile_home_for_source(source)
+
+        resolve_home.assert_not_called()
+        assert hidden.is_dir()
 
 
 class TestProfileRuntimeScopeCleanup:
@@ -613,4 +731,3 @@ class TestProfileRuntimeScopeCleanup:
         finally:
             reset_secret_scope(secret_token)
             reset_hermes_home_override(home_token)
-

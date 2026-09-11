@@ -26,7 +26,7 @@ def test_capture_head_sha_returns_stripped_sha(monkeypatch, tmp_path):
 
     monkeypatch.setattr(hermes_main.subprocess, "run", fake_run)
 
-    assert hermes_main._capture_head_sha(["git"], tmp_path) == "deadbeefcafe"
+    assert update_cmd._capture_head_sha(["git"], tmp_path) == "deadbeefcafe"
 
 
 # ---------------------------------------------------------------------------
@@ -55,8 +55,10 @@ def _populate_critical_tree(root: Path, *, broken_file: str | None = None) -> No
             path.write_text("# stub\n")
 
 
-def test_validate_post_pull_critical_files_syntax_tolerates_missing_files(tmp_path):
-    """Older layouts may omit a critical file; ordinary updates tolerate it."""
+def test_validate_critical_files_syntax_tolerates_missing_files(tmp_path):
+    """A refactor may legitimately remove one of the critical files — the
+    guard should skip missing files, not falsely flag the install as broken."""
+    # Populate everything except hermes_constants.py
     for relpath in update_cmd._UPDATE_CRITICAL_FILES:
         if relpath == "hermes_constants.py":
             continue
@@ -64,7 +66,7 @@ def test_validate_post_pull_critical_files_syntax_tolerates_missing_files(tmp_pa
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("# stub\n")
 
-    ok, failing_path, error = update_cmd._validate_post_pull_critical_files_syntax(tmp_path)
+    ok, failing_path, error = update_cmd._validate_critical_files_syntax(tmp_path)
 
     assert (ok, failing_path, error) == (True, None, None)
 

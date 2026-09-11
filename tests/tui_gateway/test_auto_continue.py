@@ -24,6 +24,7 @@ import types
 
 import pytest
 
+from agent.api_outage_recovery import should_auto_resume_api_outage_result
 from tui_gateway import server
 from tui_gateway.turn_marker import (
     clear_turn_marker,
@@ -132,6 +133,128 @@ def test_marker_survives_corrupt_sidecar(tmp_path):
     assert read_turn_marker(tmp_path, "abc") is None
     record_turn_start(tmp_path, "abc", "prompt")
     assert read_turn_marker(tmp_path, "abc")["prompt"] == "prompt"
+
+
+def _patch_local_interrupt(monkeypatch, session):
+    monkeypatch.setattr(server, "_tts_stream_stop", lambda: None)
+    monkeypatch.setattr(server, "_sess_nowait", lambda params, rid: (session, None))
+    monkeypatch.setattr(server, "_sess", lambda params, rid: (session, None))
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda current: False)
+    monkeypatch.setattr(server, "_clear_pending", lambda sid=None: None)
+
+
+def test_interrupt_ack_retires_marker_before_run_thread_exits(monkeypatch, marker_home):
+    """A confirmed Stop must not auto-continue if the backend dies afterward."""
+
+    class _AliveThread:
+        def is_alive(self):
+            return True
+
+    interrupted = []
+    agent = types.SimpleNamespace(interrupt=lambda: interrupted.append(True))
+    session = _session(
+        agent=agent,
+        running=True,
+        _run_thread=_AliveThread(),
+        _active_turn_marker_key="original-key",
+    )
+    session["session_key"] = "rotated-key"
+    session_home = marker_home / "remote-profile"
+    session["profile_home"] = str(session_home)
+    record_turn_start(session_home, "original-key", "do not resume me")
+
+    _patch_local_interrupt(monkeypatch, session)
+
+    response = server._methods["session.interrupt"]("request-1", {"session_id": "runtime-1"})
+
+    assert response["result"]["status"] == "interrupted"
+    assert interrupted == [True]
+    assert read_turn_marker(session_home, "original-key") is None
+    assert read_turn_marker(session_home, "rotated-key") is None
+    assert "_active_turn_marker_key" not in session
+
+
+def test_interrupt_racing_marker_write_cannot_leave_recovery_state(
+    monkeypatch, emits, turn_env, marker_home
+):
+    """Stop before the disk write must still prevent later auto-continue."""
+
+    interrupted = []
+    agent = types.SimpleNamespace(
+        session_id="session-key",
+        clear_interrupt=lambda: None,
+        interrupt=lambda: interrupted.append(True),
+        run_conversation=lambda message, **kwargs: {"final_response": "stopped"},
+    )
+    session = _session(agent=agent, running=True)
+    _patch_local_interrupt(monkeypatch, session)
+
+    def write_after_stop(home, key, prompt, *, attempts=0):
+        response = server._methods["session.interrupt"](
+            "stop-during-write", {"session_id": "runtime-race"}
+        )
+        assert response["result"]["status"] == "interrupted"
+        record_turn_start(home, key, prompt, attempts=attempts)
+
+    monkeypatch.setattr(server, "record_turn_start", write_after_stop)
+
+    server._run_prompt_submit("request-race", "runtime-race", session, "race me")
+
+    assert interrupted == [True]
+    assert read_turn_marker(marker_home, "session-key") is None
+    assert "_active_turn_marker_key" not in session
+
+
+def test_busy_interrupt_attributes_the_new_message_as_user_owned(
+    monkeypatch, marker_home
+):
+    """A busy prompt's interrupt must never look like an auto-resumable outage wait."""
+    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "interrupt")
+    interrupted = []
+
+    class _Agent:
+        def interrupt(self, message=None):
+            interrupted.append(message)
+
+    session = _session(
+        agent=_Agent(),
+        running=True,
+        inflight_turn={"user": "original request", "assistant": "partial reply"},
+    )
+
+    response = server._handle_busy_submit(
+        "rid", "sid", session, "new request", "transport"
+    )
+
+    assert response["result"]["status"] == "queued"
+    deadline = time.time() + 1
+    while not interrupted and time.time() < deadline:
+        time.sleep(0.01)
+    assert interrupted == ["new request"]
+    assert not should_auto_resume_api_outage_result(
+        {
+            "interrupted": True,
+            "resume_reason": "api_outage_recovery",
+            "interrupt_message": interrupted[0],
+        }
+    )
+
+
+@pytest.mark.parametrize("interrupt_message", ["Stop requested", "/stop", "/new", "/reset", "new request"])
+def test_user_owned_interrupt_controls_are_never_auto_resumed(interrupt_message):
+    result = {
+        "interrupted": True,
+        "resume_reason": "api_outage_recovery",
+        "interrupt_message": interrupt_message,
+    }
+
+    assert should_auto_resume_api_outage_result(result) is False
+
+
+def test_unattributed_api_outage_wait_is_the_only_auto_resume_case():
+    assert should_auto_resume_api_outage_result(
+        {"interrupted": True, "resume_reason": "api_outage_recovery"}
+    ) is True
 
 
 # ── Turn lifecycle owns the marker ─────────────────────────────────────
