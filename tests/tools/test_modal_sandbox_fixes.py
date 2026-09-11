@@ -439,6 +439,142 @@ class TestDockerHostBindApproval:
         assert res.get("approved") is not True
         assert res.get("status") == "pending_approval"
 
+    def test_default_trust_mounted_docker_is_disabled(self):
+        """Mounted Docker trust is opt-in in the default config."""
+        from hermes_cli.config import DEFAULT_CONFIG
+
+        assert DEFAULT_CONFIG["approvals"]["trust_mounted_docker"] is False
+
+    @pytest.mark.parametrize("configured_value", [False, "true", "True", 1, "yes", None])
+    def test_host_bound_docker_trust_requires_literal_yaml_true(
+        self, monkeypatch, configured_value
+    ):
+        """Only a typed YAML true may suppress the host-bind approval gate."""
+        import tools.approval as A
+        self._isolate_approval_state(monkeypatch)
+        monkeypatch.setenv("HERMES_EXEC_ASK", "1")
+        monkeypatch.setattr(
+            A,
+            "_get_approval_config",
+            lambda: {"trust_mounted_docker": configured_value},
+        )
+        monkeypatch.setattr(
+            "tools.tirith_security.check_command_security",
+            lambda _c: {"action": "allow", "findings": [], "summary": ""},
+        )
+
+        res = A.check_all_command_guards(
+            "rm -rf /workspace",
+            "docker",
+            has_host_access=True,
+        )
+
+        assert res.get("approved") is not True
+        assert res.get("status") == "pending_approval"
+
+    def test_literal_true_trusts_host_bound_docker(self, monkeypatch):
+        """Typed trust skips normal approval for mounted Docker only."""
+        import tools.approval as A
+        self._isolate_approval_state(monkeypatch)
+        monkeypatch.setenv("HERMES_EXEC_ASK", "1")
+        monkeypatch.setattr(
+            A,
+            "_get_approval_config",
+            lambda: {"trust_mounted_docker": True},
+        )
+
+        res = A.check_all_command_guards(
+            "rm -rf /workspace",
+            "docker",
+            has_host_access=True,
+        )
+
+        assert res["approved"] is True
+
+    def test_mounted_docker_trust_does_not_apply_to_other_backends(self, monkeypatch):
+        """The opt-in is scoped to Docker even when host access is reported."""
+        import tools.approval as A
+        self._isolate_approval_state(monkeypatch)
+        monkeypatch.setenv("HERMES_EXEC_ASK", "1")
+        monkeypatch.setattr(
+            A,
+            "_get_approval_config",
+            lambda: {"trust_mounted_docker": True},
+        )
+        monkeypatch.setattr(
+            "tools.tirith_security.check_command_security",
+            lambda _c: {"action": "allow", "findings": [], "summary": ""},
+        )
+
+        res = A.check_all_command_guards(
+            "rm -rf /workspace",
+            "local",
+            has_host_access=True,
+        )
+
+        assert res.get("approved") is not True
+        assert res.get("status") == "pending_approval"
+
+    def test_mounted_docker_trust_preserves_hardline_block(self, monkeypatch):
+        """The mounted-Docker opt-in cannot bypass unconditional hardlines."""
+        import tools.approval as A
+        self._isolate_approval_state(monkeypatch)
+        monkeypatch.setattr(
+            A,
+            "_get_approval_config",
+            lambda: {"trust_mounted_docker": True},
+        )
+
+        res = A.check_all_command_guards(
+            "rm -rf --no-preserve-root /",
+            "docker",
+            has_host_access=True,
+        )
+
+        assert res["approved"] is False
+        assert res.get("hardline") is True
+
+    def test_mounted_docker_trust_preserves_explicit_deny_rule(self, monkeypatch):
+        """The mounted-Docker opt-in cannot bypass approvals.deny."""
+        import tools.approval as A
+        self._isolate_approval_state(monkeypatch)
+        monkeypatch.setattr(
+            A,
+            "_get_approval_config",
+            lambda: {
+                "trust_mounted_docker": True,
+                "deny": ["rm -rf /workspace"],
+            },
+        )
+
+        res = A.check_all_command_guards(
+            "rm -rf /workspace",
+            "docker",
+            has_host_access=True,
+        )
+
+        assert res["approved"] is False
+        assert res.get("user_deny") is True
+
+    def test_mounted_docker_trust_applies_to_execute_code(self, monkeypatch):
+        """Trusted mounted Docker also skips the whole-script execute_code gate."""
+        import tools.approval as A
+        self._isolate_approval_state(monkeypatch)
+        monkeypatch.setenv("HERMES_EXEC_ASK", "1")
+        monkeypatch.setattr(
+            A,
+            "_get_approval_config",
+            lambda: {"trust_mounted_docker": True},
+        )
+
+        res = A.check_execute_code_guard(
+            "import os; os.system('rm -rf /workspace')",
+            "docker",
+            has_host_access=True,
+        )
+
+        assert res["approved"] is True
+
     def test_execute_code_vercel_sandbox_always_skips(self, monkeypatch):
         """vercel_sandbox has no host-bind concept and stays always-skipped."""
         import tools.approval as A
@@ -446,3 +582,117 @@ class TestDockerHostBindApproval:
         res = A.check_execute_code_guard("import os", "vercel_sandbox",
                                          has_host_access=True)
         assert res["approved"] is True
+
+
+class TestMountedDockerTrustContextPrecedence:
+    """Mounted-Docker trust must not override unattended approval policies."""
+
+    @staticmethod
+    def _enable_trust(monkeypatch):
+        import tools.approval as A
+        TestDockerHostBindApproval._isolate_approval_state(monkeypatch)
+        monkeypatch.setattr(
+            A,
+            "_get_approval_config",
+            lambda: {"trust_mounted_docker": True},
+        )
+        monkeypatch.setattr(
+            "tools.tirith_security.check_command_security",
+            lambda _c: {"action": "allow", "findings": [], "summary": ""},
+        )
+        for var in (
+            "HERMES_GATEWAY_SESSION",
+            "HERMES_EXEC_ASK",
+            "HERMES_CRON_SESSION",
+            "HERMES_SINGLE_QUERY_SESSION",
+            "HERMES_SESSION_PLATFORM",
+            "HERMES_INTERACTIVE",
+        ):
+            monkeypatch.delenv(var, raising=False)
+
+    @pytest.mark.parametrize(
+        "context, mode, expected",
+        [
+            ("cron", "deny", False),
+            ("cron", "approve", True),
+            ("single_query", "deny", False),
+            ("single_query", "approve", True),
+            ("unattended", "deny", False),
+            ("unattended", "approve", True),
+        ],
+    )
+    def test_context_policy_still_decides_for_all_terminal_guards(
+        self, monkeypatch, context, mode, expected
+    ):
+        """Trust applies only after cron/-q/unattended policy selection."""
+        import tools.approval as A
+
+        self._enable_trust(monkeypatch)
+        if context == "cron":
+            monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+            monkeypatch.setattr(A, "_get_cron_approval_mode", lambda: mode)
+        elif context == "single_query":
+            monkeypatch.setenv("HERMES_SINGLE_QUERY_SESSION", "1")
+            monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+            monkeypatch.setattr(A, "_get_single_query_approval_mode", lambda: mode)
+        else:
+            monkeypatch.setenv("HERMES_SESSION_PLATFORM", "webhook")
+            monkeypatch.setattr(A, "_get_unattended_approval_mode", lambda: mode)
+
+        results = [
+            A.check_dangerous_command(
+                "rm -rf /workspace", "docker", has_host_access=True
+            ),
+            A.check_all_command_guards(
+                "rm -rf /workspace", "docker", has_host_access=True
+            ),
+            A.check_execute_code_guard(
+                "import os; os.system('rm -rf /workspace')",
+                "docker",
+                has_host_access=True,
+            ),
+        ]
+
+        assert [result["approved"] for result in results] == [expected] * 3
+
+    @pytest.mark.parametrize(
+        "command, config, marker",
+        [
+            (
+                "rm -rf --no-preserve-root /",
+                {"trust_mounted_docker": True},
+                "hardline",
+            ),
+            (
+                "git push --force origin main",
+                {"trust_mounted_docker": True, "deny": ["git push --force*"]},
+                "user_deny",
+            ),
+            (
+                "sudo -S id",
+                {"trust_mounted_docker": True},
+                "sudo -S",
+            ),
+        ],
+    )
+    def test_legacy_direct_guard_keeps_runtime_floors_before_trust(
+        self, monkeypatch, command, config, marker
+    ):
+        """The direct terminal guard keeps every unconditional trust floor."""
+        import tools.approval as A
+
+        self._enable_trust(monkeypatch)
+        monkeypatch.setattr(A, "_get_approval_config", lambda: config)
+        monkeypatch.delenv("SUDO_PASSWORD", raising=False)
+
+        result = A.check_dangerous_command(
+            command, "docker", has_host_access=True
+        )
+
+        assert result["approved"] is False
+        if marker == "hardline":
+            assert result.get("hardline") is True
+        elif marker == "user_deny":
+            assert result.get("user_deny") is True
+        else:
+            assert marker in result["message"]

@@ -2569,6 +2569,11 @@ DEFAULT_CONFIG = {
         "cron_mode": "deny",
         "single_query_mode": "deny",
         "unattended_mode": "deny",
+        # Opt in to skipping normal approval prompts when Docker has host
+        # paths mounted into the container. This is deliberately strict: only
+        # the literal YAML boolean true enables it, and the approval layer
+        # still enforces its unconditional hardline and user-deny rules.
+        "trust_mounted_docker": False,
         # Operator-customizable policy text for smart approvals. When
         # non-empty, this is appended to the smart-approval guardian's
         # SYSTEM prompt (trusted channel) as additional rules — e.g.

@@ -3447,6 +3447,35 @@ def _get_approval_config() -> dict:
         return {}
 
 
+def _trust_mounted_docker_enabled(
+    env_type: str,
+    has_host_access: bool = False,
+) -> bool:
+    """Return whether normal approval prompts are trusted for mounted Docker.
+
+    This is intentionally an exact opt-in. A YAML string such as ``"true"``
+    (or any other truthy value) must not silently grant the bypass, and the
+    bypass only applies to Docker sessions that actually expose host paths.
+    Callers run unconditional hardline and user-deny checks before using this
+    predicate.
+    """
+    if env_type != "docker" or has_host_access is not True:
+        return False
+    # Cron, single-query, and unattended sessions keep their explicit
+    # fail-closed/opt-in policy even when Docker mounts are trusted.
+    if (
+        _is_cron_approval_context()
+        or _is_single_query_approval_context()
+        or _is_unattended_platform_approval_context()
+    ):
+        return False
+    try:
+        approvals = _get_approval_config()
+    except Exception:
+        return False
+    return isinstance(approvals, dict) and approvals.get("trust_mounted_docker") is True
+
+
 def _get_approval_mode() -> str:
     """Read the approval mode from config. Returns 'manual', 'smart', or 'off'."""
     try:
@@ -4117,6 +4146,13 @@ def check_dangerous_command(command: str, env_type: str,
         logger.warning("Hardline block: %s (command: %s)", hardline_desc, command[:200])
         return _hardline_block_result(hardline_desc, command)
 
+    # Keep the unconditional sudo-stdin floor ahead of user deny and trust.
+    is_sudo_guess, sudo_guess_desc = _check_sudo_stdin_guard(command)
+    if is_sudo_guess:
+        logger.warning("Sudo stdin guard block: %s (command: %s)",
+                       sudo_guess_desc, command[:200])
+        return _sudo_stdin_block_result(sudo_guess_desc)
+
     # User-defined deny rules (approvals.deny in config.yaml): like the
     # hardline floor, these fire BEFORE the yolo bypass — a deny rule is the
     # user saying "never, even under yolo".
@@ -4125,6 +4161,11 @@ def check_dangerous_command(command: str, env_type: str,
         logger.warning("User deny rule %r blocked command: %s",
                        deny_pattern, command[:200])
         return _user_deny_block_result(deny_pattern)
+
+    # Mounted Docker is only trusted when the operator explicitly sets the
+    # typed opt-in. Hardline and user-defined deny checks above remain floors.
+    if _trust_mounted_docker_enabled(env_type, has_host_access=has_host_access):
+        return {"approved": True, "message": None}
 
     # --yolo: bypass all approval prompts. Gateway /yolo is session-scoped;
     # CLI --yolo remains process-scoped via the env var for local use.
@@ -4774,6 +4815,11 @@ def check_all_command_guards(command: str, env_type: str,
         logger.warning("User deny rule %r blocked command: %s",
                        deny_pattern, command[:200])
         return _user_deny_block_result(deny_pattern)
+
+    # Mounted Docker is only trusted when the operator explicitly sets the
+    # typed opt-in. Hardline and user-defined deny checks above remain floors.
+    if _trust_mounted_docker_enabled(env_type, has_host_access=has_host_access):
+        return {"approved": True, "message": None}
 
     # --yolo or approvals.mode=off: bypass all approval prompts.
     # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.
@@ -5470,6 +5516,8 @@ def check_execute_code_guard(code: str, env_type: str,
     if env_type == "vercel_sandbox":
         return {"approved": True, "message": None}
     if _should_skip_container_guards(env_type, has_host_access=has_host_access):
+        return {"approved": True, "message": None}
+    if _trust_mounted_docker_enabled(env_type, has_host_access=has_host_access):
         return {"approved": True, "message": None}
 
     # --yolo or approvals.mode=off: bypass (session- or process-scoped).

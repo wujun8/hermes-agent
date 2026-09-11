@@ -690,6 +690,19 @@ Security tradeoff:
 
 Use the opt-in only when you intentionally want the container to work on live host files.
 
+### Trust mounted Docker approvals
+
+Set this opt-in only when you accept that commands can modify live host files:
+
+```yaml
+approvals:
+  trust_mounted_docker: true
+```
+
+With the literal YAML value `true`, Hermes trusts **all detected Docker bind mounts**, including mounts configured through `docker_volumes`, not only the current-project mount from `docker_mount_cwd_to_workspace`. If you want current-project-only use, set `docker_volumes: []` and enable `docker_mount_cwd_to_workspace` explicitly.
+
+This trust removes normal interactive/gateway approval prompts for mounted Docker terminal commands and skips the whole-script prompt for trusted Docker `execute_code`. The `cron_mode`, `single_query_mode`, and `unattended_mode` approval policies still apply and can deny these actions. Trusted Docker `execute_code` can mutate any mounted files through Python APIs, including changes that are outside shell-string `approvals.deny` visibility; use this setting only for mounts you are willing to expose to arbitrary code. Hardline blocks, `approvals.deny`, and the unconditional `sudo -S` guard remain enforced.
+
 ### Persistent Shell
 
 By default, each terminal command runs in its own subprocess — working directory, environment variables, and shell variables reset between commands. When **persistent shell** is enabled, a single long-lived bash process is kept alive across `execute()` calls so that state survives between commands.
@@ -2569,6 +2582,23 @@ Smart mode is particularly useful for reducing approval fatigue — it lets the 
 :::warning
 Setting `approvals.mode: off` disables all safety checks for terminal commands. Only use this in trusted, sandboxed environments.
 :::
+
+### Trusting a mounted Docker workspace
+
+Docker normally keeps the approval gate enabled when a host path is mounted
+into the container, because commands in that workspace can change host files.
+If the mounted Docker environment is intentionally trusted, opt in explicitly:
+
+```yaml
+approvals:
+  trust_mounted_docker: true
+```
+
+This setting is disabled by default and is accepted only when the YAML value is
+the literal boolean `true`. It applies only to the Docker backend when Hermes
+has detected host-path access; it does not change approval behavior for other
+backends. The unconditional hardline blocklist and any `approvals.deny` rules
+still block matching commands.
 
 ### Denial circuit breaker
 
