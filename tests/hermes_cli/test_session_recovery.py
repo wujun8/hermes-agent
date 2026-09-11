@@ -300,6 +300,101 @@ def _corrupt_table_root(path: Path, root_page: int) -> None:
     path.write_bytes(data)
 
 
+def test_partial_copy_skips_rows_rejected_by_destination_constraints(
+    tmp_path: Path,
+) -> None:
+    source = sqlite3.connect(str(tmp_path / "nullable-source.db"))
+    destination = sqlite3.connect(str(tmp_path / "strict-destination.db"))
+    try:
+        source.execute(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, role TEXT)"
+        )
+        source.executemany(
+            "INSERT INTO messages (id, role) VALUES (?, ?)",
+            [(1, "user"), (2, None), (3, "assistant")],
+        )
+        source.commit()
+        destination.execute(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, role TEXT NOT NULL)"
+        )
+
+        report = session_recovery._copy_table_salvage(
+            source,
+            destination,
+            "messages",
+            chunk_size=3,
+            progress_cb=None,
+            source_rows=3,
+        )
+
+        assert report["status"] == "partial"
+        assert report["copied_rows"] == 2
+        assert report["skipped_rowid_ranges"] == [
+            {
+                "low": 2,
+                "high": 2,
+                "error": "NOT NULL constraint failed: messages.role",
+            }
+        ]
+        assert destination.execute(
+            "SELECT id, role FROM messages ORDER BY id"
+        ).fetchall() == [(1, "user"), (3, "assistant")]
+    finally:
+        source.close()
+        destination.close()
+
+
+def test_partial_copy_reports_exact_row_constraint_after_range_failure(
+    tmp_path: Path,
+) -> None:
+    source = sqlite3.connect(str(tmp_path / "damaged-source.db"))
+    destination = sqlite3.connect(str(tmp_path / "strict-destination.db"))
+
+    class RangeFailingConnection:
+        def execute(self, sql, parameters=()):
+            if " BETWEEN " in sql:
+                raise sqlite3.DatabaseError("source range is damaged")
+            return source.execute(sql, parameters)
+
+    try:
+        source.execute(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, role TEXT)"
+        )
+        source.executemany(
+            "INSERT INTO messages (id, role) VALUES (?, ?)",
+            [(1, "user"), (2, None), (3, "assistant")],
+        )
+        source.commit()
+        destination.execute(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, role TEXT NOT NULL)"
+        )
+
+        report = session_recovery._copy_table_salvage(
+            RangeFailingConnection(),
+            destination,
+            "messages",
+            chunk_size=3,
+            progress_cb=None,
+            source_rows=3,
+        )
+
+        assert report["status"] == "partial"
+        assert report["copied_rows"] == 2
+        assert report["skipped_rowid_ranges"] == [
+            {
+                "low": 2,
+                "high": 2,
+                "error": "NOT NULL constraint failed: messages.role",
+            }
+        ]
+        assert destination.execute(
+            "SELECT id, role FROM messages ORDER BY id"
+        ).fetchall() == [(1, "user"), (3, "assistant")]
+    finally:
+        source.close()
+        destination.close()
+
+
 def test_snapshot_blocks_connections_opened_during_the_copy(
     tmp_path: Path,
 ) -> None:

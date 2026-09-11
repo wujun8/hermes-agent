@@ -659,7 +659,7 @@ def _copy_table_salvage(
     stopped_at_query_limit = False
     exact_sql = f'SELECT {quoted} FROM "{table}" WHERE rowid = ?'
 
-    def recover_exact_rowid(rowid: int) -> bool:
+    def recover_exact_rowid(rowid: int) -> tuple[bool, Optional[str]]:
         """Issue #80205: salvage one row by exact-key lookup.
 
         A singleton range scan (``rowid BETWEEN x AND x ORDER BY rowid``)
@@ -675,23 +675,30 @@ def _copy_table_salvage(
         try:
             row = source.execute(exact_sql, (rowid,)).fetchone()
         except sqlite3.DatabaseError:
-            return False
+            return False, None
         if row is None:
-            return True  # genuinely absent: nothing to skip
+            return True, None  # genuinely absent: nothing to skip
         value = tuple(row)
         if row_filter is not None and not row_filter(value, column_names):
             result["excluded_rows"] += 1
-            return True
+            return True, None
         destination.execute("BEGIN IMMEDIATE")
         try:
             destination.execute(insert_sql, value)
             destination.execute("COMMIT")
+        except sqlite3.IntegrityError as exc:
+            destination.execute("ROLLBACK")
+            # Physical corruption can leave a row readable while damaging a
+            # required value.  In partial mode, treat that singleton exactly
+            # like an unreadable row so range bisection can salvage its
+            # neighbours and report the rejected rowid.
+            return False, str(exc)
         except BaseException:
             destination.execute("ROLLBACK")
             raise
         result["copied_rows"] += 1
         result["exact_lookup_recovered"] += 1
-        return True
+        return True, None
 
     def copy_range(low: int, high: int) -> None:
         nonlocal stopped_at_query_limit
@@ -754,12 +761,13 @@ def _copy_table_salvage(
             if retry_low > high:
                 return
             if retry_low == high:
-                if not recover_exact_rowid(retry_low):
+                recovered, exact_error = recover_exact_rowid(retry_low)
+                if not recovered:
                     _append_skipped_range(
                         result["skipped_rowid_ranges"],
                         retry_low,
                         high,
-                        str(exc),
+                        exact_error or str(exc),
                     )
                 return
             midpoint = retry_low + (high - retry_low) // 2
