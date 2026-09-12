@@ -90,13 +90,19 @@ def record_turn_start(
     *,
     attempts: int = 0,
     resume_reason: str | None = None,
+    auto_continue: bool = True,
 ) -> None:
     """Persist the marker for a turn that is about to run. ``attempts`` = how many auto-continues led to
     this run (0 for a user-initiated turn); the crash-loop breaker reads it back on the next resume."""
     if not session_key or not prompt:
         return
     now = time.time()
-    entry = {"attempts": max(0, int(attempts)), "prompt": prompt[:_MAX_PROMPT_CHARS], "started_at": now}
+    entry = {
+        "attempts": max(0, int(attempts)),
+        "prompt": prompt[:_MAX_PROMPT_CHARS],
+        "started_at": now,
+        "auto_continue": bool(auto_continue),
+    }
     if resume_reason:
         entry["resume_reason"] = str(resume_reason)
     _update(home, session_key, lambda entries: {**_prune(entries, now), session_key: entry}, "record")
@@ -123,6 +129,7 @@ def read_turn_marker(home: Path | str, session_key: str) -> dict[str, Any] | Non
             "prompt": prompt,
             "started_at": _started_at(entry),
             "resume_reason": str(entry.get("resume_reason")) if entry.get("resume_reason") else None,
+            "auto_continue": bool(entry.get("auto_continue", True)),
         }
     except Exception:
         return None

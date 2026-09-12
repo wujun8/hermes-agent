@@ -501,7 +501,7 @@ def delegate_task(
 
 # ── OpenAI function-calling schema ──────────────────────────────────────────
 
-def _build_top_level_description() -> str:
+def _build_top_level_description(*, independent_completions=None) -> str:
     """delegate_task description: ONLY guidance stated nowhere else in the schema
     (limits live in the 'tasks' parameter description, rebuilt per get_definitions())."""
     try:
@@ -518,20 +518,32 @@ def _build_top_level_description() -> str:
         )
     else:
         restrictions_rule = "- Children cannot call delegate_task, clarify, memory, or cronjob.\n"
-    return _DESCRIPTION_HEAD + restrictions_rule + _DESCRIPTION_TAIL
+    from tools.delegate_tool_config import _get_independent_completions
+
+    if independent_completions is None:
+        independent_completions = _get_independent_completions()
+    delivery = (
+        "each ungrouped task / `group` returns on its own"
+        if independent_completions else "one message per call"
+    )
+    return _DESCRIPTION_HEAD.format(delivery=delivery) + restrictions_rule + _DESCRIPTION_TAIL
 
 _DESCRIPTION_HEAD = (
-    "Spawn subagents in isolated contexts; each gets its own conversation, terminal session, and toolset. Pass every "
-    "task in `tasks` — one entry spawns one subagent, several run in parallel (limit in the tasks description).\n\n"
-    "Background calls return live transcript paths; results re-enter the conversation as a new message when children "
-    "finish (one message per call by default; `delegation.independent_completions` splits ungrouped tasks/groups). "
-    "Results arrive BETWEEN turns: finish unrelated work, give a one-line status, and END YOUR TURN. Never wait or "
-    "poll transcripts, artifacts, or CI. While children run, `action='list'` shows ids, `action='steer'` sends a "
-    "message, and `action='stop'` ends one. Prefer steer first for narrowing scope, keeping artifacts, outdated work, "
-    "or takeover; require the next response to close. Reserve stop for unsafe work, explicit cancel, unresponsive "
-    "children, or after one steer still not converging. Stop returns interrupted (with a parent_stop marker when "
-    "applicable), never completed.\n\n"
-    "USE FOR: reasoning-heavy subtasks, context-heavy work, or independent parallel workstreams.\n"
+    "Spawn subagents in isolated contexts; each gets its own conversation, terminal session, and toolset, and only its "
+    "final summary returns to you. Pass every task in `tasks` — one entry spawns one subagent, several run in parallel "
+    "(limit in the tasks description).\n\n"
+    "Sessions without a later-result consumer (including one-shot CLI and cron) join parallel children "
+    "and return results in this tool call. "
+    "Otherwise runs in the background: dispatch returns live transcript paths and results re-enter "
+    "as a new message when subagents finish ({delivery}). Background results are delivered only "
+    "BETWEEN your turns: finish whatever does not depend on them, then give a one-line status and END YOUR TURN. Never "
+    "wait or poll on transcripts, artifact files, or CI for a child. "
+    "While children run, `action` (list/steer/stop) controls them live. Prefer steer first when a child drifts: use it "
+    "for narrowing scope, preserving artifacts, outdated work, or takeover, and require the next response to close. "
+    "After one steer still not converging, or for unsafe work, explicit cancel, or an unresponsive child, use stop. "
+    "Stop returns interrupted (with a parent_stop marker when applicable), never completed.\n\n"
+    "USE FOR: reasoning-heavy subtasks, work that would flood your context with intermediate data, or independent "
+    "parallel workstreams.\n"
     "DO NOT USE FOR (use these instead):\n"
     "- Mechanical multi-step work -> execute_code\n"
     "- A single tool call -> call it directly\n"
@@ -564,12 +576,24 @@ def _build_tasks_param_description() -> str:
 def _build_dynamic_schema_overrides() -> dict:
     """Per-call schema overrides (ToolEntry.dynamic_schema_overrides): every
     get_definitions() pass rewrites the descriptions to the user's actual limits."""
+    from tools.delegate_tool_config import _get_independent_completions
+
+    independent_completions = _get_independent_completions()
     overrides_params = {**DELEGATE_TASK_SCHEMA["parameters"]}
     # Copy properties so the static schema dict is never mutated.
     overrides_params["properties"] = {k: dict(v) for k, v in DELEGATE_TASK_SCHEMA["parameters"]["properties"].items()}
     overrides_params["properties"]["tasks"]["description"] = _build_tasks_param_description()
 
-    return {"description": _build_top_level_description(), "parameters": overrides_params}
+    if not independent_completions:
+        tasks = overrides_params["properties"]["tasks"]
+        tasks["items"] = {**tasks["items"], "properties": {
+            k: v for k, v in tasks["items"]["properties"].items() if k != "group"
+        }}
+
+    return {
+        "description": _build_top_level_description(independent_completions=independent_completions),
+        "parameters": overrides_params,
+    }
 
 def _p(type_: str, description: str, **extra) -> dict:
     return {"type": type_, **extra, "description": description}
