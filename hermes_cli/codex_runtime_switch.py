@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import functools
 import logging
 from dataclasses import dataclass
@@ -84,6 +85,62 @@ def check_codex_binary_ok() -> tuple[bool, Optional[str]]:
         return False, f"codex check failed: {exc}"
 
 
+def resolve_effective_runtime(config: dict) -> dict:
+    """Resolve the runtime represented by a config snapshot without requiring it to be saved first."""
+    model_cfg = config.get("model") if isinstance(config, dict) else None
+    model_cfg = model_cfg if isinstance(model_cfg, dict) else {}
+    requested = model_cfg.get("provider") if isinstance(model_cfg.get("provider"), str) else None
+    target_model = model_cfg.get("default") if isinstance(model_cfg.get("default"), str) else None
+
+    from hermes_cli.runtime_provider import (
+        _maybe_apply_codex_app_server_runtime,
+        _resolve_named_custom_runtime,
+        resolve_runtime_provider,
+    )
+
+    # The normal resolver reads provider definitions from disk. Resolve a named custom entry from
+    # the pending snapshot first so validation works before save_config() commits the toggle.
+    custom_runtime = _resolve_named_custom_runtime(
+        requested_provider=requested or "", target_model=target_model,
+        config=config, model_cfg=model_cfg,
+    )
+    if custom_runtime is not None:
+        return custom_runtime
+
+    runtime = dict(resolve_runtime_provider(requested=requested, target_model=target_model))
+    runtime["api_mode"] = _maybe_apply_codex_app_server_runtime(
+        provider=str(runtime.get("provider") or ""), api_mode=str(runtime.get("api_mode") or ""),
+        model_cfg=model_cfg,
+    )
+    return runtime
+
+
+def _effective_runtime_details(config: dict, resolver) -> tuple[str, str]:
+    runtime = resolver(config)
+    if not isinstance(runtime, dict):
+        raise TypeError("runtime resolver returned a non-dict result")
+    api_mode = str(runtime.get("api_mode") or "").strip()
+    if not api_mode:
+        raise ValueError("runtime resolver returned no api_mode")
+    return api_mode, str(runtime.get("provider") or "auto").strip() or "auto"
+
+
+def _format_runtime_resolution_error(exc: Exception) -> str:
+    try:
+        from hermes_cli.runtime_provider import format_runtime_provider_error
+
+        return format_runtime_provider_error(exc)
+    except Exception:
+        return str(exc) or exc.__class__.__name__
+
+
+def _restore_model_snapshot(config: dict, had_model: bool, original_model) -> None:
+    if had_model:
+        config["model"] = original_model
+    else:
+        config.pop("model", None)
+
+
 def _migration_lines(config: dict) -> list[str]:
     """Run the ~/.codex/config.toml migration and describe it; failures are non-fatal."""
     lines: list[str] = []
@@ -115,21 +172,33 @@ def _migration_lines(config: dict) -> list[str]:
 
 
 def apply(
-    config: dict, new_value: Optional[str], *, persist_callback=None) -> CodexRuntimeStatus:
+    config: dict, new_value: Optional[str], *, persist_callback=None, effective_runtime_resolver=None,
+) -> CodexRuntimeStatus:
     """Entry point for CLI and gateway. ``config`` is mutated in place when ``new_value`` is set
-    (None = show current state); ``persist_callback(config)`` writes it, skipped when None."""
+    (None = show current state); ``persist_callback(config)`` writes it, skipped when None. Enabling
+    is accepted only when the effective resolver confirms the app-server route."""
     current = get_current_runtime(config)
+    effective_runtime_resolver = effective_runtime_resolver or resolve_effective_runtime
 
     # Cached per apply() call: the enable path would otherwise spawn `codex --version` up to 3x.
     _check_binary_cached = functools.cache(check_codex_binary_ok)
 
     if new_value is None:
         ok, ver = _check_binary_cached()
-        msg = (
-            f"openai_runtime: {current}\n"
-            f"codex CLI: {'OK ' + ver if ok else 'not available — ' + (ver or 'install with `npm i -g @openai/codex`')}"
+        msg_lines = [
+            f"openai_runtime: {current}",
+            f"codex CLI: {'OK ' + ver if ok else 'not available — ' + (ver or 'install with `npm i -g @openai/codex`')}",
+        ]
+        if current == "codex_app_server":
+            try:
+                api_mode, provider = _effective_runtime_details(config, effective_runtime_resolver)
+                suffix = "" if api_mode == "codex_app_server" else " (configured app-server is inactive)"
+                msg_lines.append(f"effective runtime: {api_mode} (provider: {provider}){suffix}")
+            except Exception as exc:
+                msg_lines.append(f"effective runtime: unresolved ({_format_runtime_resolution_error(exc)})")
+        return CodexRuntimeStatus(
+            success=True, new_value=current, old_value=current, message="\n".join(msg_lines),
         )
-        return CodexRuntimeStatus(success=True, new_value=current, old_value=current, message=msg)
 
     # Re-enabling codex_app_server falls through to the migration: the config value is already
     # correct but the world state (managed block in ~/.codex/config.toml, hermes-tools MCP
@@ -154,16 +223,44 @@ def apply(
                     f"{ver_or_msg or 'codex CLI not available'}\n"
                     "Install with: npm i -g @openai/codex"))
 
+    had_model = "model" in config
+    original_model = copy.deepcopy(config.get("model"))
     if not reapplying_enable:
         set_runtime(config, new_value)
+
+    effective_api_mode = None
+    effective_provider = None
+    if new_value == "codex_app_server":
+        try:
+            effective_api_mode, effective_provider = _effective_runtime_details(config, effective_runtime_resolver)
+        except Exception as exc:
+            if not reapplying_enable:
+                _restore_model_snapshot(config, had_model, original_model)
+            return CodexRuntimeStatus(
+                success=False, new_value=None, old_value=current,
+                message=("Cannot enable codex_app_server runtime: effective runtime resolution failed: "
+                         f"{_format_runtime_resolution_error(exc)}\nopenai_runtime was not changed."),
+            )
+        if effective_api_mode != "codex_app_server":
+            if not reapplying_enable:
+                _restore_model_snapshot(config, had_model, original_model)
+            return CodexRuntimeStatus(
+                success=False, new_value=None, old_value=current,
+                message=("Cannot enable codex_app_server runtime: effective runtime resolved to "
+                         f"{effective_api_mode} (provider: {effective_provider}).\n"
+                         "openai_runtime was not changed."),
+            )
+
+    if not reapplying_enable:
         if persist_callback is not None:
             try:
                 persist_callback(config)
             except Exception as exc:
+                _restore_model_snapshot(config, had_model, original_model)
                 logger.exception("failed to persist openai_runtime change")
                 return CodexRuntimeStatus(
                     success=False, new_value=new_value, old_value=current,
-                    message=f"updated config in memory but persist failed: {exc}")
+                    message=f"could not persist openai_runtime change: {exc}")
 
     msg_lines = [
         f"openai_runtime already set to {current} — re-applying migration"
@@ -173,6 +270,9 @@ def apply(
         ok, ver = _check_binary_cached()
         if ok:
             msg_lines.append(f"codex CLI: {ver}")
+        msg_lines.append(
+            f"effective runtime: {effective_api_mode} (provider: {effective_provider})"
+        )
         # Migrate Hermes' MCP servers + Codex's curated plugins into ~/.codex/config.toml so the
         # spawned codex subprocess sees the same tool surface AND can call back into Hermes.
         msg_lines.extend(_migration_lines(config))

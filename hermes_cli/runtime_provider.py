@@ -96,7 +96,8 @@ _HOST_MANDATED_API_MODES = {
 }
 
 # codex_app_server is opt-in: hand the whole turn to a `codex app-server` subprocess (Codex's own
-# tool runtime), gated on `model.openai_runtime == "codex_app_server"` AND provider in {openai, openai-codex}.
+# tool runtime). Built-in OpenAI providers are eligible directly; named custom providers opt in at
+# their resolver only after proving that they speak the Responses wire protocol.
 _VALID_API_MODES = {"chat_completions", "codex_responses", "anthropic_messages", "bedrock_converse", "codex_app_server"}
 
 
@@ -225,10 +226,19 @@ def _api_key_provider_api_mode(provider: str, model_cfg: Dict[str, Any], api_key
     return _configured_or_fallback_api_mode(provider, model_cfg, base_url, effective_model, opencode_by_model=opencode_by_model)
 
 
-def _maybe_apply_codex_app_server_runtime(*, provider: str, api_mode: str, model_cfg: Optional[Dict[str, Any]]) -> str:
-    """Opt-in rewrite to "codex_app_server" via ``model.openai_runtime``; only ``openai`` /
-    ``openai-codex`` are eligible. No-op when unset, "auto", or empty."""
-    if model_cfg and provider in {"openai", "openai-codex"} and str(model_cfg.get("openai_runtime") or "").strip().lower() == "codex_app_server":
+def _maybe_apply_codex_app_server_runtime(
+    *, provider: str, api_mode: str, model_cfg: Optional[Dict[str, Any]], allow_custom: bool = False,
+) -> str:
+    """Apply the explicit app-server opt-in to a compatible resolved runtime.
+
+    Named custom providers must opt in at their resolver and already speak Responses. Codex's
+    custom model-provider protocol does not support Hermes' Chat Completions or Anthropic wires.
+    """
+    requested = str((model_cfg or {}).get("openai_runtime") or "").strip().lower()
+    eligible = provider in {"openai", "openai-codex"} or (
+        allow_custom and provider == "custom" and api_mode == "codex_responses"
+    )
+    if requested == "codex_app_server" and eligible:
         return "codex_app_server"
     return api_mode
 
@@ -827,7 +837,16 @@ def resolve_runtime_provider(*, requested: Optional[str] = None, explicit_api_ke
     OpenCode Zen/Go where different models route through different API surfaces)."""
     requested_provider = resolve_requested_provider(requested)
     _raise_if_provider_disabled(requested_provider)
-    return next(r for r in _ladder_rungs(requested_provider, explicit_api_key, explicit_base_url, target_model) if r)
+    runtime = next(r for r in _ladder_rungs(requested_provider, explicit_api_key, explicit_base_url, target_model) if r)
+    # Apply the built-in OpenAI override after the whole ladder, not only on credential-pool
+    # results. Named custom providers perform their stricter Responses-only check in their resolver.
+    runtime_provider = str(runtime.get("provider") or "")
+    if runtime_provider in {"openai", "openai-codex"}:
+        runtime["api_mode"] = _maybe_apply_codex_app_server_runtime(
+            provider=runtime_provider, api_mode=str(runtime.get("api_mode") or ""),
+            model_cfg=_get_model_config(),
+        )
+    return runtime
 
 
 def _ladder_rungs(requested_provider, explicit_api_key, explicit_base_url, target_model):

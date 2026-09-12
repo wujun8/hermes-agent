@@ -148,6 +148,8 @@ Kanban 工具通过分发器设置的 `HERMES_KANBAN_TASK` 环境变量进行访
    ```
    Hermes 会自动发现它们并将 `[plugins."<name>@openai-curated"]` 条目写入 `~/.codex/config.toml`。
 
+4. **（可选）命名自定义 Responses 提供商。** `model.openai_runtime: codex_app_server` 继续支持 `openai` 和 `openai-codex`。对于已配置的命名自定义提供商（例如 `custom:proxy`），只有当 Hermes 将其实际运行的 wire mode 解析为 `codex_responses` 时才支持此运行时（例如该提供商配置了 `transport: codex_responses`）。使用 `chat_completions` 或 `anthropic_messages` 的自定义提供商不支持此运行时。Codex app-server 仍从用户级 `~/.codex/config.toml` 读取它自己的 `model_provider`、`model` 和认证信息。Hermes 的命名自定义配置只负责让 Hermes 选择 app-server，因此请分别配置两边，使其指向预期的 endpoint/model。参见 Codex 文档中的[自定义模型提供商](https://developers.openai.com/codex/config-advanced)（`wire_api = "responses"`）。
+
 ## 启用
 
 在 Hermes 会话中：
@@ -158,6 +160,7 @@ Kanban 工具通过分发器设置的 `HERMES_KANBAN_TASK` 环境变量进行访
 
 该命令会：
 - 验证 `codex` CLI 是否已安装（若未安装则阻止并提示安装方法）。
+- 在启用前以及查询状态时验证当前配置的 effective runtime（实际运行时）。`openai` 和 `openai-codex` 继续支持；命名自定义提供商（例如 `custom:proxy`）只有在最终 wire mode 为 `codex_responses` 时才接受。自定义 `chat_completions` 和 `anthropic_messages` 配置会被拒绝，因此不匹配时会拒绝启用，而不会静默变成 no-op。
 - 将 `model.openai_runtime: codex_app_server` 持久化到你的 config.yaml。
 - 将用户 MCP server 从 `~/.hermes/config.yaml` 迁移到 `~/.codex/config.toml`。
 - **发现并迁移已安装的原生 Codex 插件**（Linear、GitHub、Gmail、Calendar、Canva 等），通过查询 Codex 的 `plugin/list` RPC 实现。
@@ -171,6 +174,8 @@ Kanban 工具通过分发器设置的 `HERMES_KANBAN_TASK` 环境变量进行访
 ```
 /codex-runtime
 ```
+
+这个状态查询也会验证并报告当前配置的 effective runtime（实际运行时）。如果它与请求的 app-server 运行时不匹配，启用请求会被拒绝，而不会静默变成 no-op。
 
 你也可以在 `~/.hermes/config.yaml` 中手动设置：
 ```yaml
@@ -386,6 +391,7 @@ tool_timeout_sec = 600.0
 
 已知限制：
 
+- **此运行时中的命名自定义提供商仅支持 Responses。** `custom:proxy` 只有在 Hermes 的 effective wire mode 为 `codex_responses` 时才符合条件；使用 `chat_completions` 或 `anthropic_messages` 的自定义提供商会被拒绝。Codex app-server 从用户级 `~/.codex/config.toml` 读取自己的 `model_provider`、`model` 和认证信息；Hermes 不会将命名自定义 endpoint/model/auth 自动复制到该文件，因此两边配置必须手动保持一致。
 - **Hermes 认证和 Codex 认证是独立的会话。** 为获得最佳体验，你需要同时运行 `codex login` 和 `hermes auth login codex`（运行时使用 Codex 的会话进行 LLM 调用）。这是 Hermes `_import_codex_cli_tokens` 中的有意设计——Hermes 不会与 Codex CLI 共享 OAuth 状态，以避免在 token 刷新时相互覆盖。
 - **`delegate_task`、`memory`、`session_search`、`todo` 在此运行时上不可用。** 它们需要运行中的 AIAgent 上下文，无状态的 MCP 回调无法提供。需要这些工具时，请使用 `/codex-runtime auto`。
 - **当 Codex 未跟踪变更集时，审批提示中没有内联 patch 预览。** Codex 的 `fileChange` 审批参数并不总是携带变更集。Hermes 会尽可能从对应的 `item/started` 通知中缓存数据，但如果审批在事件项流式传输完成之前到达，提示会回退到 Codex 提供的 `reason`。

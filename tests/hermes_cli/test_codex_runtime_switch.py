@@ -60,6 +60,57 @@ class TestSetRuntime:
 
 class TestApply:
 
+    def test_enable_validates_pending_named_custom_runtime_before_side_effects(self):
+        def config(transport):
+            return {
+                "model": {
+                    "provider": "custom:custom-codex",
+                    "default": "gpt-5.6-sol",
+                    "openai_runtime": "auto",
+                },
+                "providers": {
+                    "custom-codex": {
+                        "api": "https://relay.example.test/v1",
+                        "api_key": "relay-secret",
+                        "transport": transport,
+                    },
+                },
+            }
+
+        persisted = []
+        with patch.object(crs, "check_codex_binary_ok", return_value=(True, "0.130.0")), \
+             patch("hermes_cli.codex_runtime_plugin_migration.migrate") as migrate:
+            migrate.return_value.migrated = []
+            migrate.return_value.migrated_plugins = []
+            migrate.return_value.plugin_query_error = None
+            migrate.return_value.wrote_permissions_default = None
+            migrate.return_value.errors = []
+            migrate.return_value.target_path = "/fake/.codex/config.toml"
+            valid = config("codex_responses")
+            result = crs.apply(valid, "codex_app_server", persist_callback=persisted.append)
+
+            assert result.success
+            assert valid["model"]["openai_runtime"] == "codex_app_server"
+            assert persisted == [valid]
+            assert migrate.call_count == 1
+            assert "effective runtime: codex_app_server" in result.message
+            assert "provider: custom" in result.message
+
+            status = crs.apply(valid, None)
+            assert "effective runtime: codex_app_server (provider: custom)" in status.message
+
+            migrate.reset_mock()
+            invalid = config("chat_completions")
+            before = config("chat_completions")
+            persisted.clear()
+            result = crs.apply(invalid, "codex_app_server", persist_callback=persisted.append)
+
+        assert not result.success
+        assert invalid == before
+        assert persisted == []
+        assert not migrate.called
+        assert "effective runtime resolved to chat_completions" in result.message
+
 
     def test_reapply_codex_app_server_runs_migration(self):
         """Re-applying codex_app_server when already enabled must still
@@ -83,6 +134,11 @@ class TestApply:
 
         with patch.object(crs, "check_codex_binary_ok",
                           return_value=(True, "0.130.0")), \
+             patch.object(
+                 crs,
+                 "resolve_effective_runtime",
+                 return_value={"provider": "openai-codex", "api_mode": "codex_app_server"},
+             ), \
              patch("hermes_cli.codex_runtime_plugin_migration.migrate") as mig:
             mig.return_value.migrated = ["filesystem", "hermes-tools"]
             mig.return_value.migrated_plugins = []
@@ -126,6 +182,11 @@ class TestApply:
 
         with patch.object(crs, "check_codex_binary_ok",
                           return_value=(True, "0.130.0")), \
+             patch.object(
+                 crs,
+                 "resolve_effective_runtime",
+                 return_value={"provider": "openai-codex", "api_mode": "codex_app_server"},
+             ), \
              patch("hermes_cli.codex_runtime_plugin_migration.migrate") as mig:
             mig.return_value.migrated = ["filesystem", "hermes-tools"]
             mig.return_value.migrated_plugins = []
@@ -161,6 +222,11 @@ class TestApply:
         cfg = {"mcp_servers": {"x": {"command": "y"}}}
         with patch.object(crs, "check_codex_binary_ok",
                           return_value=(True, "0.130.0")), \
+             patch.object(
+                 crs,
+                 "resolve_effective_runtime",
+                 return_value={"provider": "openai-codex", "api_mode": "codex_app_server"},
+             ), \
              patch("hermes_cli.codex_runtime_plugin_migration.migrate",
                    side_effect=RuntimeError("disk full")):
             r = crs.apply(cfg, "codex_app_server")
@@ -168,5 +234,3 @@ class TestApply:
         assert r.new_value == "codex_app_server"
         assert "MCP migration skipped" in r.message
         assert "disk full" in r.message
-
-

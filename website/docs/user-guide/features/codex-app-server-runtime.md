@@ -167,6 +167,8 @@ uses:
    ```
    Hermes will discover them and write `[plugins."<name>@openai-curated"]` entries to `~/.codex/config.toml` automatically.
 
+4. **(Optional) Named custom Responses provider.** `model.openai_runtime: codex_app_server` continues to support `openai` and `openai-codex`. It also supports a configured named custom provider such as `custom:proxy`, but only when Hermes resolves its effective wire mode to `codex_responses` (for example, the provider is configured with `transport: codex_responses`). Custom providers using `chat_completions` or `anthropic_messages` are not supported here. Codex app-server still reads its own `model_provider`, `model`, and auth from the user-level `~/.codex/config.toml`. Hermes' named custom configuration only selects the app-server runtime, so configure both sides to target the endpoint/model you expect. See [Custom model providers](https://developers.openai.com/codex/config-advanced) in the Codex docs (`wire_api = "responses"`).
+
 ## Enabling
 
 In a Hermes session:
@@ -177,6 +179,7 @@ In a Hermes session:
 
 That command:
 - Verifies the `codex` CLI is installed (blocks with an install hint if not).
+- Validates the effective runtime before enabling and when reporting status. `openai` and `openai-codex` remain supported; a configured named custom provider such as `custom:proxy` is accepted only when its final wire mode is `codex_responses`. Custom `chat_completions` and `anthropic_messages` configurations are rejected, so a mismatch refuses enablement instead of silently doing nothing.
 - Persists `model.openai_runtime: codex_app_server` to your config.yaml.
 - Migrates user MCP servers from `~/.hermes/config.yaml` to `~/.codex/config.toml`.
 - **Discovers and migrates installed native Codex plugins** (Linear, GitHub, Gmail, Calendar, Canva, etc.) by querying Codex's `plugin/list` RPC.
@@ -190,6 +193,8 @@ To check current state without changing anything:
 ```
 /codex-runtime
 ```
+
+This status query also validates and reports the effective runtime for the current configuration. If it does not match the requested app-server runtime, enabling is refused rather than silently becoming a no-op.
 
 You can also set it manually in `~/.hermes/config.yaml`:
 ```yaml
@@ -405,6 +410,7 @@ This runtime is **opt-in beta**. Working as of Hermes Agent 2026.5 + Codex CLI 0
 
 Known limitations:
 
+- **Named custom providers are Responses-only on this runtime.** `custom:proxy` is eligible only when Hermes' effective wire mode is `codex_responses`; custom providers using `chat_completions` or `anthropic_messages` are rejected. The Codex app-server reads `model_provider`, `model`, and auth from the user-level `~/.codex/config.toml`; Hermes does not copy the named custom endpoint/model/auth into that file, so the two configurations must be aligned manually.
 - **Hermes auth and codex auth are separate sessions.** You need both `codex login` AND `hermes auth add openai-codex` for the cleanest UX (the runtime uses codex's session for the LLM call). This is a deliberate design choice in Hermes' `_import_codex_cli_tokens` — Hermes won't share OAuth state with codex CLI to avoid clobbering each other on token refresh.
 - **`delegate_task`, `memory`, `session_search`, `todo` are unavailable on this runtime.** They need the running AIAgent context which a stateless MCP callback can't provide. Use `/codex-runtime auto` when you need these.
 - **No inline patch preview in approval prompts when codex doesn't track the changeset.** Codex's `fileChange` approval params don't always carry the changeset. Hermes caches the data from the corresponding `item/started` notification when possible, but if approval arrives before the item has streamed, the prompt falls back to whatever `reason` codex provides.

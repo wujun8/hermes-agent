@@ -62,8 +62,6 @@ class TestMaybeApplyCodexAppServerRuntime:
         )
         assert got == "codex_app_server"
 
-
-
     @pytest.mark.parametrize(
         "provider",
         [
@@ -87,6 +85,45 @@ class TestMaybeApplyCodexAppServerRuntime:
         assert got == "anthropic_messages", (
             f"provider={provider!r} should not be rerouted to codex_app_server"
         )
+
+
+@pytest.mark.parametrize(
+    ("transport", "expected_mode"),
+    [
+        ("codex_responses", "codex_app_server"),
+        ("chat_completions", "chat_completions"),
+        ("anthropic_messages", "anthropic_messages"),
+    ],
+)
+def test_named_custom_runtime_only_routes_responses_to_app_server(
+    monkeypatch, transport, expected_mode,
+) -> None:
+    """The real named-provider config path gates app-server on its final wire protocol."""
+    from hermes_cli import runtime_provider as rp
+
+    config = {
+        "model": {
+            "provider": "custom:custom-codex",
+            "default": "gpt-5.6-sol",
+            "openai_runtime": "codex_app_server",
+        },
+        "custom_providers": [
+            {
+                "name": "custom-codex",
+                "base_url": "https://relay.example.test/v1",
+                "api_key": "relay-secret",
+                "api_mode": transport,
+            },
+        ],
+    }
+    monkeypatch.setattr(rp, "load_config", lambda: config)
+    monkeypatch.setattr(rp, "load_pool", lambda _provider: None)
+
+    resolved = rp.resolve_runtime_provider()
+
+    assert resolved["requested_provider"] == "custom:custom-codex"
+    assert resolved["provider"] == "custom"
+    assert resolved["api_mode"] == expected_mode
 
 
 class TestCodexAppServerModule:
@@ -339,4 +376,3 @@ class TestSpawnEnvSecretStripping:
         monkeypatch.setenv("OPENAI_API_KEY", "sk-codex-needs-this")
         env = self._capture_spawn_env(monkeypatch)
         assert env.get("OPENAI_API_KEY") == "sk-codex-needs-this"
-

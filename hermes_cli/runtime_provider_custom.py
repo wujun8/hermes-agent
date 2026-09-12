@@ -159,12 +159,14 @@ def _match_legacy_custom_provider(requested_norm: str, custom_providers) -> Opti
     return None
 
 
-def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, Any]]:
+def _get_named_custom_provider(
+    requested_provider: str, *, config: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
     requested_norm = _normalize_custom_provider_name(requested_provider or "")
     if not requested_norm or requested_norm == "auto" or _shadowed_by_builtin(requested_norm):
         return None
     rp = _rp()
-    config = rp.load_config()
+    config = rp.load_config() if config is None else config
     providers = config.get("providers")
     found = _match_new_style_provider(requested_norm, providers) if isinstance(providers, dict) else None
     if found:
@@ -408,6 +410,15 @@ def _custom_runtime(rp, base_url: str, api_key: Any, api_mode: Optional[str], **
                        api_key or "no-key-required", **extra)
 
 
+def _apply_named_custom_codex_runtime(rp, result: Dict[str, Any], model_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Route an opted-in Responses-compatible named custom provider through Codex app-server."""
+    result["api_mode"] = rp._maybe_apply_codex_app_server_runtime(
+        provider=str(result.get("provider") or ""), api_mode=str(result.get("api_mode") or ""),
+        model_cfg=model_cfg, allow_custom=True,
+    )
+    return result
+
+
 def _resolve_direct_alias_runtime(requested_provider: str, explicit_api_key: Optional[str],
                                   explicit_base_url: str) -> Dict[str, Any]:
     """Bare ``custom`` + explicit base_url (e.g. a ``model_aliases:`` direct alias)."""
@@ -446,11 +457,14 @@ def _opencode_family_for_custom(requested_provider: str, base_url: str) -> Optio
 
 def _resolve_named_custom_runtime(*, requested_provider: str, explicit_api_key: Optional[str] = None,
                                   explicit_base_url: Optional[str] = None,
-                                  target_model: Optional[str] = None) -> Optional[Dict[str, Any]]:
+                                  target_model: Optional[str] = None,
+                                  config: Optional[Dict[str, Any]] = None,
+                                  model_cfg: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
     """Runtime for a llamacpp alias, a bare-custom direct alias, or a configured custom entry.
     Aliases resolving to "custom" (ollama, vllm, llamacpp, …) are treated like bare ``custom``. A
     llamacpp alias with no explicit base_url resolves to the managed server first; an explicit
-    base_url always wins."""
+    base_url always wins. Optional config snapshots let pre-persist validation resolve the same
+    named entry the command is about to save."""
     rp = _rp()
     # Bare `provider="custom"` with an explicit base_url (e.g. propagated from a `model_aliases:`
     # direct-alias resolution) — build a runtime directly so the alias's base_url actually takes effect.
@@ -464,9 +478,14 @@ def _resolve_named_custom_runtime(*, requested_provider: str, explicit_api_key: 
         requested_norm = "custom"
     if requested_norm == "custom" and explicit_base_url:
         return _resolve_direct_alias_runtime(requested_provider, explicit_api_key, explicit_base_url)
-    custom_provider = rp._get_named_custom_provider(requested_provider)
+    custom_provider = (
+        rp._get_named_custom_provider(requested_provider)
+        if config is None
+        else rp._get_named_custom_provider(requested_provider, config=config)
+    )
     if not custom_provider:
         return None
+    resolved_model_cfg = model_cfg if isinstance(model_cfg, dict) else rp._get_model_config()
     base_url = ((explicit_base_url or "").strip() or custom_provider.get("base_url", "")).rstrip("/")
     if not base_url:
         return None
@@ -477,7 +496,7 @@ def _resolve_named_custom_runtime(*, requested_provider: str, explicit_api_key: 
     if pool_result:
         # The pool doesn't know the custom_providers fields — propagate them here too.
         _apply_custom_provider_extras(custom_provider, target_model, pool_result)
-        return pool_result
+        return _apply_named_custom_codex_runtime(rp, pool_result, resolved_model_cfg)
     explicit_key = (explicit_api_key or "").strip()
     candidates = [
         explicit_key,
@@ -505,8 +524,8 @@ def _resolve_named_custom_runtime(*, requested_provider: str, explicit_api_key: 
     family = _opencode_family_for_custom(requested_provider, base_url)
     if family is not None and not custom_provider.get("api_mode"):
         from hermes_cli.models import normalize_opencode_base_url, opencode_model_api_mode
-        effective_model = str(target_model or custom_provider.get("model") or rp._get_model_config().get("default") or "").strip()
+        effective_model = str(target_model or custom_provider.get("model") or resolved_model_cfg.get("default") or "").strip()
         if effective_model:
             result["api_mode"] = opencode_model_api_mode(family, effective_model)
         result["base_url"] = normalize_opencode_base_url(family, result["api_mode"], result["base_url"])
-    return result
+    return _apply_named_custom_codex_runtime(rp, result, resolved_model_cfg)
