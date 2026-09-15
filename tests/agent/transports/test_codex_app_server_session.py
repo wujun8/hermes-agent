@@ -210,6 +210,77 @@ class TestRunTurn:
         assert r.turn_id == "turn-fake-001"
 
 
+    @pytest.mark.parametrize("turn_timeout", [None, 0, -1])
+    def test_unlimited_turn_timeout_waits_past_1800_seconds(self, turn_timeout):
+        """None and non-positive values do not impose an overall turn deadline."""
+        client = FakeClient()
+        client.queue_notification(
+            "item/completed",
+            item={"type": "agentMessage", "id": "m1", "text": "done"},
+            threadId="t", turnId="tu1",
+        )
+        client.queue_notification(
+            "turn/completed", threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        original_take_notification = client.take_notification
+        clock = {"now": 0.0}
+        release_at = 1801.0
+
+        def delay_notifications(timeout=0.0):
+            if clock["now"] < release_at:
+                clock["now"] += 600.0
+                return None
+            return original_take_notification(timeout)
+
+        client.take_notification = delay_notifications
+        with patch.object(session_mod.time, "monotonic", side_effect=lambda: clock["now"]):
+            result = make_session(client).run_turn(
+                "long task", turn_timeout=turn_timeout, notification_poll_timeout=0.0,
+            )
+
+        assert clock["now"] > 1800.0
+        assert result.final_text == "done"
+        assert result.interrupted is False
+        assert result.error is None
+        assert result.should_retire is False
+        assert not any(method == "turn/interrupt" for method, _ in client.requests)
+
+    def test_default_turn_timeout_is_unlimited(self):
+        """A future caller cannot accidentally restore the old implicit deadline."""
+        client = FakeClient()
+        client.queue_notification(
+            "item/completed",
+            item={"type": "agentMessage", "id": "m1", "text": "done"},
+            threadId="t", turnId="tu1",
+        )
+        client.queue_notification(
+            "turn/completed", threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        original_take_notification = client.take_notification
+        clock = {"now": 0.0}
+
+        def delay_notifications(timeout=0.0):
+            if clock["now"] <= 1800.0:
+                clock["now"] += 600.0
+                return None
+            return original_take_notification(timeout)
+
+        client.take_notification = delay_notifications
+        with patch.object(session_mod.time, "monotonic", side_effect=lambda: clock["now"]):
+            result = make_session(client).run_turn(
+                "long task", notification_poll_timeout=0.0,
+            )
+
+        assert clock["now"] > 1800.0
+        assert result.final_text == "done"
+        assert result.interrupted is False
+        assert result.error is None
+        assert result.should_retire is False
+        assert not any(method == "turn/interrupt" for method, _ in client.requests)
+
+
 
     def test_result_records_the_exact_submitted_input(self):
         client = FakeClient()
@@ -292,6 +363,38 @@ class TestRunTurn:
         assert result.projected_messages == [
             {"role": "assistant", "content": "parent after approval"}
         ]
+
+    def test_current_completion_in_server_request_drain_finishes_turn(self):
+        """The approval-first queue must not consume and lose this turn's completion."""
+        client = FakeClient()
+        client.queue_server_request(
+            "item/commandExecution/requestApproval",
+            request_id="approval-current",
+            command="pwd",
+            cwd="/tmp",
+        )
+        client.queue_notification(
+            "item/completed",
+            threadId="t",
+            turnId="tu1",
+            item={"type": "agentMessage", "id": "parent", "text": "done", "phase": "final_answer"},
+        )
+        client.queue_notification(
+            "turn/completed",
+            threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+
+        result = make_session(
+            client,
+            request_routing=_ServerRequestRouting(auto_approve_exec=True),
+        ).run_turn("finish while approval is queued", turn_timeout=0.05)
+
+        assert client.responses == [("approval-current", {"decision": "accept"})]
+        assert result.final_text == "done"
+        assert result.interrupted is False
+        assert result.error is None
+        assert not any(method == "turn/interrupt" for method, _ in client.requests)
 
 
 
@@ -719,11 +822,18 @@ class TestSessionRetirement:
 
 
 
-    def test_final_agent_message_without_turn_completed_is_recovered(self):
-        """A completed assistant item is still a usable terminal response when
-        codex omits turn/completed and then goes quiet.
+    @pytest.mark.parametrize("prior_phase", ["commentary", "final_answer"])
+    def test_final_agent_message_without_turn_completed_is_recovered(self, prior_phase):
+        """An unphased assistant item remains a legacy fallback even after
+        an explicitly phased agent message.
         """
         client = FakeClient()
+        client.queue_notification(
+            "item/completed",
+            item={"type": "agentMessage", "id": "m0", "text": "older", "phase": prior_phase},
+            threadId="t",
+            turnId="tu1",
+        )
         client.queue_notification(
             "item/completed",
             item={"type": "agentMessage", "id": "m1", "text": "done"},
@@ -745,6 +855,207 @@ class TestSessionRetirement:
             for msg in r.projected_messages
         )
         assert not any(method == "turn/interrupt" for method, _ in client.requests)
+
+    def test_final_answer_grace_returns_early_but_commentary_still_times_out(self, caplog):
+        """Only phase=final_answer may complete during the short drain window."""
+        final_client = FakeClient()
+        final_client.queue_notification(
+            "item/completed",
+            item={"type": "agentMessage", "id": "m1", "text": "done", "phase": "final_answer"},
+            threadId="t", turnId="tu1",
+        )
+        final_client.queue_notification(
+            "thread/tokenUsage/updated",
+            threadId="t", turnId="tu1",
+            tokenUsage={
+                "last": {"inputTokens": 10, "outputTokens": 2, "totalTokens": 12},
+                "modelContextWindow": 200000,
+            },
+        )
+        final_clock = {"now": 100.0}
+
+        def final_monotonic():
+            final_clock["now"] += 0.02
+            return final_clock["now"]
+
+        with patch.object(session_mod, "_FINAL_ANSWER_GRACE_SECONDS", 0.02):
+            with patch.object(session_mod.time, "monotonic", side_effect=final_monotonic):
+                final_result = make_session(final_client).run_turn(
+                    "hi", turn_timeout=600.0, notification_poll_timeout=0.0,
+                )
+        assert final_result.final_text == "done"
+        assert final_result.interrupted is False
+        assert final_result.error is None
+        assert final_result.should_retire is False
+        assert final_result.token_usage_last["totalTokens"] == 12
+        assert final_clock["now"] - 100.0 < 600.0
+        assert not any(method == "turn/interrupt" for method, _ in final_client.requests)
+        assert any("received phase=final_answer" in record.message for record in caplog.records)
+        assert not any("turn reached deadline" in record.message for record in caplog.records)
+
+        commentary_client = FakeClient()
+        commentary_client.queue_notification(
+            "item/completed",
+            item={"type": "agentMessage", "id": "m2", "text": "still working", "phase": "commentary"},
+            threadId="t", turnId="tu1",
+        )
+        commentary_clock = {"now": 200.0}
+
+        def commentary_monotonic():
+            commentary_clock["now"] += 0.05
+            return commentary_clock["now"]
+
+        with patch.object(session_mod, "_FINAL_ANSWER_GRACE_SECONDS", 0.02):
+            with patch.object(session_mod.time, "monotonic", side_effect=commentary_monotonic):
+                commentary_result = make_session(commentary_client).run_turn(
+                    "hi", turn_timeout=0.1, notification_poll_timeout=0.0,
+                )
+        assert commentary_result.final_text == ""
+        assert commentary_result.interrupted is True
+        assert commentary_result.should_retire is True
+        assert commentary_result.error and "timed out" in commentary_result.error
+        assert any(method == "turn/interrupt" for method, _ in commentary_client.requests)
+
+    def test_final_answer_candidate_is_cleared_by_later_item(self):
+        client = FakeClient()
+        client.queue_notification(
+            "item/completed",
+            item={"type": "agentMessage", "id": "m1", "text": "stale", "phase": "final_answer"},
+            threadId="t", turnId="tu1",
+        )
+        client.queue_notification(
+            "item/completed",
+            item={"type": "reasoning", "id": "r1", "summary": ["resumed"]},
+            threadId="t", turnId="tu1",
+        )
+        clock = {"now": 300.0}
+
+        def monotonic():
+            clock["now"] += 0.05
+            return clock["now"]
+
+        with patch.object(session_mod, "_FINAL_ANSWER_GRACE_SECONDS", 0.02):
+            with patch.object(session_mod.time, "monotonic", side_effect=monotonic):
+                result = make_session(client).run_turn(
+                    "hi", turn_timeout=0.2, notification_poll_timeout=0.0,
+                )
+
+        assert result.final_text == ""
+        assert result.interrupted is True
+        assert result.should_retire is True
+        assert result.error and "timed out" in result.error
+
+    def test_final_answer_candidate_is_cleared_by_later_server_request(self):
+        client = FakeClient()
+        client.queue_notification(
+            "item/completed",
+            item={"type": "agentMessage", "id": "m1", "text": "stale", "phase": "final_answer"},
+            threadId="t", turnId="tu1",
+        )
+        original_take_notification = client.take_notification
+
+        def queue_request_after_final(timeout=0.0):
+            note = original_take_notification(timeout)
+            if note is not None:
+                client.queue_server_request("totally/unknown", request_id="late-request")
+            return note
+
+        client.take_notification = queue_request_after_final
+        clock = {"now": 400.0}
+
+        def monotonic():
+            clock["now"] += 0.05
+            return clock["now"]
+
+        with patch.object(session_mod, "_FINAL_ANSWER_GRACE_SECONDS", 0.02):
+            with patch.object(session_mod.time, "monotonic", side_effect=monotonic):
+                result = make_session(client).run_turn(
+                    "hi", turn_timeout=0.2, notification_poll_timeout=0.0,
+                )
+
+        assert result.final_text == ""
+        assert result.interrupted is True
+        assert result.should_retire is True
+        assert [(request_id, code) for request_id, code, _ in client.error_responses] == [
+            ("late-request", -32601)
+        ]
+
+    def test_foreign_server_request_does_not_clear_final_answer_candidate(self):
+        client = FakeClient()
+        client.queue_notification(
+            "item/completed",
+            item={"type": "agentMessage", "id": "m1", "text": "done", "phase": "final_answer"},
+            threadId="t", turnId="tu1",
+        )
+        original_take_notification = client.take_notification
+
+        def queue_foreign_request_after_final(timeout=0.0):
+            note = original_take_notification(timeout)
+            if note is not None:
+                client.queue_server_request(
+                    "totally/unknown",
+                    request_id="foreign-request",
+                    threadId="thread-child-001",
+                    turnId="turn-child-001",
+                )
+            return note
+
+        client.take_notification = queue_foreign_request_after_final
+        clock = {"now": 450.0}
+
+        def monotonic():
+            clock["now"] += 0.02
+            return clock["now"]
+
+        with patch.object(session_mod, "_FINAL_ANSWER_GRACE_SECONDS", 0.02):
+            with patch.object(session_mod.time, "monotonic", side_effect=monotonic):
+                result = make_session(client).run_turn(
+                    "hi", turn_timeout=2.0, notification_poll_timeout=0.0,
+                )
+
+        assert result.final_text == "done"
+        assert result.interrupted is False
+        assert result.error is None
+        assert [(request_id, code) for request_id, code, _ in client.error_responses] == [
+            ("foreign-request", -32601)
+        ]
+
+    def test_foreign_notification_cannot_trigger_final_answer_grace(self):
+        client = FakeClient()
+        client.queue_notification(
+            "item/completed",
+            item={"type": "agentMessage", "id": "m1", "text": "done", "phase": "final_answer"},
+            threadId="t", turnId="tu1",
+        )
+        client.queue_notification(
+            "item/completed",
+            item={"type": "reasoning", "id": "child", "summary": ["child"]},
+            threadId="thread-child-001", turnId="turn-child-001",
+        )
+        client.queue_notification(
+            "thread/tokenUsage/updated",
+            threadId="t", turnId="tu1",
+            tokenUsage={"last": {"totalTokens": 33}},
+        )
+        client.queue_notification(
+            "turn/completed", threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        clock = {"now": 500.0}
+
+        def monotonic():
+            clock["now"] += 0.05
+            return clock["now"]
+
+        with patch.object(session_mod, "_FINAL_ANSWER_GRACE_SECONDS", 0.02):
+            with patch.object(session_mod.time, "monotonic", side_effect=monotonic):
+                result = make_session(client).run_turn(
+                    "hi", turn_timeout=2.0, notification_poll_timeout=0.0,
+                )
+
+        assert result.final_text == "done"
+        assert result.token_usage_last["totalTokens"] == 33
+        assert result.interrupted is False
 
 
     def test_post_tool_watchdog_uses_monotonic_clock(self):
@@ -794,7 +1105,6 @@ class TestSessionRetirement:
         client.queue_notification(
             "item/completed",
             item={"type": "agentMessage", "id": "m1", "text": "tool finished"},
-            threadId="t", turnId="tu1",
         )
         client.queue_notification(
             "turn/completed", threadId="t",
@@ -812,6 +1122,113 @@ class TestSessionRetirement:
         assert r.final_text == "tool finished"
         assert r.should_retire is False
         assert r.interrupted is False
+
+
+    def test_post_tool_watchdog_processes_queued_reasoning_at_quiet_timeout(self):
+        """Queued empty-projection reasoning still counts as activity at the boundary."""
+        client = FakeClient()
+        post_tool_quiet_timeout = 0.05
+        client.queue_notification(
+            "item/completed",
+            item={
+                "type": "commandExecution", "id": "ex1",
+                "command": "echo hi", "cwd": "/tmp",
+                "status": "completed", "aggregatedOutput": "hi",
+                "exitCode": 0, "commandActions": [],
+            },
+            threadId="t", turnId="tu1",
+        )
+        client.queue_notification(
+            "item/completed",
+            item={"type": "reasoning", "id": "r1", "summary": ["thinking"]},
+            threadId="t", turnId="tu1",
+        )
+        client.queue_notification(
+            "item/completed",
+            item={"type": "agentMessage", "id": "m1", "text": "done"},
+            threadId="t", turnId="tu1",
+        )
+        client.queue_notification(
+            "turn/completed", threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+
+        clock = {"now": 100.0}
+        monotonic_calls = 0
+
+        def monotonic_clock():
+            nonlocal monotonic_calls
+            monotonic_calls += 1
+            # Cross the quiet boundary on the loop check immediately after the
+            # tool completion, while reasoning remains queued.
+            if monotonic_calls == 4:
+                clock["now"] += post_tool_quiet_timeout + 0.1
+            return clock["now"]
+
+        s = make_session(client)
+        with patch.object(session_mod.time, "monotonic", side_effect=monotonic_clock):
+            r = s.run_turn(
+                "tool then reason", turn_timeout=2.0,
+                notification_poll_timeout=0.01,
+                post_tool_quiet_timeout=post_tool_quiet_timeout,
+            )
+
+        assert clock["now"] > 100.0 + post_tool_quiet_timeout
+        assert r.tool_iterations == 1
+        assert r.final_text == "done"
+        assert r.should_retire is False
+        assert r.interrupted is False
+        assert not any(method == "turn/interrupt" for method, _ in client.requests)
+
+
+    def test_post_tool_watchdog_ignores_foreign_activity_during_silence(self):
+        """A continuous foreign stream must not keep the parent turn alive."""
+        client = FakeClient()
+        client.queue_notification(
+            "item/completed",
+            item={
+                "type": "commandExecution", "id": "ex1",
+                "command": "echo hi", "cwd": "/tmp",
+                "status": "completed", "aggregatedOutput": "hi",
+                "exitCode": 0, "commandActions": [],
+            },
+            threadId="t", turnId="tu1",
+        )
+        client.queue_notification(
+            "item/completed",
+            item={"type": "agentMessage", "id": "child-message", "text": "child still working"},
+            threadId="thread-child-001", turnId="turn-child-001",
+        )
+
+        take_notification = client.take_notification
+
+        def take_and_requeue_foreign(timeout=0.0):
+            note = take_notification(timeout)
+            if note and (note.get("params") or {}).get("threadId") == "thread-child-001":
+                client._notifications.append(note)
+            return note
+
+        client.take_notification = take_and_requeue_foreign
+
+        clock = {"now": 100.0}
+
+        def monotonic_clock():
+            clock["now"] += 0.01
+            return clock["now"]
+
+        s = make_session(client)
+        with patch.object(session_mod.time, "monotonic", side_effect=monotonic_clock):
+            r = s.run_turn(
+                "tool then foreign silence", turn_timeout=2.0,
+                notification_poll_timeout=0.0,
+                post_tool_quiet_timeout=0.05,
+            )
+
+        assert r.interrupted is True
+        assert r.should_retire is True
+        assert r.error and "silent" in r.error
+        assert r.final_text == ""
+        assert not any(msg.get("content") == "child still working" for msg in r.projected_messages)
 
 
 
@@ -910,4 +1327,3 @@ class TestClassifyOAuthFailure:
         assert _classify_oauth_failure() is None
         assert _classify_oauth_failure("") is None
         assert _classify_oauth_failure("", None) is None  # type: ignore[arg-type]
-

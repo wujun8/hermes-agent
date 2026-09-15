@@ -4313,6 +4313,7 @@ class GatewayRunner(
         ("compression", "proactive_prune_min_result_chars"),
         ("compression", "proactive_prune_min_reclaim_tokens"),
         ("compression", "min_tail_user_messages"), ("agent", "disabled_toolsets"),
+        ("agent", "codex_app_server_turn_timeout_seconds"),
         ("memory", "provider"), ("checkpoints", "enabled"), ("checkpoints", "max_snapshots"),
         ("checkpoints", "max_total_size_mb"), ("checkpoints", "max_file_size_mb"))
 

@@ -104,6 +104,28 @@ class TestCommandExecutionProjection:
 class TestAgentMessageProjection:
     """assistant text → final_text + assistant message."""
 
+    @pytest.mark.parametrize(
+        ("raw_phase", "expected_phase", "expected_final_text", "expected_terminal"),
+        [
+            ("commentary", "commentary", None, False),
+            (" FINAL_ANSWER ", "final_answer", "hi there", True),
+            ("future_phase", "future_phase", None, False),
+        ],
+    )
+    def test_agent_message_phase_controls_terminal_projection(
+        self, raw_phase, expected_phase, expected_final_text, expected_terminal
+    ) -> None:
+        r = CodexEventProjector().project({
+            "method": "item/completed",
+            "params": {"item": {"type": "agentMessage", "id": "x",
+                                "text": "hi there", "phase": raw_phase}},
+        })
+        assert r.phase == expected_phase
+        assert r.final_text == expected_final_text
+        assert r.is_agent_message is True
+        assert r.terminal is expected_terminal
+        assert r.messages == [{"role": "assistant", "content": "hi there"}]
+
     def test_agent_message_projects_to_assistant(self) -> None:
         p = CodexEventProjector()
         r = p.project({

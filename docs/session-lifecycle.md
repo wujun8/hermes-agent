@@ -593,7 +593,8 @@ conversation boundaries and shutdown.
 | `thread_sessions_per_user` | `bool` | `false` | Isolate thread sessions per user |
 | `session_store_max_age_days` | `int` | `0` | Prune sessions older than N days (0=disabled) |
 | `agent.gateway_auto_continue_freshness` | `int` | `3600` | Seconds for resume freshness window |
-| `agent.gateway_timeout` | `int` | `1800` | Agent turn timeout (30 min default) |
+| `agent.gateway_timeout` | `int` | `1800` | Inactivity timeout: cancel a run only after no agent progress (30 min default) |
+| `agent.codex_app_server_turn_timeout_seconds` | `number`/`null` | `null` (disabled) | Optional wall-clock hard limit for an entire Codex app-server agentic turn; positive seconds enable it |
 | `agent.agent_cache.max_size` | `int` | `128` | LRU entry cap on cached AIAgents |
 | `agent.agent_cache.idle_ttl_secs` | `int` | `3600` | Evict agents idle this long |
 | `agent.agent_cache.memory_high_mb` | `int`/`str` | `auto` | Anon-RSS budget above which LRU transcripts are shed |

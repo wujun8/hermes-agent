@@ -284,9 +284,9 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
 
     Tool items fire ``tool_progress_callback`` plus the stable-ID ``tool_start_callback`` /
     ``tool_complete_callback`` card hooks; deltas go to ``_fire_stream_delta`` / ``_fire_reasoning_delta``;
-    a completed agentMessage goes to ``_emit_interim_assistant_message`` (the gateway's ``already_streamed``
-    check dedupes against streamed deltas). Every callback is guarded so a buggy display hook cannot
-    tear down the turn loop."""
+    a completed non-final agentMessage goes to ``_emit_interim_assistant_message`` (the gateway's
+    ``already_streamed`` check dedupes against streamed deltas). Every callback is guarded so a buggy
+    display hook cannot tear down the turn loop."""
     # item_id -> (tool_name, args, started_monotonic); duration even when codex omits durationMs.
     started: dict[str, tuple[str, dict, float]] = {}
 
@@ -330,6 +330,12 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
 
     def _fire_agent_message_completed(item: dict) -> None:
         text = item.get("text") or ""
+        raw_phase = item.get("phase")
+        phase = raw_phase.strip().lower() if isinstance(raw_phase, str) else None
+        # The final response has its own caller-visible delivery path. Sending
+        # it here would misclassify it as commentary and can duplicate it.
+        if phase == "final_answer":
+            return
         # display.show_commentary=false keeps mid-turn narration off the interim path too (codex_responses contract).
         if isinstance(text, str) and text.strip() and getattr(agent, "show_commentary", True):
             agent_cb("_emit_interim_assistant_message", "_emit_interim_assistant_message raised",
@@ -352,6 +358,9 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
     }
 
     def on_event(note: dict) -> None:
+        method = (note.get("method") or "") if isinstance(note, dict) else ""
+        agent_cb("_touch_activity", "_touch_activity raised for Codex app-server event",
+                 args=(f"codex app-server event: {method or 'notification'}",))
         handler = handlers.get(note.get("method") or "") if isinstance(note, dict) else None
         if handler is not None:
             params = note.get("params")
@@ -398,6 +407,7 @@ def _ensure_codex_session(agent) -> None:
         auto_approve_requests = is_approval_bypass_active()
     except Exception:
         logger.debug("codex app-server: approval-bypass lookup failed; keeping fail-closed default", exc_info=True)
+
     # Bridge codex JSON-RPC notifications (item/started, item/completed, item/agentMessage/delta, ...) into
     # Hermes' gateway UI callbacks (tool_progress_callback, _fire_stream_delta,
     # _emit_interim_assistant_message). Without this, Discord/Telegram users see no live tool-progress or
@@ -478,8 +488,14 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
         raise _checkpoint_blocked("codex_app_server owns the authoritative thread and compacts it "
                                   "without a truthful pre-compaction transcript boundary")
     _ensure_codex_session(agent)
+    # ``HERMES_API_TIMEOUT`` is the per-request timeout used by the ordinary
+    # HTTP transports.  An app-server turn is an agentic workflow containing
+    # many requests/tools, so it must not inherit that value as a wall-clock
+    # cap.  The dedicated config is opt-in; ``None`` means the app-server may
+    # run until it reports completion or a real liveness/interrupt guard fires.
+    turn_timeout = getattr(agent, "codex_app_server_turn_timeout_seconds", None)
     try:
-        turn = agent._codex_session.run_turn(user_input=user_message)
+        turn = agent._codex_session.run_turn(user_input=user_message, turn_timeout=turn_timeout)
     except Exception as exc:
         logger.exception("codex app-server turn failed")
         _close_codex_session(agent)

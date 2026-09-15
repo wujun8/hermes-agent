@@ -36,7 +36,13 @@ class ProjectionResult:
 
     messages: list[dict] = field(default_factory=list)
     is_tool_iteration: bool = False
-    final_text: Optional[str] = None  # Set when an agentMessage completes
+    final_text: Optional[str] = None  # Usable terminal candidate from an agentMessage
+    is_agent_message: bool = False
+    # Codex 0.154+ distinguishes progress text from the terminal answer.  Keep
+    # the phase internal to the transport so older unphased messages retain
+    # their legacy final_text behavior.
+    phase: Optional[str] = None
+    terminal: bool = False
 
 
 class CodexEventProjector:
@@ -75,7 +81,15 @@ class CodexEventProjector:
 
     def _project_agent_message(self, item: dict) -> ProjectionResult:
         text = item.get("text") or ""
-        return ProjectionResult(messages=[self._assistant_message(text)], final_text=text)
+        raw_phase = item.get("phase")
+        phase = raw_phase.strip().lower() if isinstance(raw_phase, str) else None
+        return ProjectionResult(
+            messages=[self._assistant_message(text)],
+            final_text=text if phase is None or phase == "final_answer" else None,
+            is_agent_message=True,
+            phase=phase,
+            terminal=phase == "final_answer",
+        )
 
     @staticmethod
     def _project_user_message(item: dict) -> ProjectionResult:

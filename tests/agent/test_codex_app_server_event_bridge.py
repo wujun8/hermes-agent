@@ -39,6 +39,7 @@ def _make_stub_agent() -> SimpleNamespace:
         _emit_interim_assistant_message=MagicMock(
             name="_emit_interim_assistant_message"
         ),
+        _touch_activity=MagicMock(name="_touch_activity"),
     )
 
 
@@ -155,6 +156,14 @@ class TestCodexItemCompletionPayload:
 
 
 class TestStreamDeltaDispatch:
+    def test_app_server_event_refreshes_turn_activity(self):
+        agent = _make_stub_agent()
+        bridge = make_codex_app_server_event_bridge(agent)
+        bridge({"method": "item/reasoning/delta", "params": {"delta": "thinking..."}})
+        agent._touch_activity.assert_called_once_with(
+            "codex app-server event: item/reasoning/delta"
+        )
+
     def test_agent_message_delta_fires_stream_delta(self):
         agent = _make_stub_agent()
         bridge = make_codex_app_server_event_bridge(agent)
@@ -260,6 +269,30 @@ class TestAgentMessageInterimDispatch:
         }))
         agent._emit_interim_assistant_message.assert_called_once_with(
             {"role": "assistant", "content": "I'll check the config first."}
+        )
+
+    def test_completed_final_answer_is_not_emitted_as_interim(self):
+        agent = _make_stub_agent()
+        bridge = make_codex_app_server_event_bridge(agent)
+        bridge(_item_completed({
+            "type": "agentMessage",
+            "id": "am-final",
+            "text": "The task is complete.",
+            "phase": " FINAL_ANSWER ",
+        }))
+        agent._emit_interim_assistant_message.assert_not_called()
+
+    def test_completed_commentary_still_emits_interim(self):
+        agent = _make_stub_agent()
+        bridge = make_codex_app_server_event_bridge(agent)
+        bridge(_item_completed({
+            "type": "agentMessage",
+            "id": "am-commentary",
+            "text": "Still checking.",
+            "phase": "commentary",
+        }))
+        agent._emit_interim_assistant_message.assert_called_once_with(
+            {"role": "assistant", "content": "Still checking."}
         )
 
 
@@ -387,6 +420,10 @@ class TestBridgeWiredInRuntime:
         )
         assert callable(captured["on_event"]), (
             "on_event must be the bridge callable, not None or a sentinel"
+        )
+        assert "on_activity" not in captured, (
+            "a synthetic wait heartbeat would make a completely silent app-server "
+            "look like real progress to Hermes' liveness watchdog"
         )
 
         # And the bridge must actually drive the agent's callbacks when

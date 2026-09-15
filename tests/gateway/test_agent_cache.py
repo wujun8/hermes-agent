@@ -143,6 +143,32 @@ class TestAgentConfigSignature:
         assert sig_a == sig_b
 
 
+    def test_codex_app_server_turn_timeout_change_busts_cache(self):
+        """The construction-time Codex turn timeout must invalidate cached agents."""
+        from gateway.run import GatewayRunner
+
+        runtime = {"api_key": "k", "base_url": "u", "provider": "p"}
+
+        def signature(timeout):
+            cache_keys = GatewayRunner._extract_cache_busting_config(
+                {"agent": {"codex_app_server_turn_timeout_seconds": timeout}}
+            )
+            assert cache_keys["agent.codex_app_server_turn_timeout_seconds"] == timeout
+            return GatewayRunner._agent_config_signature(
+                "m", runtime, [], "", cache_keys=cache_keys,
+            )
+
+        disabled = signature(None)
+        enabled = signature(900)
+        changed = signature(1800)
+        re_disabled = signature(None)
+
+        assert disabled != enabled
+        assert enabled != changed
+        assert changed != re_disabled
+        assert disabled == re_disabled
+
+
 class TestExtractCacheBustingConfig:
     """Verify _extract_cache_busting_config pulls the documented subset of
     config values that must invalidate the cached agent on change."""

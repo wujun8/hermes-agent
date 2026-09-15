@@ -150,6 +150,8 @@ You can also set `providers.<id>.stale_timeout_seconds` for the non-streaming st
 
 Leaving these unset keeps the legacy defaults (`HERMES_API_TIMEOUT=1800`s, `HERMES_API_CALL_STALE_TIMEOUT=90`s, native Anthropic 900s). The non-streaming stale detector is auto-disabled for local endpoints when left implicit and can scale upward for very large contexts. Not currently wired for AWS Bedrock (both `bedrock_converse` and AnthropicBedrock SDK paths use boto3 with its own timeout configuration). See the commented example in [`cli-config.yaml.example`](https://github.com/NousResearch/hermes-agent/blob/main/cli-config.yaml.example).
 
+The optional Codex app-server runtime has a separate whole-turn wall-clock hard limit: `agent.codex_app_server_turn_timeout_seconds`. It defaults to `null` (disabled); set a positive number of seconds to enable it. The limit covers the entire agentic turn, including its model requests and tool calls, so a long-running task that keeps making progress can exceed 1800 seconds when this limit is disabled. `providers.<id>.request_timeout_seconds` and the legacy `HERMES_API_TIMEOUT` remain per-request timeouts only; they do not cap an app-server turn.
+
 ### API Retry Status
 
 Hermes retries transient API failures according to `agent.api_max_retries` and normally buffers retry/fallback status messages unless all recovery attempts fail. To display every retry status immediately while the request is still running, enable:
@@ -1140,7 +1142,7 @@ The gateway runs a notify-only stall watchdog (`agent.session_stall_timeout`, de
 
 Semantics:
 
-- **Notify-only.** The watchdog never kills the turn — contrast `agent.gateway_timeout`, which cancels a run after prolonged inactivity. The stall notice just tells you the agent looks wedged so you can decide (`/new`, `/stop`, or keep waiting).
+- **Notify-only.** The watchdog never kills the turn — contrast `agent.gateway_timeout`, an inactivity timeout that cancels a run only after prolonged inactivity. It is not a whole-turn wall-clock limit: active tool calls and API progress keep the run alive. The stall notice just tells you the agent looks wedged so you can decide (`/new`, `/stop`, or keep waiting).
 - **One notification per stall episode.** The latch clears when the pending inbound drains or activity resumes, so a session that recovers and stalls again notifies again.
 - Progress comes only from the shared activity snapshot (tool calls, API stream progress, compression heartbeats). Pending inbound is a notify gate, not a progress clock.
 
@@ -1288,7 +1290,8 @@ Hermes has separate timeout layers for streaming, plus a stale detector for non-
 | Socket read timeout | 120s | Auto-raised to 1800s | `HERMES_STREAM_READ_TIMEOUT` |
 | Stale stream detection | 180s | Raised to a 900s ceiling (`agent.local_stream_stale_timeout`) | `HERMES_STREAM_STALE_TIMEOUT` |
 | Stale non-stream detection | 90s | Auto-disabled when left implicit | `providers.<id>.stale_timeout_seconds` or `HERMES_API_CALL_STALE_TIMEOUT` |
-| API call (non-streaming) | 1800s | Unchanged | `providers.<id>.request_timeout_seconds` / `timeout_seconds` or `HERMES_API_TIMEOUT` |
+| API call (non-streaming; per request) | 1800s | Unchanged | `providers.<id>.request_timeout_seconds` / `timeout_seconds` or `HERMES_API_TIMEOUT` |
+| Codex app-server agentic turn | disabled (`null`) | — | `agent.codex_app_server_turn_timeout_seconds` |
 
 The **socket read timeout** controls how long httpx waits for the next chunk of data from the provider. Local LLMs can take minutes for prefill on large contexts before producing the first token, so Hermes raises this to 30 minutes when it detects a local endpoint. If you explicitly set `HERMES_STREAM_READ_TIMEOUT`, that value is always used regardless of endpoint detection.
 

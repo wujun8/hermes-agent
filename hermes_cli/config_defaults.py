@@ -57,6 +57,9 @@ DEFAULT_CONFIG = {
         # elapsed; implicit provider stale timeouts capped to remaining budget. CLI equivalent:
         # `hermes chat --run-budget N`.
         "run_budget_seconds": None,
+        # Optional hard wall-clock cap (seconds) for one complete Codex app-server turn. null =
+        # disabled; only positive finite values enable it. 0 and negative values disable it.
+        "codex_app_server_turn_timeout_seconds": None,
         "api_outage_recovery": {
             "enabled": False,
             "probe_command": "",

@@ -1067,6 +1067,12 @@ agent:
   # Recommended: 20-30 for focused tasks, 50-100 for open exploration
   max_turns: 500
 
+  # Optional absolute wall-clock cap (seconds) for a complete Codex app-server
+  # turn. Leave unset/null to disable; only positive finite values enable it.
+  # 0 and negative values disable it. This is separate from HERMES_API_TIMEOUT,
+  # which remains the per-request timeout for ordinary API transports.
+  # codex_app_server_turn_timeout_seconds: 7200
+
   # Inactivity timeout for gateway agent runs (seconds, 0 = unlimited).
   # The agent can run indefinitely when actively calling tools or receiving
   # API responses.  Only fires after the agent has been idle for this duration.

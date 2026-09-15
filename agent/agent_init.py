@@ -10,6 +10,7 @@ Symbols that tests patch on ``run_agent.*`` (``OpenAI``, ``get_tool_definitions`
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
 import sys
@@ -428,6 +429,37 @@ def _normalize_run_budget_seconds(value) -> Optional[float]:
     except (TypeError, ValueError):
         return None
     return seconds if seconds > 0 else None  # NaN compares False → None
+
+
+def _normalize_codex_app_server_turn_timeout_seconds(
+    value, *, warn_invalid: bool = False,
+) -> Optional[float]:
+    """Positive finite float or None for the optional app-server turn deadline.
+
+    ``bool`` is rejected so YAML ``true`` cannot become a one-second deadline.  A
+    non-positive finite value deliberately disables the optional deadline; malformed
+    or non-finite values also disable it and may emit a config warning.
+    """
+    if value is None:
+        return None
+    invalid = isinstance(value, bool)
+    seconds = None
+    if not invalid:
+        try:
+            seconds = float(value)
+        except (TypeError, ValueError, OverflowError):
+            invalid = True
+        else:
+            invalid = not math.isfinite(seconds)
+    if invalid:
+        if warn_invalid:
+            _ra().logger.warning(
+                "Invalid agent.codex_app_server_turn_timeout_seconds=%r; "
+                "absolute app-server turn timeout disabled",
+                value,
+            )
+        return None
+    return seconds if seconds > 0 else None
 
 
 
@@ -1430,6 +1462,15 @@ def _apply_agent_section(agent, _agent_cfg):
         agent.run_budget_seconds = _normalize_run_budget_seconds(
             _agent_section.get("run_budget_seconds")
         )
+
+    # Optional hard wall-clock cap for a complete Codex app-server turn. This is
+    # separate from HERMES_API_TIMEOUT, which remains a per-request setting.
+    agent.codex_app_server_turn_timeout_seconds = (
+        _normalize_codex_app_server_turn_timeout_seconds(
+            _agent_section.get("codex_app_server_turn_timeout_seconds"),
+            warn_invalid=True,
+        )
+    )
 
     # Empty-response guard: a malformed section falls back to schema defaults (on, $0.25).
     from agent.empty_response_guard import resolve_guard_settings
