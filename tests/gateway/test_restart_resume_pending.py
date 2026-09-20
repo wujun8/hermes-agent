@@ -801,8 +801,10 @@ async def test_api_outage_recovery_marks_then_schedules_after_turn_release():
     runner.async_session_store.mark_resume_pending = AsyncMock(
         side_effect=lambda *_args: order.append("mark")
     )
-    runner._release_running_agent_state.side_effect = lambda *_args: order.append("slot")
-    runner._release_turn_lease.side_effect = lambda *_args: order.append("lease")
+    # Upstream releases the slot with ``run_generation=`` and the lease with its own kwargs; the
+    # ordering assertion only cares that both releases happen after the resume-pending mark.
+    runner._release_running_agent_state.side_effect = lambda *_args, **_kwargs: order.append("slot")
+    runner._release_turn_lease.side_effect = lambda *_args, **_kwargs: order.append("lease")
     runner._schedule_resume_pending_sessions.side_effect = (
         lambda **_kwargs: order.append("schedule")
     )

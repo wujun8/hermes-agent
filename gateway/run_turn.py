@@ -2102,7 +2102,35 @@ class GatewayTurnMixin:
         if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
             return nullcontext()
         from gateway.run import _profile_runtime_scope
-        return _profile_runtime_scope(self._resolve_profile_home_for_source(source), {})
+        try:
+            profile_home = self._resolve_profile_home_for_source(source)
+        except Exception as exc:
+            # Delivery-side path translation only needs the producing profile's home + terminal
+            # policy; the route containment gate can refuse before startup publishes the served
+            # set (or once a profile stops being published). Fall back to the strict local
+            # resolution of this source's own profile — it still rejects non-canonical names,
+            # symlink escapes, and tombstoned homes — and skip scoping entirely if that refuses.
+            logger.debug(
+                "media delivery scope: %r fell back to strict profile resolution: %s",
+                getattr(source, "profile", None), exc)
+            profile_home = self._strict_profile_home_or_none(
+                getattr(source, "profile", None))
+            if profile_home is None:
+                return nullcontext()
+        return _profile_runtime_scope(profile_home, {})
+
+    @staticmethod
+    def _strict_profile_home_or_none(profile: object):
+        """Canonical, containment-checked home for *profile*, or None (never raises)."""
+        name = str(profile or "").strip()
+        if not name:
+            return None
+        try:
+            from hermes_cli.profiles import resolve_profile_home
+
+            return resolve_profile_home(name, require_exists=True)
+        except Exception:
+            return None
 
     def _reset_notice_session_info(self, source: SessionSource) -> str:
         """Session-info block for the auto-reset notice, resolved inside the profile serving ``source``.

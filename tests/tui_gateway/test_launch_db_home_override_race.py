@@ -54,8 +54,13 @@ def test_insights_get_reads_the_requested_profile_store_not_the_launch_handle(la
     profiles_root = tmp_path / "profiles"
     work = profiles_root / "work"
     work.mkdir(parents=True)
+    # Two resolution seams: the RPC wrapper scopes HERMES_HOME through ``get_profile_dir``, and
+    # the local resolver only serves canonical homes inside the profiles root. This test is
+    # about which DB handle ``insights.get`` opens, not about profile-name resolution.
     monkeypatch.setattr("hermes_cli.profiles.get_profile_dir", lambda name: profiles_root / name)
-    monkeypatch.setattr(server, "_canonical_profile_request", lambda name: name or None)
+    monkeypatch.setattr(
+        server, "_profile_home", lambda name: work if (name or "").strip() == "work" else None
+    )
 
     seeded = registry.acquire(work / "state.db")
     seeded.create_session("work-only", source="tui", model="m")

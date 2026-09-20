@@ -30,7 +30,10 @@ def _gateway_available_commands() -> list:
 def _gateway_menu_commands() -> list:
     """Registry entries advertised by platform command menus (config gates read once)."""
     overrides = _resolve_config_gates()
-    return [cmd for cmd in COMMAND_REGISTRY if _is_gateway_menu_advertised(cmd, overrides)]
+    # Upstream derives the menu set from the gateway-available set; the local registry keeps the
+    # extra ``advertise_in_gateway_menu`` opt-out on top of it (for example ``/micro`` stays a
+    # typed gateway command that is deliberately absent from registered platform menus).
+    return [cmd for cmd in _gateway_available_commands() if _is_gateway_menu_advertised(cmd, overrides)]
 
 
 def _requires_argument(args_hint: str) -> bool:

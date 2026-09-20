@@ -617,11 +617,22 @@ class _KanbanNotification:
 
         # Pings, artifact uploads (media policy) and the wake text (display.language) all read the
         # SUBSCRIBER profile's config; the notifier thread itself runs in the launch profile's scope.
-        async with self._owner_scope():
-            if not await self._send_pings():
-                return
-            # All text pings delivered (or skipped for non-push / wake-only).
-            self.build_wake_text()
+        from gateway.run import ProfileRouteRejectedError
+        try:
+            async with self._owner_scope():
+                if not await self._send_pings():
+                    return
+                # All text pings delivered (or skipped for non-push / wake-only).
+                self.build_wake_text()
+        except ProfileRouteRejectedError:
+            # The subscription's profile is gone or is no longer served (profile removed / route
+            # revoked between ticks). Never fall back to the launch profile's scope — the route
+            # authorizes exactly one transport, so rewind the claim and retry after the next
+            # reconcile publishes the served set.
+            logger.warning("kanban notifier: profile %r unavailable for %s; rewinding claim",
+                           self.sub_profile, self.task_id)
+            await self.rewind()
+            return
         wake_kinds, is_push = self.wake_kinds, self.is_push_adapter
         from gateway.wake import WakeNotAccepted
 
