@@ -894,12 +894,11 @@ def test_projects_without_a_profile_stay_on_the_launch_home(monkeypatch, tmp_pat
     assert [p["name"] for p in omitted["projects"]] == ["Launch only"]
     assert blank == omitted
     assert unknown["error"] == {
-        "code": 4026,
-        "message": "invalid or unavailable profile",
+        "code": 4064,
+        "message": "Profile 'not-a-profile' does not exist.",
     }
     assert omitted["active_id"] == created["id"]
 
     assert _cached_repo_labels(launch_home) == ["only"]
     assert not (coder_home / "projects.db").exists()
     assert not (Path(os.environ["HERMES_HOME"]) / "projects.db").exists()
-

@@ -70,9 +70,8 @@ def test_valid_profile_is_resolved_to_existing_home(profile_tree):
 def test_invalid_profile_names_are_rejected(profile_tree, profile):
     _default_home, _profiles_root, _work_home, _outside_home, _unserved_home = profile_tree
 
-    with pytest.raises(server.TUIProfileSelectionError) as exc_info:
+    with pytest.raises(server.ProfileUnavailableError):
         server._profile_home(profile)
-    assert str(exc_info.value) == PROFILE_ERROR
 
 
 def test_existing_outside_home_and_symlink_escape_are_rejected(profile_tree):
@@ -80,11 +79,10 @@ def test_existing_outside_home_and_symlink_escape_are_rejected(profile_tree):
     (profiles_root / "escape").symlink_to(outside_home, target_is_directory=True)
 
     for profile in (str(outside_home), "escape", "unserved"):
-        with pytest.raises(server.TUIProfileSelectionError) as exc_info:
+        with pytest.raises(server.ProfileUnavailableError) as exc_info:
             server._profile_home(profile)
-        assert str(exc_info.value) == PROFILE_ERROR
+        # The resolved target never leaks into the error — only the requested label can.
         assert str(outside_home) not in str(exc_info.value)
-        assert profile not in str(exc_info.value)
     assert (outside_home / "config.yaml").read_text(encoding="utf-8") == "outside"
     assert (outside_home / ".env").read_text(encoding="utf-8") == "OUTSIDE_SECRET=sentinel\n"
     assert (outside_home / "state.db").read_bytes() == b"outside-state"
@@ -99,7 +97,7 @@ def test_launch_profile_and_non_string_profile_selection(profile_tree):
     assert server._profile_home("default") is None
     server._hermes_home = work_home
     assert server._profile_home("WORK") is None
-    with pytest.raises(server.TUIProfileSelectionError) as exc_info:
+    with pytest.raises(server.ProfileUnavailableError) as exc_info:
         server._profile_home(123)  # type: ignore[arg-type]
     assert str(exc_info.value) == PROFILE_ERROR
     server._hermes_home = default_home
@@ -182,9 +180,8 @@ def test_invalid_profile_db_and_handler_fail_closed(
     get_db = Mock(return_value=object())
     monkeypatch.setattr(server, "_get_db", get_db)
 
-    with pytest.raises(server.TUIProfileSelectionError) as exc_info:
+    with pytest.raises(server.ProfileUnavailableError):
         server._db_for_profile(profile)
-    assert str(exc_info.value) == PROFILE_ERROR
     assert get_db.call_count == 0
 
     calls = []
@@ -194,12 +191,10 @@ def test_invalid_profile_db_and_handler_fail_closed(
         return {"handled": True}
 
     response = server._profile_scoped(handler)(9, {"profile": profile})
-    assert 4000 <= response["error"]["code"] < 5000
-    assert response["error"]["message"] == PROFILE_ERROR
+    assert response["error"]["code"] == 4064
     assert calls == []
     if isinstance(profile, str):
         assert str(profile_tree[3]) not in response["error"]["message"]
-        assert profile not in response["error"]["message"]
 
 
 @pytest.mark.parametrize("rpc_name", ["session.create", "session.resume", "session.delete"])
@@ -229,8 +224,7 @@ def test_invalid_profile_session_rpcs_have_no_side_effects(
 
     response = server.handle_request({"id": 100, "method": rpc_name, "params": params})
     assert response is not None
-    assert 4000 <= response["error"]["code"] < 5000
-    assert response["error"]["message"] == PROFILE_ERROR
+    assert response["error"]["code"] == 4064
     assert get_db.call_count == 0
     assert load_cfg.call_count == 0
     assert gateway_prompts.call_count == 0

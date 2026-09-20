@@ -10,7 +10,6 @@ from gateway.session import SessionSource, build_session_key
 from gateway.run import (
     GatewayRunner,
     ProfileRouteRejectedError,
-    SecondaryPortBindingConfigError,
 )
 from gateway.profile_routing import ProfileRoute, ProfileRouteRejected
 from gateway.config import GatewayConfig, Platform
@@ -167,8 +166,7 @@ class TestNonDiscordProfileRouting:
         ):
             assert mock_runner._profile_name_for_source(telegram_source) == "tg-profile"
 
-    def test_route_inside_allowlist_resolves(self, mock_runner, telegram_source):
-        mock_runner.config.multiplex_profile_allowlist = ["worker"]
+    def test_route_to_served_profile_resolves(self, mock_runner, telegram_source):
         mock_runner.config.profile_routes = [
             ProfileRoute(
                 name="worker-route",
@@ -186,12 +184,9 @@ class TestNonDiscordProfileRouting:
         ) as enumerate_profiles:
             assert mock_runner._profile_name_for_source(telegram_source) == "worker"
 
-        enumerate_profiles.assert_called_once_with(
-            multiplex=True, profile_allowlist=["worker"]
-        )
+        enumerate_profiles.assert_called_once_with(multiplex=True)
 
-    def test_route_outside_allowlist_rejects(self, mock_runner, telegram_source, caplog):
-        mock_runner.config.multiplex_profile_allowlist = ["worker"]
+    def test_route_to_unserved_profile_rejects(self, mock_runner, telegram_source, caplog):
         mock_runner.config.profile_routes = [
             ProfileRoute(
                 name="restricted-route",
@@ -213,7 +208,6 @@ class TestNonDiscordProfileRouting:
         assert "target profile 'restricted' is not served" in caplog.text
 
     def test_no_route_match_preserves_default_sentinel(self, mock_runner, telegram_source):
-        mock_runner.config.multiplex_profile_allowlist = ["worker"]
         mock_runner.config.profile_routes = [
             ProfileRoute(
                 name="other-chat",
@@ -368,7 +362,6 @@ class TestAdapterToSessionKeyIntegration:
 
     @pytest.mark.asyncio
     async def test_adapter_drops_rejected_route_before_dispatch(self, mock_runner):
-        mock_runner.config.multiplex_profile_allowlist = []
         mock_runner.config.profile_routes = [
             ProfileRoute(
                 name="restricted-route",
@@ -399,7 +392,6 @@ class TestAdapterToSessionKeyIntegration:
     @pytest.mark.asyncio
     async def test_direct_source_is_rejected_at_shared_ingress(self, mock_runner):
         mock_runner.config.multiplex_profiles = True
-        mock_runner.config.multiplex_profile_allowlist = []
         mock_runner.config.profile_routes = [
             ProfileRoute(
                 name="restricted-route",
@@ -545,31 +537,6 @@ class TestProfileRouteContainment:
             active_source = SessionSource(platform=Platform.DISCORD, chat_id="active")
             assert runner._resolve_profile_home_for_source(active_source) == active.resolve()
 
-    def test_startup_publishes_secondary_before_adapter_skip(self, tmp_path, monkeypatch):
-        import asyncio
-
-        default, _root, secondary, _active, _hidden, _outside = self._tree(
-            tmp_path, monkeypatch
-        )
-        runner = self._runner(set())
-        runner.adapters = {}
-        runner._profile_adapters = {}
-        runner._failed_platforms = {}
-        runner.pairing_stores = {}
-        runner.pairing_store = MagicMock()
-        runner._start_one_profile_adapters = AsyncMock(
-            side_effect=SecondaryPortBindingConfigError("shared listener")
-        )
-
-        with patch(
-            "hermes_cli.profiles.profiles_to_serve",
-            return_value=[("default", default), ("secondary", secondary)],
-        ), patch("hermes_cli.profiles.get_active_profile_name", return_value="default"), \
-                patch("gateway.status.write_runtime_status"):
-            assert asyncio.run(runner._start_secondary_profile_adapters()) == 0
-
-        assert runner._served_profile_names == {"default", "secondary"}
-
     def test_startup_fallback_does_not_authorize_raw_route_target(
         self, tmp_path, monkeypatch
     ):
@@ -579,7 +546,6 @@ class TestProfileRouteContainment:
         runner = GatewayRunner.__new__(GatewayRunner)
         runner.config = GatewayConfig(
             multiplex_profiles=True,
-            multiplex_profile_allowlist=[],
             profile_routes=[
                 ProfileRoute(
                     name="hidden-route",

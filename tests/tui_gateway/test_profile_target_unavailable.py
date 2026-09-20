@@ -26,22 +26,22 @@ def test_explicit_profile_target_never_falls_back(tmp_path, monkeypatch):
     before = (home / "config.yaml").read_bytes()
     worker.rename(worker.with_name("gone"))
     for name in ("worker", "unknown"):
-        with pytest.raises(server.TUIProfileSelectionError):
+        with pytest.raises(server.ProfileUnavailableError):
             with server._profile_db({"profile": name}):
                 pytest.fail("unavailable profile reached a database")
         response = server._methods["config.set"](
             2, {"profile": name, "key": "busy", "value": "steer"}
         )
         assert response["error"] == {
-            "code": server._TUI_PROFILE_SELECTION_RPC_CODE,
-            "message": server._TUI_PROFILE_SELECTION_MESSAGE,
+            "code": 4064,
+            "message": f"Profile '{name}' does not exist.",
         }
         assert (home / "config.yaml").read_bytes() == before
     # A real resolution I/O failure must propagate, too (no predicate patch).
     profiles = home / "profiles"
     profiles.rename(home / "saved-profiles")
     profiles.symlink_to("profiles")
-    with pytest.raises(server.TUIProfileSelectionError):
+    with pytest.raises(server.ProfileUnavailableError):
         server._profile_home("worker")
 
 
@@ -62,3 +62,44 @@ def test_custom_root_basename_target_fails_closed_when_unavailable(tmp_path, mon
     with pytest.raises(server.TUIProfileSelectionError):
         with server._profile_db({"profile": "customer-data"}):
             pass
+
+
+@pytest.mark.parametrize("name", ["..", "../outside", "../../tmp", "a/b", "a\\b", ".hidden"])
+def test_profile_param_traversal_fails_closed(tmp_path, monkeypatch, name):
+    """A traversal-shaped ``profile`` param must never resolve outside profiles/."""
+    from tui_gateway import server
+
+    home = tmp_path / ".hermes"
+    outside = tmp_path / "outside"
+    outside.mkdir(parents=True)   # a real directory the traversal could land on
+    home.mkdir()
+    (home / "config.yaml").write_text("terminal:\n  cwd: /launch\n")
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(server, "_hermes_home", home)
+
+    with pytest.raises(FileNotFoundError):
+        server._profile_home(name)
+    with pytest.raises(FileNotFoundError):
+        with server._profile_db({"profile": name}):
+            pass
+
+
+def test_unavailable_profile_is_a_typed_rpc_error_not_a_dispatch_crash(tmp_path, monkeypatch):
+    """A client still holding a deleted profile gets JSON-RPC 4064 from every profile-scoped
+    method (#107829) — the method itself keeps raising, the dispatcher chokepoint maps it."""
+    from tui_gateway import server
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text("terminal:\n  cwd: /launch\n")
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(server, "_hermes_home", home)
+
+    for method, params in (("session.create", {"profile": "gone"}),
+                           ("config.get", {"profile": "gone", "key": "full"})):
+        resp = server.handle_request({"jsonrpc": "2.0", "id": 7, "method": method, "params": params})
+        assert resp["error"]["code"] == 4064, resp
+        assert "gone" in resp["error"]["message"]
+    assert server._response_profile_name("gone") == server._current_profile_name()
