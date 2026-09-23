@@ -144,7 +144,7 @@ def _joined(result, statuses):
 def test_finite_batch_returns_success_and_child_failure(harness, outcome):
     _parent, children, dispatch = harness
     result = dispatch("completed", outcome)
-    _joined(result, ["completed", outcome])
+    _joined(result, ["completed", "failed"])
     assert "synthetic" in result["results"][1]["error"]
     assert result["results"][1]["exit_reason"] == "error"
     assert all(child.closed.is_set() for child in children)
@@ -154,9 +154,10 @@ def test_finite_batch_returns_timeout_while_child_unwinds(harness, monkeypatch):
     _parent, children, dispatch = harness
     monkeypatch.setattr(dt, "_get_child_timeout", lambda: 0.5)
     result = dispatch("completed", "slow")
-    _joined(result, ["completed", "timeout"])
+    _joined(result, ["completed", "failed"])
     assert "timed out" in result["results"][1]["error"]
-    assert result["results"][1]["exit_reason"] == "timeout"
+    assert result["results"][1]["exit_reason"] == "error"
+    assert result["results"][1]["truncated"] is False
     slow = children[1]
     assert slow.unwinding.wait(1)
     assert not slow.finished.is_set()
@@ -202,7 +203,7 @@ def test_finite_marker_overrides_api_history_continuation(harness):
                         session_history_delivery="1", async_delivery=False)
     assert sc.session_history_delivery_supported()
     result = dispatch("completed", "error")
-    _joined(result, ["completed", "error"])
+    _joined(result, ["completed", "failed"])
 
 
 @pytest.mark.parametrize("marker", [None, "0", "false"])

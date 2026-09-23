@@ -14,9 +14,11 @@ from tui_gateway import server
 
 def test_cron_manage_profile_reads_that_profiles_store(tmp_path, monkeypatch):
     # A temp profile home with one job in its cron store.
-    profile_home = tmp_path / "profiles" / "botA"
+    profile_home = tmp_path / "profiles" / "bota"
     cron_dir = profile_home / "cron"
     cron_dir.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     (cron_dir / "jobs.json").write_text(
         json.dumps(
             {

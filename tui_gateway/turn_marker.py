@@ -80,6 +80,7 @@ def record_turn_start(
     attempts: int = 0,
     resume_reason: str | None = None,
     auto_continue: bool = True,
+    notification_category: str | None = None,
 ) -> None:
     """Persist the marker for a turn that is about to run. ``attempts`` = how many auto-continues led to
     this run (0 for a user-initiated turn); the crash-loop breaker reads it back on the next resume."""
@@ -94,6 +95,8 @@ def record_turn_start(
     }
     if resume_reason:
         entry["resume_reason"] = str(resume_reason)
+    if notification_category == "diagnostic":
+        entry["notification_category"] = notification_category
     _update(home, session_key, lambda entries: {**_prune(entries, now), session_key: entry}, "record")
 
 
@@ -119,6 +122,8 @@ def read_turn_marker(home: Path | str, session_key: str) -> dict[str, Any] | Non
             "started_at": _started_at(entry),
             "resume_reason": str(entry.get("resume_reason")) if entry.get("resume_reason") else None,
             "auto_continue": bool(entry.get("auto_continue", True)),
+            **({"notification_category": "diagnostic"}
+               if entry.get("notification_category") == "diagnostic" else {}),
         }
     except Exception:
         return None

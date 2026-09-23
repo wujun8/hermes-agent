@@ -30,7 +30,7 @@ from tools.delegate_tool_child_run import (  # noqa: F401
 )
 from tools.delegate_tool_config import (  # noqa: F401
     _DEFAULT_MAX_CONCURRENT_CHILDREN, _get_child_timeout, _get_max_async_children, _get_max_concurrent_children,
-    _get_max_spawn_depth, _get_orchestrator_enabled, _get_subagent_approval_callback, _get_worktree_isolation,
+    _get_max_spawn_depth, _get_oneshot_max_children, _get_orchestrator_enabled, _get_subagent_approval_callback, _get_worktree_isolation,
     _inherit_parent_capabilities, _load_config, _merge_request_overrides, _resolve_child_credential_pool,
     _resolve_child_runtime, _resolve_delegation_credentials,
     _subagent_auto_approve, _subagent_auto_deny,
@@ -140,7 +140,7 @@ def _child_compression_cap_tokens(raw) -> "int | None":
 def _apply_child_compression_cap(child, delegation_cfg: dict) -> None:
     """Optional absolute cap on the child's compaction trigger, ``delegation.compression_threshold_tokens``
     (lower of it and any global ``compression.threshold_tokens``). Off by default: a 1M-window child
-    compacts at 500K like its parent. The compressor applies the cap on first window resolution, which
+    compacts where its parent does. The compressor applies the cap on first window resolution, which
     happens after construction, so setting it here is exactly equivalent to config."""
     from agent.context_compressor import ContextCompressor
 
@@ -278,7 +278,9 @@ def _build_child_agent(
     if parent_sid and getattr(child, "_session_init_model_config", None) is not None:
         child._session_init_model_config["_delegate_from"] = parent_sid
     # Shared pool lets children rotate credentials on rate limits.
-    child_pool = _resolve_child_credential_pool(rt["provider"], parent_agent, rt["base_url"])
+    child_pool = _resolve_child_credential_pool(
+        rt["provider"], parent_agent, rt["base_url"], effective_requested_provider=rt.get("requested_provider"),
+    )
     if child_pool is not None:
         child._credential_pool = child_pool
 
@@ -316,7 +318,7 @@ def _run_single_child(
     child_progress_cb = getattr(child, "tool_progress_callback", None)
     child_pool, leased_cred_id = _lease_child_credential(child)
     # Heartbeat keeps the parent's _last_activity_ts moving so the gateway inactivity timeout doesn't fire while the
-    # child works; it stops itself once the child looks stale (see _HEARTBEAT_STALE_CYCLES_*).
+    # child works; once the child looks stale (see _HEARTBEAT_STALE_CYCLES_*) it also ends await_child's wait.
     heartbeat = _start_heartbeat(child, parent_agent, task_index)
     # TUI/RPC registry entry (kill/pause/status by subagent_id); None for test
     # doubles without a stable id. Unregistered in the finally block.
@@ -324,7 +326,7 @@ def _run_single_child(
         child, parent_agent, goal, owner_session_id=owner_session_id, owner_transport=owner_transport,
         owner_session_record=owner_session_record,
     )
-    run = _ChildRun(child, parent_agent, task_index, goal, _subagent_id, child_progress_cb)
+    run = _ChildRun(child, parent_agent, task_index, goal, _subagent_id, child_progress_cb, heartbeat=heartbeat)
     # Set when a timed-out Future still owns the child: closing it from this
     # thread before the worker settles races the conversation's finally path.
     _child_close_deferred = False
@@ -417,6 +419,26 @@ def _build_children(
     return children, None
 
 
+def _oneshot_spawn_budget(parent_agent: Any, requested: int) -> Optional[str]:
+    """Charge *requested* children against the finite one-shot session's total (delegation.oneshot_max_children);
+    the error text tells the model to do the work inline. Interactive and gateway sessions are never charged."""
+    from agent.oneshot_footprint import is_single_query_session
+    if not is_single_query_session():
+        return None
+    cap = _get_oneshot_max_children()
+    if cap <= 0:
+        return None
+    spent = getattr(parent_agent, "_oneshot_children_spawned", 0)
+    if spent + requested > cap:
+        return (
+            f"Delegation budget for this one-shot run is exhausted ({spent}/{cap} subagents used; "
+            f"delegation.oneshot_max_children). Do the remaining work yourself in this session — reviewing "
+            f"your own diff and running the tests inline is expected here, not a delegated review."
+        )
+    parent_agent._oneshot_children_spawned = spent + requested
+    return None
+
+
 def delegate_task(
     goal: Optional[str] = None, context: Optional[str] = None, tasks: Optional[List[Dict[str, Any]]] = None,
     max_iterations: Optional[int] = None, role: Optional[str] = None, background: Optional[bool] = None,
@@ -485,6 +507,9 @@ def delegate_task(
         task_images, err = _coerce_task_images(task_list, images)
     if err:
         return tool_error(err)
+    err = _oneshot_spawn_budget(parent_agent, len(task_list))
+    if err:
+        return tool_error(err)
 
     overall_start = time.monotonic()
     # Live transcripts: cache/delegation/live/<id>/task-<n>.log per task, a side channel with zero effect on message
@@ -539,9 +564,8 @@ def _build_top_level_description(*, independent_completions=None) -> str:
     return _DESCRIPTION_HEAD.format(delivery=delivery) + restrictions_rule + _DESCRIPTION_TAIL
 
 _DESCRIPTION_HEAD = (
-    "Spawn subagents in isolated contexts; each gets its own conversation, terminal session, and toolset, and only its "
-    "final summary returns to you. Pass every task in `tasks` — one entry spawns one subagent, several run in parallel "
-    "(limit in the tasks description).\n\n"
+    "Spawn subagents with isolated conversations, terminal sessions, and toolsets; only final summaries return. "
+    "Pass tasks in `tasks`: one entry per child, several run in parallel (limit in tasks description).\n\n"
     "Sessions without a later-result consumer (including one-shot CLI and cron) join parallel children "
     "and return results in this tool call. "
     "Otherwise runs in the background: dispatch returns live transcript paths and results re-enter "
@@ -552,19 +576,19 @@ _DESCRIPTION_HEAD = (
     "for narrowing scope, preserving artifacts, outdated work, or takeover, and require the next response to close. "
     "After one steer still not converging, or for unsafe work, explicit cancel, or an unresponsive child, use stop. "
     "Stop returns interrupted (with a parent_stop marker when applicable), never completed.\n\n"
-    "USE FOR: reasoning-heavy subtasks, work that would flood your context with intermediate data, or independent "
-    "parallel workstreams.\n"
+    "USE FOR: reasoning-heavy subtasks, context-heavy research, or independent parallel work.\n"
     "DO NOT USE FOR (use these instead):\n"
     "- Mechanical multi-step work -> execute_code\n"
     "- A single tool call -> call it directly\n"
     "- User interaction -> subagents cannot ask questions\n"
     "- Durable work -> cronjob or terminal(background=True, notify=True); /stop, /new, or process exit discards "
-    "running subagents.\n\n"
+    "running subagents (whole tree), returning interrupted completions with partial output.\n\n"
     "RULES:\n"
-    "- Children know nothing of this conversation: pass everything needed via `context`, including language, tone, or "
+    "- Children lack this conversation: pass everything needed via `context`, including language, tone, or "
     "style (e.g. \"respond in Chinese\").\n"
     "- Child summaries are SELF-REPORTS, not verified facts. For external side effects, require a verifiable handle "
     "(URL, ID, absolute path) and verify it yourself before reporting success.\n"
+    "- Children cannot close tracked work: they return findings; the parent applies the transition.\n"
 )
 _DESCRIPTION_TAIL = (
     "- Children inherit the parent model unless pinned via delegation.provider / delegation.model in config.yaml."
@@ -644,8 +668,8 @@ DELEGATE_TASK_SCHEMA = {
                             "object",
                             "Optional JSON Schema this child's final answer must validate against (told to the "
                             "child up front; parent validates with one bounded correction retry; result gains "
-                            "schema_valid, plus schema_errors on failure). Keep it forgiving — require only "
-                            "fields you will read.",
+                            "schema_valid, plus schema_errors on failure — the child's raw text is still returned "
+                            "as summary, never discarded). Keep it forgiving — require only fields you will read.",
                         ),
                         "images": _p(
                             "array",

@@ -197,7 +197,8 @@ def test_windows_does_not_zip_fallback_after_git_update_then_subprocess_failure(
     assert exc_info.value.code == 1
     assert zip_calls == []
     out = capsys.readouterr().out
-    assert "✗ Git update failed:" in out
+    assert "✗ Git update failed." in out
+    assert "Details:" in out
     assert "Falling back to ZIP download" not in out
 
 

@@ -49,7 +49,9 @@ def test_registry_names_resolve_into_the_table():
     # registry commands the CLI never handled inline must still fall through
     dispatched = {c.name for c in COMMAND_REGISTRY if HermesCLI._slash_handler(c.name)}
     # /login has no old branch; it resolves through the naming-convention fallback.
-    assert dispatched == set(OLD_CHAIN_COMMANDS) - {"exit"} | {"quit", "login"}
+    # /micro is a local reserved builtin with its own dynamic handler, outside the
+    # historical inline chain represented by OLD_CHAIN_COMMANDS.
+    assert dispatched == set(OLD_CHAIN_COMMANDS) - {"exit"} | {"quit", "login", "micro"}
 
 
 def _cli():

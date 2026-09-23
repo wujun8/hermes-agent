@@ -190,6 +190,11 @@ class SidebarCacheTests(unittest.TestCase):
             self.assertTrue(release.wait(timeout=2))
             return None
 
+        # The first project-tree call imports the TUI gateway server. Warm that
+        # one-time import before the synchronization assertion so the test only
+        # measures scan coalescing, not module import latency.
+        import tui_gateway.server  # noqa: F401
+
         with mock.patch.object(profiles, "_profile_targets", return_value=[("default", Path("/nonexistent"))]), \
                 mock.patch.object(profiles, "_read_profile_db", side_effect=fake_read), \
                 ThreadPoolExecutor(max_workers=workers) as pool:

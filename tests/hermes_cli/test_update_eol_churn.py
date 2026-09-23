@@ -127,7 +127,6 @@ def _patch_ordinary_update_runtime(monkeypatch, repo: Path) -> None:
     monkeypatch.setattr(hermes_main, "_resolve_update_branch", lambda _args: "main")
     monkeypatch.setattr(hermes_main, "_clear_bytecode_cache", lambda _root: 0)
     monkeypatch.setattr(hermes_main, "_record_bytecode_fingerprint", lambda: None)
-    monkeypatch.setattr(hermes_main, "_reload_updated_runtime_modules", lambda: None)
     monkeypatch.setattr(
         hermes_main,
         "_install_python_dependencies_with_optional_fallback",
@@ -145,11 +144,6 @@ def _patch_ordinary_update_runtime(monkeypatch, repo: Path) -> None:
     monkeypatch.setattr(hermes_main, "_clear_update_incomplete_marker", lambda: None)
     monkeypatch.setattr(hermes_main, "_clear_lazy_refresh_incomplete_marker", lambda: None)
     monkeypatch.setattr(hermes_main, "_kill_stale_dashboard_processes", lambda **_kwargs: None)
-    # The live updater purges cached Hermes modules before restarting the
-    # gateway.  Disable that production-only reload boundary here so the
-    # hermetic gateway/uv doubles below cannot be replaced by real host code.
-    monkeypatch.setattr(hermes_main, "_purge_stale_hermes_modules", lambda: None)
-
     monkeypatch.setattr("hermes_cli.managed_uv.ensure_uv", lambda **_kwargs: None)
     monkeypatch.setattr("hermes_cli.managed_uv.update_managed_uv", lambda **_kwargs: None)
     monkeypatch.setattr(

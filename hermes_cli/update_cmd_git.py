@@ -421,6 +421,31 @@ def _ensure_non_trampoline_git(git_cmd: list) -> list:
     return [str(real_git)] + list(git_cmd[1:])
 
 
+def _npm_lockfile_owners(repo_root: Path) -> set[Path]:
+    """Manifest directories whose specs the single root ``package-lock.json`` records: the root plus every
+    workspace from the root ``workspaces`` globs (same model as ``update_cmd_deps._npm_manifest_paths``).
+    A manifest outside that graph (``website/``, ``scripts/whatsapp-bridge/``) has its own lockfile."""
+    owners = {Path(".")}
+    try:
+        import json
+        package = json.loads((repo_root / "package.json").read_text(encoding="utf-8"))
+        workspaces = package.get("workspaces", [])
+        if isinstance(workspaces, dict):
+            workspaces = workspaces.get("packages", [])
+        if not isinstance(workspaces, list):
+            return owners
+        for pattern in workspaces:
+            # One bad glob (absolute pattern -> NotImplementedError) degrades to "not an owner"
+            # instead of aborting the whole churn cleanup through the caller's suppress(Exception).
+            with suppress(Exception):
+                for directory in repo_root.glob(str(pattern)):
+                    if (directory / "package.json").is_file():
+                        owners.add(directory.relative_to(repo_root))
+    except (OSError, ValueError, TypeError):
+        pass
+    return owners
+
+
 def _discard_lockfile_churn(git_cmd, repo_root):
     """Compatibility hook that deliberately never discards user lockfile edits."""
     return None

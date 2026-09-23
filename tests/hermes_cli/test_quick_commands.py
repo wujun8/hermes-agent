@@ -77,6 +77,14 @@ class TestCLIQuickCommands:
 class TestGatewayQuickCommands:
     """Test quick command dispatch in GatewayRunner._handle_message."""
 
+    @pytest.fixture(autouse=True)
+    def _isolated_gateway_home(self, tmp_path, monkeypatch):
+        """Give the strict profile resolver a real, isolated launch profile."""
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        (home / "config.yaml").write_text("{}\n", encoding="utf-8")
+        monkeypatch.setenv("HERMES_HOME", str(home))
+
     def _make_event(self, command, args=""):
         event = MagicMock()
         event.get_command.return_value = command
@@ -88,6 +96,7 @@ class TestGatewayQuickCommands:
         event.source.platform.value = "telegram"
         event.source.chat_type = "dm"
         event.source.chat_id = "123"
+        event.source.profile = "default"
         return event
 
     @pytest.mark.asyncio
@@ -98,6 +107,7 @@ class TestGatewayQuickCommands:
         runner._running_agents = {}
         runner._pending_messages = {}
         runner._is_user_authorized = MagicMock(return_value=True)
+        runner._served_profile_names = {"default"}
 
         event = self._make_event("limits")
         result = await runner._handle_message(event)
@@ -113,6 +123,7 @@ class TestGatewayQuickCommands:
         runner._running_agents = {}
         runner._pending_messages = {}
         runner._is_user_authorized = MagicMock(return_value=True)
+        runner._served_profile_names = {"default"}
 
         event = self._make_event("leak")
         with patch.dict(os.environ, {"OPENROUTER_API_KEY": "sk-or-secret-12345"}):
@@ -135,6 +146,7 @@ class TestGatewayQuickCommands:
         runner._running_agents = {}
         runner._pending_messages = {}
         runner._is_user_authorized = MagicMock(return_value=True)
+        runner._served_profile_names = {"default"}
 
         event = self._make_event("token")
         result = await runner._handle_message(event)
@@ -152,6 +164,7 @@ class TestGatewayQuickCommands:
         runner._running_agents = {}
         runner._pending_messages = {}
         runner._is_user_authorized = MagicMock(return_value=True)
+        runner._served_profile_names = {"default"}
 
         event = self._make_event("slow")
         with patch("asyncio.wait_for", side_effect=asyncio.TimeoutError):
@@ -171,6 +184,7 @@ class TestGatewayQuickCommands:
         runner._running_agents = {}
         runner._pending_messages = {}
         runner._is_user_authorized = MagicMock(return_value=True)
+        runner._served_profile_names = {"default"}
 
         event = self._make_event("limits")
         result = await runner._handle_message(event)

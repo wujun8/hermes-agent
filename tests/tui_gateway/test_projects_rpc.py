@@ -660,6 +660,7 @@ def test_nondefault_policy_rejects_stale_or_legacy_results(monkeypatch, tmp_path
 def _profile_dir(tmp_path: Path, name: str) -> Path:
     home = tmp_path / "homes" / name
     home.mkdir(parents=True, exist_ok=True)
+    (home / "config.yaml").write_text("{}\n", encoding="utf-8")
     return home
 
 

@@ -11,19 +11,19 @@ from tui_gateway import server
 
 
 def test_plugins_manage_profile_reads_that_profiles_dir(tmp_path, monkeypatch):
-    # A temp profile home with one user plugin in its plugins dir.
-    profile_home = tmp_path / "profiles" / "botA"
+    # A real temporary profile home with an identity marker and one user plugin.
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    # Profile ids are canonicalized to lowercase at the resolver boundary.
+    profile_home = hermes_home / "profiles" / "bota"
     plugin_dir = profile_home / "plugins" / "bota-only-plugin"
     plugin_dir.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text("{}\n", encoding="utf-8")
     (plugin_dir / "plugin.yaml").write_text(
         "name: bota-only-plugin\nversion: '1.0'\ndescription: BotA-only plugin\n",
         encoding="utf-8",
     )
-
-    # Route the profile name the handler resolves to our temp home.
-    import hermes_cli.profiles as profiles
-
-    monkeypatch.setattr(profiles, "get_profile_dir", lambda name: profile_home)
 
     resp = server.handle_request(
         {

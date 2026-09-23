@@ -25,6 +25,7 @@ def profile_tree(tmp_path, monkeypatch):
     work_home.mkdir()
     unserved_home.mkdir()
     outside_home.mkdir()
+    (work_home / "config.yaml").write_text("{}\n", encoding="utf-8")
     (outside_home / "config.yaml").write_text("outside", encoding="utf-8")
     (outside_home / ".env").write_text("OUTSIDE_SECRET=sentinel\n", encoding="utf-8")
     (outside_home / "state.db").write_bytes(b"outside-state")

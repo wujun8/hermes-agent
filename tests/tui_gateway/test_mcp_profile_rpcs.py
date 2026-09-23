@@ -31,6 +31,8 @@ def hermes_root(tmp_path, monkeypatch):
     root = tmp_path / "hermes_home"
     (root / "profiles" / "work").mkdir(parents=True)
     (root / "profiles" / "other").mkdir(parents=True)
+    (root / "profiles" / "work" / "config.yaml").write_text("{}\n", encoding="utf-8")
+    (root / "profiles" / "other" / "config.yaml").write_text("{}\n", encoding="utf-8")
     monkeypatch.setenv("HERMES_HOME", str(root))
     # Make sure no stale process-wide home override leaks in from another test.
     from hermes_constants import get_hermes_home_override

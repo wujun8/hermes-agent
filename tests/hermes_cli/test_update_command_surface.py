@@ -32,14 +32,15 @@ def test_upgrade_help_is_rejected_as_an_unknown_command(tmp_path: Path) -> None:
     result = _run_cli(tmp_path, "upgrade", "--help")
 
     assert result.returncode != 0
-    assert "invalid choice" in result.stderr
+    assert "not a `hermes` command" in result.stderr
+    assert "Did you mean: update?" in result.stderr
 
 
 def test_update_help_keeps_the_official_update_options(tmp_path: Path) -> None:
     result = _run_cli(tmp_path, "update", "--help")
 
     assert result.returncode == 0
-    for expected in ("--branch", "default (main)", "--backup", "--no-backup"):
+    for expected in ("--branch NAME", "default", "(main)", "--backup", "--no-backup"):
         assert expected in result.stdout
 
 

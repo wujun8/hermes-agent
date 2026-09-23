@@ -146,7 +146,7 @@ class ApiOutageRecoveryWaiter:
             # not just the immediate probe executable.
             popen_kwargs["start_new_session"] = True
         try:
-            process = subprocess.Popen(argv, **popen_kwargs)
+            process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, **popen_kwargs)
         except Exception:
             return "failure"
 
