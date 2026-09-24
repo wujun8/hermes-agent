@@ -1080,6 +1080,33 @@ def test_list_enumerates_dict_format_models_alongside_default(monkeypatch):
     assert ds_rows[0]["total_models"] == 2
 
 
+def test_runtime_only_provider_overlay_keeps_custom_provider_catalog(monkeypatch):
+    """A timeout-only providers overlay must not claim the custom provider's picker row."""
+    monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
+    monkeypatch.setattr(providers_mod, "HERMES_OVERLAYS", {})
+
+    providers = list_authenticated_providers(
+        current_provider="custom:relay",
+        current_model="model-a",
+        user_providers={"custom:relay": {"stale_timeout_seconds": 900}},
+        custom_providers=[{
+            "name": "relay",
+            "base_url": "https://relay.example/v1",
+            "model": "model-a",
+            "models": {"model-a": {}, "model-b": {}, "model-c": {}},
+            "discover_models": False,
+        }],
+        probe_custom_providers=False,
+        probe_current_custom_provider=False,
+    )
+
+    rows = [row for row in providers if row["slug"] == "custom:relay"]
+    assert len(rows) == 1
+    assert rows[0]["models"] == ["model-a", "model-b", "model-c"]
+    assert rows[0]["total_models"] == 3
+    assert rows[0]["is_current"] is True
+
+
 def test_list_enumerates_dict_format_models_without_singular_model(monkeypatch):
     """Dict-format ``models:`` with no singular ``model:`` should still
     enumerate every dict key (previously the picker reported 0 models)."""

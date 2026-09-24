@@ -956,16 +956,29 @@ def _lap_canonical_rows(b: _PickerBuild) -> None:
             cp.slug, cp.label, cp.slug == b.current_provider, model_ids, "canonical", uncapped_ok=False)
 
 
-def _lap_user_provider_rows(b: _PickerBuild, user_providers: dict) -> None:
+def _lap_user_provider_rows(b: _PickerBuild, user_providers: dict, custom_providers: list | None) -> None:
     """Section 3: ``providers:`` dict entries, grouped by (api_url, credential, api_mode,
     extra_headers) so keyed providers on one endpoint with the same wire protocol collapse into
     one row (two Palantir Claude entries -> one "Palantir Claude" row); a different
     key_env/api_mode/headers keeps distinct rows since the wire protocol or tenant differs."""
     from hermes_cli.model_switch import _extra_headers_from_config, _scoped_key_env
     from hermes_cli.config import coerce_provider_id, is_provider_enabled
+    # A providers.<custom:id> block can contain only runtime settings (for
+    # example stale_timeout_seconds), while custom_providers owns the endpoint
+    # and its models. Let section 4 build that catalog; claiming the slug here
+    # would hide it and leave only the current model injected at finalization.
+    catalog_slugs = {
+        custom_provider_slug(entry.get("name", ""), entry.get("provider_key", "")).lower()
+        for entry in custom_providers or []
+        if isinstance(entry, dict) and entry.get("name") and _entry_base_url(entry)
+    }
     ep_groups: dict[tuple, dict] = {}
     for ep_name, ep_cfg in user_providers.items():
         if not isinstance(ep_cfg, dict) or not is_provider_enabled(ep_cfg) or ep_name.lower() in b.seen_slugs:
+            continue
+        if ep_name.lower() in catalog_slugs and not any(
+            ep_cfg.get(key) for key in ("base_url", "api", "url", "models", "model", "default_model")
+        ):
             continue
         display_name = coerce_provider_id(ep_cfg.get("name")) or ep_name
         api_url = _entry_base_url(ep_cfg, ("base_url", "api", "url"))
@@ -1240,7 +1253,7 @@ def list_authenticated_providers(
     _lap_overlay_rows(b, data, user_providers)
     _lap_canonical_rows(b)
     if user_providers and isinstance(user_providers, dict):
-        _lap_user_provider_rows(b, user_providers)
+        _lap_user_provider_rows(b, user_providers, custom_providers)
     _lap_bare_custom_row(b, custom_providers)
     if custom_providers and isinstance(custom_providers, list):
         _lap_custom_provider_rows(b, custom_providers)
