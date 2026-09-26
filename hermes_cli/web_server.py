@@ -1370,30 +1370,34 @@ def _on_server_started(
 def _run_serve(serve, config, host: str, port: int) -> None:
     """Drive ``serve()`` on the loop uvicorn expects.
 
-    POSIX keeps ``asyncio.run`` (already a SelectorEventLoop / uvloop). On
-    Windows ``asyncio.run`` defaults to a ProactorEventLoop, on which uvicorn
-    binds a socket that never accepts (#50641), so mirror uvicorn's own runner +
-    loop factory there (hand-installed selector policy for uvicorn < 0.36).
+    Linux uses uvicorn's loop factory, so ``loop=auto`` selects uvloop when
+    installed instead of silently falling back to asyncio's EpollSelector.
+    On Windows ``asyncio.run`` defaults to a ProactorEventLoop, on which uvicorn
+    binds a socket that never accepts (#50641), so use the same runner + factory
+    there (hand-installed selector policy for uvicorn < 0.36).
     Ctrl+C -> clean return; probe-to-bind port race -> sentinel + exit code.
     """
     runner = asyncio.run
     runner_kwargs: dict = {}
-    if sys.platform == "win32":
+    if sys.platform == "win32" or sys.platform.startswith("linux"):
         # Resolved FIRST; the serve call is outside this try so genuine
         # serve-time errors (port in use) propagate instead of double-running.
         try:
             from uvicorn._compat import asyncio_run as runner
 
             runner_kwargs = {"loop_factory": config.get_loop_factory()}
-        except Exception:
+        except Exception as exc:
+            if sys.platform != "win32" and not isinstance(exc, ImportError):
+                raise
             runner = asyncio.run
             runner_kwargs = {}
-            try:
-                asyncio.set_event_loop_policy(
-                    asyncio.WindowsSelectorEventLoopPolicy()  # type: ignore[attr-defined]
-                )
-            except Exception:
-                pass
+            if sys.platform == "win32":
+                try:
+                    asyncio.set_event_loop_policy(
+                        asyncio.WindowsSelectorEventLoopPolicy()  # type: ignore[attr-defined]
+                    )
+                except Exception:
+                    pass
 
     # ``capture_signals()`` re-raises the captured signal after graceful
     # shutdown; console Ctrl+C lands as KeyboardInterrupt = clean exit.

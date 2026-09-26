@@ -207,16 +207,12 @@ def test_start_server_runs_on_uvicorns_loop_factory(monkeypatch):
     )
 
 
-def test_start_server_keeps_bare_asyncio_run_on_posix(monkeypatch):
-    """POSIX continues to serve via the plain ``asyncio.run(_serve())`` path,
-    never the Windows loop-factory branch.
+@pytest.mark.macos_only
+def test_start_server_keeps_bare_asyncio_run_on_macos(monkeypatch):
+    """macOS retains its existing plain ``asyncio.run(_serve())`` path.
 
-    The #50641 fix is intentionally win32-scoped to keep the loop selection
-    unchanged — Python's default loop on POSIX is already a SelectorEventLoop
-    (or uvloop), which is what uvicorn serves on.
-
-    No platform patching: the Linux CI host is already POSIX, so this asserts
-    the real host's serve path.
+    Linux now uses Uvicorn's loop factory, so this checks the remaining native
+    POSIX path on a real macOS host.
     """
     _stub_uvicorn(monkeypatch)
 
@@ -240,13 +236,14 @@ def test_start_server_keeps_bare_asyncio_run_on_posix(monkeypatch):
 
     web_server.start_server(host="127.0.0.1", port=0, open_browser=False)
 
-    assert bare_called["hit"] is True, "POSIX must serve via bare asyncio.run"
+    assert bare_called["hit"] is True, "macOS must serve via bare asyncio.run"
     assert runner_called["hit"] is False, (
-        "POSIX must not take the Windows loop-factory branch"
+        "macOS must not take the loop-factory branch"
     )
 
 
-def test_start_server_treats_posix_keyboardinterrupt_as_clean_shutdown(monkeypatch):
+@pytest.mark.macos_only
+def test_start_server_treats_macos_keyboardinterrupt_as_clean_shutdown(monkeypatch):
     """Ctrl+C is the normal foreground-dashboard shutdown path.
 
     Uvicorn re-raises captured SIGINT as ``KeyboardInterrupt`` after it has
