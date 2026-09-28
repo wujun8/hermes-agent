@@ -4,12 +4,14 @@ npm/Desktop rebuilds, self-lock deferral. Names are re-imported by ``update_cmd`
 
 import logging
 from contextlib import suppress
+import ast
 import hashlib
 import json
 import os
 import shutil
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 from typing import Optional
 from hermes_constants import project_venv_dir, venv_python_path
@@ -22,11 +24,83 @@ logger = logging.getLogger("hermes_cli.update_cmd")
 _INSTALL_DEFINING_FILES = "pyproject.toml", "setup.py", "setup.cfg", "MANIFEST.in", "uv.lock"
 
 
+def _mapping_literal(tree: ast.AST):
+    """The setuptools finder uses ``MAPPING: dict[str, str] = {...}``, not a bare assign."""
+    for node in tree.body:
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.target.id == "MAPPING":
+            return ast.literal_eval(node.value)
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == "MAPPING" for target in node.targets
+        ):
+            return ast.literal_eval(node.value)
+    return None
+
+
+def _checkout_import_names(root: Path) -> set[str]:
+    """Top-level names an editable install records: root modules plus configured packages."""
+    names = {path.stem for path in root.glob("*.py") if path.name != "setup.py"}
+    with (root / "pyproject.toml").open("rb") as stream:
+        includes = (
+            tomllib.load(stream)
+            .get("tool", {})
+            .get("setuptools", {})
+            .get("packages", {})
+            .get("find", {})
+            .get("include", [])
+        )
+    prefixes = {item.removesuffix(".*") for item in includes if isinstance(item, str)}
+    names.update(
+        path.name
+        for path in root.iterdir()
+        if path.is_dir() and (path / "__init__.py").is_file() and path.name in prefixes
+    )
+    return names
+
+
+def _editable_finder_files(venv: Path) -> list[Path]:
+    sites = [*venv.glob("lib/python*/site-packages"), venv / "Lib" / "site-packages"]
+    return [
+        finder
+        for site in sites
+        if site.is_dir()
+        for finder in site.glob("__editable__*hermes_agent*finder.py")
+    ]
+
+
+def _editable_finder_mapping_current(cwd) -> bool | None:
+    """None when the install venv has no static finder; False when its map misses the checkout.
+
+    Module entries point at the stem (``cli``, not ``cli.py``). Existence of that
+    path is not the contract — the key set is. A dangling path is a different repair.
+    """
+    root = Path(cwd)
+    venv = project_venv_dir(root)
+    if venv is None:
+        return None
+    finders = _editable_finder_files(venv)
+    if not finders:
+        return None
+    try:
+        inventory = _checkout_import_names(root)
+        for finder in finders:
+            mapping = _mapping_literal(ast.parse(finder.read_text(encoding="utf-8")))
+            if not isinstance(mapping, dict) or set(mapping) != inventory:
+                return False
+    except (OSError, SyntaxError, ValueError, TypeError, AttributeError):
+        return False
+    return True
+
+
 def _editable_install_is_current(git_cmd, cwd, pre_pull_sha: str | None) -> bool:
-    """True when the pulled commits cannot have invalidated the editable install: ``uv pip install
-    -e .`` always rewrites console-script shims (Windows: ``hermes.exe`` quarantine, ``os error 32``
-    on a lost race), so skip it when only non-install files changed. Safe because the editable
-    finder uses a *static* module list. Fails closed: no pre-pull SHA or failed diff -> False."""
+    """True when the pull cannot invalidate the editable install.
+
+    ``uv pip install -e .`` rewrites console-script shims. On Windows that rewrite
+    quarantines the running ``hermes.exe``, and a lost race is the ``os error 32``
+    family, so skip it only when packaging files are unchanged and the installed
+    finder still names every top-level import the checkout exposes. No finder keeps
+    the packaging-file gate. An unreadable finder, or a map that disagrees with the
+    checkout, is not current. No pre-pull SHA or a failed diff fails closed.
+    """
     if not pre_pull_sha:
         return False
     try:
@@ -35,7 +109,10 @@ def _editable_install_is_current(git_cmd, cwd, pre_pull_sha: str | None) -> bool
             cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace")
     except OSError:
         return False
-    return result.returncode == 0 and not result.stdout.strip()
+    if result.returncode != 0 or result.stdout.strip():
+        return False
+    mapping_current = _editable_finder_mapping_current(cwd)
+    return mapping_current is not False
 
 
 # Env keys stripped from the import-health probe child: they steer the interpreter at a
@@ -116,6 +193,20 @@ def _critical_module_import_failures(
             )
         }
 
+    interpreter = sys.executable
+    pin_checkout_root = True
+    try:
+        venv_dir = project_venv_dir(checkout_root) or checkout_root / "venv"
+        venv_python = venv_python_path(venv_dir, windows=_m()._is_windows())
+        if venv_python.exists():
+            interpreter = str(venv_python)
+        # An installed editable finder must resolve the checkout without cwd help,
+        # as it does for a gateway launched from /. Keep -I and origin validation;
+        # only a bare development checkout needs the explicit sys.path entry.
+        pin_checkout_root = not bool(_editable_finder_files(venv_dir))
+    except Exception:
+        pass  # fall back to the running interpreter
+
     first_party_roots = tuple(sorted(FIRST_PARTY_MODULE_ROOTS))
     import secrets
 
@@ -125,7 +216,8 @@ def _critical_module_import_failures(
         "from pathlib import Path\n"
         "sys.argv = ['hermes', 'update']\n"
         "_root = Path(%r).resolve(strict=True)\n"
-        "sys.path.insert(0, str(_root))\n"
+        "if %r:\n"
+        "    sys.path.insert(0, str(_root))\n"
         "_first_party_roots = frozenset(%r)\n"
         "def _is_first_party_module(name):\n"
         "    root = str(name).split('.', 1)[0] if name else ''\n"
@@ -168,6 +260,7 @@ def _critical_module_import_failures(
         "sys.stdout.write('\\n%s' + json.dumps(failures))\n"
         % (
             str(checkout_root),
+            pin_checkout_root,
             first_party_roots,
             _UPDATE_CRITICAL_MODULES,
             report_runtime_errors,
@@ -176,15 +269,6 @@ def _critical_module_import_failures(
         )
     )
     try:
-        interpreter = sys.executable
-        try:
-            venv_python = venv_python_path(
-                (project_venv_dir(checkout_root) or checkout_root / "venv"), windows=_m()._is_windows()
-            )
-            if venv_python.exists():
-                interpreter = str(venv_python)
-        except Exception:
-            pass  # fall back to the running interpreter
         probe_env = {k: v for k, v in os.environ.items() if k not in _PROBE_ENV_DENYLIST}
         result = bounded_probe_run(
             [interpreter, "-I", "-c", probe], timeout=120, cwd=str(checkout_root),
@@ -491,8 +575,9 @@ def _refresh_active_memory_provider_dependencies() -> None:
             return
         provider = str(memory_cfg.get("provider") or "").strip()
 
-    # "default"/empty is the built-in file store — no pip deps.
-    if not provider or provider in {"default", "builtin", "none"}:
+    # The built-in file store has no pip deps.
+    from agent.memory_provider import is_core_memory_provider
+    if is_core_memory_provider(provider):
         return
 
     try:
@@ -898,38 +983,94 @@ def _venv_dependency_set_stale() -> tuple[bool, str]:
     return stale, f"installed hermes-agent {installed}, checkout is {expected}" if stale else ""
 
 
-# Native extensions that pin venv files once imported: if the updater holds one, Windows blocks
-# REPLACE on the mapped ``.pyd`` and the sync dies with ``os error 5``. PyYAML's ``_yaml`` is in
-# every CLI process, so the guard must be HONEST: fire only when the sync would actually REWRITE
-# the dist, and only AFTER the code swap so a deferral leaves new code with just the install
-# pending. Keys are ``sys.modules`` prefixes; values are ``(display name, PyPI dist)``.
-# If the updater process itself has any of these loaded, the dependency sync below cannot rewrite the
-# backing ``.pyd``/``.dll`` — Windows blocks REPLACE on a mapped image — and the update dies with ``os error
-# 5`` between uninstall and reinstall, stranding the venv half-updated (#83569). ``cryptography`` is the
-# canonical case: ``hermes_cli.main`` used to import it at startup while resolving external secret sources;
-# ``PyYAML``'s ``_yaml`` C extension is loaded by every CLI process (config parsing). Keep this guard as
-# defence-in-depth against future eager imports (new secret sources, plugins absorbed into core, refactors
-# of the startup order) — but the guard must be HONEST (#86735/#86780/#86781: a preflight that fired on
-# every run, before the fetch, re-bricked the exact flow it was meant to protect). Two honesty gates: 1. It
-# only fires when the dependency sync would actually REWRITE the loaded distribution
-# (``_dependency_sync_would_rewrite``): if the installed version already satisfies the on-disk pyproject
-# pins, uv/pip will not touch the mapped ``.pyd``, so there is no lock to trip. 2. It runs AFTER the code
-# swap (git pull / ZIP commit), immediately before the venv rewrite — so the on-disk pyproject is the NEW
-# one (gate 1 compares against the right target) and a deferral no longer strands the user on the old
-# checkout: the next launch's marker recovery completes the dependency install against the already-updated
-# pyproject.
-_SELF_LOCKING_NATIVE_MODULES: dict[str, tuple[str, str]] = {
-    "cryptography.hazmat.bindings._rust": ("cryptography (_rust.pyd)", "cryptography"),
-    "yaml._yaml": ("PyYAML (_yaml.pyd)", "pyyaml")}
+# A native extension the updater process has mapped pins its venv file: Windows blocks REPLACE on a
+# mapped ``.pyd`` and the sync dies with ``os error 5`` between uninstall and reinstall, stranding the
+# venv half-updated (#83569). Which extensions are mapped is DERIVED from ``sys.modules`` (every loaded
+# module whose file is an extension under site-packages), never hand-listed: the #81594 report's lock
+# was ``_cffi_backend.pyd``, which the old two-entry list missed. PyYAML's ``_yaml`` is in every CLI
+# process, so the guard must stay HONEST (#86735/#86780/#86781: a preflight that fired on every run
+# re-bricked the flow it protects): 1. it fires only when the sync would actually REWRITE the loaded
+# distribution (``_dependency_sync_would_rewrite``); 2. it runs AFTER the code swap, right before the
+# venv rewrite, so the on-disk pyproject/uv.lock are the NEW ones and a deferral leaves new code with
+# only the install pending for the next launch's marker recovery.
+def _loaded_native_extension_dists(
+        modules, site_dirs, extension_suffixes, top_level_dists) -> dict[str, list[str]]:
+    """``{distribution: [extension file names]}`` for loaded modules backed by an extension file
+    under one of *site_dirs*. Stdlib extensions (``DLLs``/``lib-dynload``) and pure-Python modules
+    never match; a module whose top-level name maps to no distribution is skipped."""
+    roots = [os.path.normcase(os.path.abspath(d)) for d in site_dirs]
+    suffixes = tuple(extension_suffixes)
+    loaded: dict[str, list[str]] = {}
+    for name, module in list(modules.items()):
+        path = getattr(module, "__file__", None)
+        if not isinstance(path, str) or not path.endswith(suffixes):
+            continue
+        normalized = os.path.normcase(os.path.abspath(path))
+        if not any(normalized.startswith(root + os.sep) for root in roots):
+            continue
+        for dist in top_level_dists.get(name.partition(".")[0], ()):
+            files = loaded.setdefault(dist, [])
+            if os.path.basename(path) not in files:
+                files.append(os.path.basename(path))
+    return loaded
+
+
+def _pyproject_pin_verdict(target: str, installed: str | None, req_strings: list[str]) -> bool | None:
+    """True: an applicable pin is unsatisfied (or the dist is missing); False: pinned and
+    satisfied; None: *target* (canonical name) has no applicable pyproject requirement."""
+    from packaging.requirements import Requirement
+    from packaging.utils import canonicalize_name
+    from packaging.version import Version
+    saw_pin = False
+    for req_str in req_strings:
+        try:
+            req = Requirement(req_str)
+        except Exception:
+            continue
+        if canonicalize_name(req.name) != target:
+            continue
+        if req.marker is not None and not req.marker.evaluate():
+            continue
+        if installed is None or Version(installed) not in req.specifier:
+            return True
+        saw_pin = True
+    return False if saw_pin else None
+
+
+def _transitive_sync_would_rewrite(target: str, installed: str, root: Path, base_reqs: list[str]) -> bool | None:
+    """An unpinned dist moves only when something requiring it moves. True when uv.lock resolves it
+    to a version other than the installed one AND a lock parent is being moved by a BASE
+    ``dependencies`` pin. Only base pins count: the sync cannot skip them (a failing optional extra is
+    skipped by the fallback ladder and would re-defer every update, #86735), so the sync this defers
+    always clears the condition. None otherwise."""
+    from importlib import metadata as _ilmd
+    from packaging.utils import canonicalize_name
+    from packaging.version import Version
+    packages = tomllib.loads((root / "uv.lock").read_text(encoding="utf-8")).get("package") or []
+    locked = {Version(p["version"]) for p in packages
+              if canonicalize_name(p.get("name", "")) == target and p.get("version")}
+    if not locked or Version(installed) in locked:
+        return None
+    for parent in packages:
+        if not any(canonicalize_name(dep.get("name", "")) == target for dep in parent.get("dependencies") or ()):
+            continue
+        try:
+            parent_installed = _ilmd.version(parent["name"])
+        except Exception:
+            parent_installed = None
+        if _pyproject_pin_verdict(canonicalize_name(parent["name"]), parent_installed, base_reqs):
+            return True
+    return None
 
 
 def _dependency_sync_would_rewrite(dist_name: str) -> bool | None:
     """Whether the ``.[all]`` install would replace *dist_name*'s files, judged against every
-    applicable pin in on-disk ``pyproject.toml`` (base + extras). False: all pins satisfied;
-    True: pin unsatisfied or dist missing; None: undeterminable. Never raises. Callers treat
-    None as fail-OPEN — PyYAML is in every process, so deferring on uncertainty always fires.
+    applicable pin in on-disk ``pyproject.toml`` (base + extras) and, for an unpinned transitive,
+    its uv.lock parents. False: all pins satisfied; True: pin unsatisfied, dist missing, or moved
+    by a rewritten parent; None: undeterminable. Never raises. Callers treat None as fail-OPEN —
+    PyYAML is in every process, so deferring on uncertainty always fires.
 
-    See #86735.
+    See #86735, #81594.
     """
     from hermes_cli.update_cmd import _m
     try:
@@ -938,34 +1079,18 @@ def _dependency_sync_would_rewrite(dist_name: str) -> bool | None:
     except Exception:
         return True  # not installed → the sync will definitely install it
     try:
-        import tomllib
-        from packaging.requirements import Requirement
         from packaging.utils import canonicalize_name
-        from packaging.version import Version
-        pyproject = _m().PROJECT_ROOT / "pyproject.toml"
-        data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
-        project = data.get("project") or {}
-        req_strings: list[str] = list(project.get("dependencies") or [])
+        root = _m().PROJECT_ROOT
+        project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8")).get("project") or {}
+        base_reqs: list[str] = list(project.get("dependencies") or [])
+        req_strings = list(base_reqs)
         for extra_reqs in (project.get("optional-dependencies") or {}).values():
             req_strings.extend(extra_reqs or [])
-
         target = canonicalize_name(dist_name)
-        installed_v = Version(installed)
-        saw_pin = False
-        for req_str in req_strings:
-            try:
-                req = Requirement(req_str)
-            except Exception:
-                continue
-            if canonicalize_name(req.name) != target:
-                continue
-            if req.marker is not None and not req.marker.evaluate():
-                continue
-            saw_pin = True
-            if installed_v not in req.specifier:
-                return True
-        # Not pinned in pyproject: the resolver may still move it as a transitive — unknown.
-        return False if saw_pin else None
+        verdict = _pyproject_pin_verdict(target, installed, req_strings)
+        if verdict is not None:
+            return verdict
+        return _transitive_sync_would_rewrite(target, installed, root, base_reqs)
     except Exception:
         return None
 
@@ -983,12 +1108,20 @@ def _detect_self_loaded_native_modules() -> list[str]:
     from hermes_cli.update_cmd import _m
     if not _m()._is_windows():
         return []
+    import sysconfig
+    from importlib import machinery, metadata
+    try:
+        loaded = _loaded_native_extension_dists(
+            sys.modules, {sysconfig.get_path("purelib"), sysconfig.get_path("platlib")},
+            machinery.EXTENSION_SUFFIXES, metadata.packages_distributions())
+    except Exception:  # unreadable dist metadata: fail open, like an unknown rewrite below
+        return []
     # Defer ONLY on a CONFIRMED rewrite; unknown fails OPEN (PyYAML is in every process, so
     # unknown-as-at-risk always fires). A missed deferral only yields the mid-sync os error 5
     # that marker recovery already handles — far less harmful than an update that never runs.
-    return sorted({
-        display for prefix, (display, dist) in _SELF_LOCKING_NATIVE_MODULES.items()
-        if prefix in sys.modules and _m()._dependency_sync_would_rewrite(dist) is True})
+    return sorted(
+        f"{dist} ({', '.join(files)})" for dist, files in loaded.items()
+        if _m()._dependency_sync_would_rewrite(dist) is True)
 
 
 def _abort_dependency_sync_if_self_locked(gateway_resume=None) -> None:

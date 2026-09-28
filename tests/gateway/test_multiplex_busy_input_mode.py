@@ -192,10 +192,14 @@ async def test_secondary_profile_busy_mode_controls_priority_path(
 
 
 @pytest.mark.asyncio
-async def test_busy_status_dispatches_through_active_session_path(tmp_path):
+async def test_busy_status_dispatches_through_active_session_path(tmp_path, monkeypatch):
     """A running session still dispatches /busy through its normal handler."""
     runner = _runner(default_mode="interrupt")
-    await _load_profile_snapshot(runner, tmp_path / "research", "queue")
+    await _load_profile_snapshot(
+        runner,
+        _canonical_profile_home(tmp_path, monkeypatch),
+        "queue",
+    )
     event = _event(profile="research")
     event.text = "/busy status"
     session_key = runner._session_key_for_source(event.source)

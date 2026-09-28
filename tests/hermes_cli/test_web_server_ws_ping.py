@@ -270,6 +270,33 @@ def test_start_server_treats_macos_keyboardinterrupt_as_clean_shutdown(monkeypat
         )
 
 
+def test_start_server_treats_posix_keyboardinterrupt_as_clean_shutdown(monkeypatch):
+    """Ctrl+C is the normal foreground-dashboard shutdown path.
+
+    Uvicorn re-raises captured SIGINT as ``KeyboardInterrupt`` after it has
+    restored the original signal handlers.  The dashboard should treat that as a
+    clean user-requested shutdown instead of leaking a traceback to the terminal.
+    """
+    _stub_uvicorn(monkeypatch)
+
+    def _raise_keyboard_interrupt(coro):
+        coro.close()
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(asyncio, "run", _raise_keyboard_interrupt)
+
+    # Catch rather than let it escape: pytest treats a propagating
+    # KeyboardInterrupt as a session abort, not a test failure, so a
+    # regression here would kill the run instead of reporting red.
+    try:
+        web_server.start_server(host="127.0.0.1", port=0, open_browser=False)
+    except KeyboardInterrupt:
+        pytest.fail(
+            "start_server must treat serve-time KeyboardInterrupt as a clean "
+            "shutdown, not propagate it"
+        )
+
+
 @pytest.mark.windows_only
 def test_start_server_treats_windows_keyboardinterrupt_as_clean_shutdown(monkeypatch):
     """Console Ctrl+C on the Windows loop-factory branch is a clean exit too.

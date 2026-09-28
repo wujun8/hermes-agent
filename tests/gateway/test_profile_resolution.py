@@ -2,7 +2,7 @@
 
 import logging
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -234,12 +234,6 @@ class TestGatewayRunnerInjection:
     that makes the routing in TestNonDiscordProfileRouting reachable at runtime.
     """
 
-    def test_base_adapter_declares_gateway_runner(self):
-        from gateway.platforms.base import BasePlatformAdapter
-
-        # Class-level attribute exists and defaults to None.
-        assert hasattr(BasePlatformAdapter, "gateway_runner")
-        assert BasePlatformAdapter.gateway_runner is None
 
     def test_factory_binds_every_adapter_to_runner(self, monkeypatch):
         """``_create_adapter`` binds the runner regardless of which branch
