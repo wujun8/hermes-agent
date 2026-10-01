@@ -434,6 +434,117 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
         )
     return _runtime_provider_credentials(values, explicit_request_overrides)
 
+
+def _resolve_delegation_route(cfg: dict, parent_agent, *, allow_off_peak: bool = True) -> tuple[dict, dict]:
+    """Select a new dispatch's route without mutating profile config or live children.
+
+    ``deepseek_off_peak_provider: inherit`` keeps the normal route's complete
+    credential bundle and changes only the target model and optional wire mode.
+    Named low routes resolve their own credentials; only native DeepSeek is
+    restricted to the official endpoint. Missing low-route credentials leave
+    the configured route usable.
+    """
+    from tools import delegate_tool
+    from tools.delegate_off_peak import is_deepseek_off_peak
+
+    if (
+        allow_off_peak
+        and is_truthy_value(cfg.get("deepseek_off_peak_enabled"), default=True)
+        and is_deepseek_off_peak()
+    ):
+        low_provider = str(cfg.get("deepseek_off_peak_provider") or "").strip() or "deepseek"
+        low_model = str(cfg.get("deepseek_off_peak_model") or "").strip() or "deepseek-flash"
+        raw_mode = cfg.get("deepseek_off_peak_api_mode", "")
+        try:
+            from hermes_cli.runtime_provider import _parse_api_mode
+
+            low_api_mode = (
+                None
+                if raw_mode is None or (isinstance(raw_mode, str) and not raw_mode.strip())
+                else _parse_api_mode(raw_mode)
+            )
+            if (
+                raw_mode is not None
+                and (not isinstance(raw_mode, str) or raw_mode.strip())
+                and low_api_mode is None
+            ):
+                raise ValueError("Unsupported delegation.deepseek_off_peak_api_mode")
+        except ValueError:
+            logger.warning(
+                "DeepSeek off-peak route unavailable; using the configured delegation route. "
+                "Check delegation.deepseek_off_peak_api_mode."
+            )
+            return cfg, delegate_tool._resolve_delegation_credentials(cfg, parent_agent)
+
+        if low_provider.lower() == "inherit":
+            route = dict(cfg)
+            route["model"] = low_model
+            if low_api_mode is not None:
+                route["api_mode"] = low_api_mode
+            creds = delegate_tool._resolve_delegation_credentials(route, parent_agent)
+            if low_api_mode is not None:
+                # Named-provider resolution derives its mode and ignores api_mode;
+                # the validated off-peak override must be applied to the bundle.
+                creds["api_mode"] = low_api_mode
+            elif not route.get("provider") and not route.get("base_url"):
+                parent_provider = (
+                    getattr(parent_agent, "requested_provider", None)
+                    or getattr(parent_agent, "provider", None)
+                )
+                if parent_provider:
+                    parent_api_key = getattr(parent_agent, "api_key", None)
+                    client_kwargs = getattr(parent_agent, "_client_kwargs", None)
+                    if not parent_api_key and isinstance(client_kwargs, dict):
+                        parent_api_key = client_kwargs.get("api_key")
+                    parent_base_url, parent_api_key = _inherit_parent_endpoint(
+                        parent_agent, getattr(parent_agent, "base_url", None), parent_api_key,
+                    )
+                    try:
+                        from hermes_cli.runtime_provider import resolve_runtime_provider
+                        inherited_runtime = resolve_runtime_provider(
+                            requested=parent_provider,
+                            target_model=low_model,
+                            explicit_base_url=parent_base_url,
+                            explicit_api_key=parent_api_key,
+                        )
+                    except Exception:
+                        logger.debug("Could not derive off-peak transport from the inherited provider")
+                    else:
+                        if inherited_runtime.get("api_mode"):
+                            creds["api_mode"] = inherited_runtime["api_mode"]
+            logger.info("DeepSeek off-peak: keeping the configured delegation provider for model %s", low_model)
+            return route, creds
+
+        try:
+            # Resolve only the low route: normal endpoint/key/transport overrides
+            # must not leak into a separately named provider.
+            creds = _runtime_provider_credentials({"provider": low_provider, "model": low_model}, None)
+            if low_api_mode is not None:
+                # _runtime_provider_credentials derives the provider's mode and
+                # does not consume v.api_mode; an explicit validated mode wins.
+                creds["api_mode"] = low_api_mode
+            if (
+                low_provider.lower() == "deepseek"
+                and base_url_hostname(creds.get("base_url") or "") != "api.deepseek.com"
+            ):
+                raise ValueError("Native DeepSeek requires its official endpoint")
+        except ValueError:
+            # Resolver exceptions may contain credential or endpoint configuration.
+            logger.warning(
+                "DeepSeek off-peak route unavailable; using the configured delegation route. "
+                "Check this profile's low-route provider credentials and endpoint."
+            )
+        else:
+            route = dict(cfg)
+            for key in ("base_url", "api_key", "api_mode", "request_overrides", "command", "args", "acp_command", "acp_args"):
+                route.pop(key, None)
+            route.update(model=creds["model"], provider=creds["provider"], api_mode=creds["api_mode"])
+            logger.info("DeepSeek off-peak: dispatching subagents via %s/%s", low_provider, low_model)
+            return route, creds
+    # Keep the facade patch seam used by the existing delegation integrations.
+    return cfg, delegate_tool._resolve_delegation_credentials(cfg, parent_agent)
+
+
 def _load_config() -> dict:
     """The ``delegation`` config section (read-only — do NOT mutate). Prefers the shared ``load_config_readonly()``
     (follows HERMES_HOME/profile; no deepcopy, since this runs on every get_definitions() rebuild) over the legacy

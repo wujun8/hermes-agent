@@ -32,7 +32,7 @@ from tools.delegate_tool_config import (  # noqa: F401
     _DEFAULT_MAX_CONCURRENT_CHILDREN, _get_child_timeout, _get_max_async_children, _get_max_concurrent_children,
     _get_max_spawn_depth, _get_oneshot_max_children, _get_orchestrator_enabled, _get_subagent_approval_callback, _get_worktree_isolation,
     _inherit_parent_capabilities, _load_config, _merge_request_overrides, _resolve_child_credential_pool,
-    _resolve_child_runtime, _resolve_delegation_credentials,
+    _resolve_child_runtime, _resolve_delegation_credentials, _resolve_delegation_route,
     _subagent_auto_approve, _subagent_auto_deny,
 )
 from tools.delegate_tool_dispatch import _Batch, _announce_batch, _capture_origin, _run_batch
@@ -495,7 +495,9 @@ def delegate_task(
     # the route and its fallback policy together through child construction.
     routing_cfg = credentials_cfg if credentials_cfg is not None else cfg
     try:
-        creds = _resolve_delegation_credentials(routing_cfg, parent_agent)
+        routing_cfg, creds = _resolve_delegation_route(
+            routing_cfg, parent_agent, allow_off_peak=credentials_cfg is None,
+        )
     except ValueError as exc:
         # Explicit-pin preflight failures (e.g. pinned delegation.command missing from PATH) refuse the
         # spawn loudly (#80450).

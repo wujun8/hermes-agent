@@ -1316,6 +1316,14 @@ DEFAULT_CONFIG = {
     # cheaper/faster model. Uses the same runtime provider resolution as CLI/gateway startup, so
     # every configured provider is supported.
     "delegation": {
+        # Route new dispatches through the provider during DeepSeek billing off-peak windows.
+        # "deepseek" uses native DeepSeek; "inherit" keeps the normal provider/endpoint/key.
+        "deepseek_off_peak_provider": "deepseek",
+        "deepseek_off_peak_model": "deepseek-flash",
+        # Empty derives the target provider's wire mode; non-empty must be a registered transport.
+        "deepseek_off_peak_api_mode": "",
+        # false = always use the configured delegation route below.
+        "deepseek_off_peak_enabled": True,
         "model": "",  # e.g. "google/gemini-3-flash-preview" (empty = inherit parent)
         "provider": "",  # e.g. "openrouter" (empty = inherit parent provider + credentials)
         # Fallback chain for delegated children (same entry format as the top-level list).

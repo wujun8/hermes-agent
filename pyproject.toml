@@ -66,6 +66,9 @@ dependencies = [
   "prompt_toolkit==3.0.52",
   # Cron scheduler (built-in feature — scheduled cron/interval jobs use croniter).
   "croniter==6.0.0",
+  # Local Chinese public-holiday dates for the default-enabled subagent billing
+  # schedule. Pure Python, no transitive dependencies; refresh for new calendar years.
+  "chinesecalendar==1.11.0",
   # Snowball stemming for tool_search's BM25 (tools/tool_search.py) —
   # official Snowball project package, pure Python, zero transitive deps.
   # Applied at index AND query time so morphological variants match
@@ -509,6 +512,7 @@ azure-identity = false
 boto3 = false
 brotlicffi = false
 certifi = false
+chinesecalendar = false
 concurrent-log-handler = false
 croniter = false
 cryptography = false

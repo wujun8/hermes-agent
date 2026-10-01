@@ -1796,6 +1796,10 @@ delegation:
   # fallback_providers:                       # Fallback chain for delegated children (same entry format as the
   #   - provider: "openrouter"                # top-level list). Pinned children use only a declared child chain;
   #     model: "deepseek/deepseek-chat"       # unpinned children inherit when unset. [] disables fallback (#65038).
+  deepseek_off_peak_enabled: true             # Route only new delegate_task children during the same Beijing-time schedule
+  deepseek_off_peak_provider: "deepseek"     # Native DeepSeek by default; "inherit" keeps normal provider/endpoint/key, or name another provider
+  deepseek_off_peak_model: "deepseek-flash"  # Target model during off-peak windows
+  deepseek_off_peak_api_mode: ""              # Empty = derive; otherwise a registered wire mode such as chat_completions
 
 # =============================================================================
 # Honcho Integration (Cross-Session User Modeling)

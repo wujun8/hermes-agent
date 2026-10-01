@@ -3010,6 +3010,10 @@ Configure subagent behavior for the delegate tool:
 delegation:
   # model: "google/gemini-3-flash-preview"  # Override model (empty = inherit parent)
   # provider: "openrouter"                  # Override provider (empty = inherit parent)
+  deepseek_off_peak_enabled: true            # Apply the off-peak route to newly dispatched children
+  deepseek_off_peak_provider: "deepseek"    # Native DeepSeek (default); "inherit" keeps the normal route, or name another provider
+  deepseek_off_peak_model: "deepseek-flash" # Target model during off-peak windows
+  deepseek_off_peak_api_mode: ""             # Empty = derive from target route; or a registered wire mode, e.g. chat_completions
   # base_url: "http://localhost:1234/v1"    # Direct OpenAI-compatible endpoint (takes precedence over provider)
   # api_key: "local-key"                    # API key for base_url (falls back to OPENAI_API_KEY)
   # api_mode: ""                            # Wire protocol for base_url: "chat_completions", "codex_responses", or "anthropic_messages". Empty = auto-detect from URL (e.g. /anthropic suffix → anthropic_messages). Set explicitly for non-standard endpoints the heuristic can't detect.
@@ -3025,7 +3029,21 @@ delegation:
   oneshot_max_children: 2                   # Total subagents a one-shot run (hermes chat -q / --oneshot) may spawn; 0 = unlimited. Interactive and gateway sessions are never capped by this.
 ```
 
-**Subagent provider:model override:** By default, subagents inherit the parent agent's provider and model. Set `delegation.provider` and `delegation.model` to route subagents to a different provider:model pair — e.g., use a cheap/fast model for narrowly-scoped subtasks while your primary agent runs an expensive reasoning model.
+**Off-peak routing:** `delegation.deepseek_off_peak_enabled` defaults to `true` and affects only newly dispatched children from Hermes' native `delegate_task` tool; the primary agent, already-running children, and internal routes such as `/review` keep their own routes. During peak hours the usual `delegation.provider` / `delegation.model` route is unchanged. Set the option to `false` to disable schedule-based routing:
+
+```bash
+hermes config set delegation.deepseek_off_peak_enabled false
+```
+
+All three off-peak route settings use the same schedule: 09:00–12:00 and 14:00–18:00 Beijing time, Monday–Friday except China statutory public holidays; lunch, weekends (including make-up workdays), and public holidays are off-peak. The default `deepseek_off_peak_provider: "deepseek"` resolves the native DeepSeek provider with `deepseek-flash` and the active profile's DeepSeek credentials, and refuses non-official DeepSeek endpoints. To keep the normal supplier/provider, endpoint, credentials, and request settings while changing only the model, set `deepseek_off_peak_provider: "inherit"`; `deepseek_off_peak_model` defaults to `deepseek-flash`. An optional `deepseek_off_peak_api_mode` overrides transport and is validated against built-in and registered transports (for example `chat_completions`). When empty, the selected route's provider resolver derives transport for the off-peak model; pure parent inheritance resolves against the parent's named provider when possible. A different named `deepseek_off_peak_provider` resolves its own credential bundle and does not reuse the normal route's endpoint/key/transport overrides.
+
+This schedule mirrors DeepSeek's published billing windows; it does **not** guarantee off-peak rates from a third-party supplier when using `inherit` or another named provider. Such suppliers may use different model availability, calendars, and prices; confirm their terms directly. DeepSeek's published pricing applies only when requests are billed by DeepSeek under its own account and endpoint terms. See [DeepSeek pricing](https://api-docs.deepseek.com/zh-cn/quick_start/pricing).
+
+If the selected low-route credentials are missing/unresolvable, Hermes warns and keeps the normal delegation route. For native `deepseek`, an endpoint other than `api.deepseek.com` is also rejected; other named providers are not subject to that DeepSeek-host check. If a request later fails, fallback follows only the route owner's configured `delegation.fallback_providers`; Hermes does not re-evaluate the schedule during the run.
+
+The current `chinesecalendar==1.11.0` holiday data covers 2004–2026. Outside that range, Hermes conservatively keeps the normal route during weekday peak windows, where holiday status is unknown; other deterministically off-peak times still use the configured off-peak route. Upgrade the dependency when the next year's China holiday calendar is published. No scheduled restart is required, and this setting does not change Codex's global agent configuration.
+
+**Subagent provider:model override:** Outside automatic off-peak routing, subagents inherit the parent agent's provider and model when no override is set. Set `delegation.provider` and `delegation.model` to route subagents to a different provider:model pair — e.g., use a cheap/fast model for narrowly-scoped subtasks while your primary agent runs an expensive reasoning model.
 
 **Subagent fallback chain:** Set `delegation.fallback_providers` to give workers their own chain (same entry shape as the top-level list). An explicitly pinned child (by provider, endpoint, or model) uses that chain only when it is declared; otherwise it fails loudly instead of borrowing the parent agent's route. For an unpinned child, an absent or `null` setting preserves parent-chain inheritance. Use `fallback_providers: []` under `delegation:` to disable child fallback entirely.
 
