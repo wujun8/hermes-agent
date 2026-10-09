@@ -174,6 +174,7 @@ def test_provider_health_probe_handles_responses_sse_black_box(
         _write_test_config(hermes_home, base_url)
         child_env = {
             "HOME": str(fake_home),
+            "HERMES_PYTHON": sys.executable,
             "PATH": _minimal_path(),
             "TMPDIR": str(case_dir),
             "HERMES_DIR": str(hermes_home),

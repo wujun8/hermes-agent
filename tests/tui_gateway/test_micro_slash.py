@@ -10,7 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
-import yaml
+import hermes_yaml as yaml
 
 from hermes_state import SessionDB
 
@@ -684,6 +684,7 @@ def test_prompt_exact_lease_cleanup_skips_replaced_session(gateway, monkeypatch)
     server, db, _home = gateway
     old_agent = LiveAgent(db, "prompt-aba-old")
     old_session = _session(server, db, "sid-prompt-aba", "prompt-aba-old", old_agent)
+    old_session["profile_home"] = str(_home / "owning-profile")
     old_lease = RecordingLease("aba-old")
     old_session["active_session_lease"] = old_lease
     new_agent = LiveAgent(db, "prompt-aba-new")
@@ -694,7 +695,8 @@ def test_prompt_exact_lease_cleanup_skips_replaced_session(gateway, monkeypatch)
     registry_checked = threading.Event()
     registry_release = threading.Event()
 
-    def blocked_child_check(_session_key: str) -> bool:
+    def blocked_child_check(_session_key: str, profile_home) -> bool:
+        assert profile_home == old_session["profile_home"]
         registry_checked.set()
         assert registry_release.wait(5), "cleanup registry seam was not released"
         return False
@@ -1154,7 +1156,7 @@ def test_busy_micro_rejects_before_lease_config_db_or_live_mutation(
     if busy_source == "running":
         session["running"] = True
     else:
-        monkeypatch.setattr(server, "_child_run_active", lambda _key: True)
+        monkeypatch.setattr(server, "_child_run_active", lambda _key, _profile_home: True)
 
     def fail_config(_session):
         pytest.fail("busy /micro must reject before loading config")

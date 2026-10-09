@@ -331,9 +331,9 @@ def _make_agent(
     *, api_mode="chat_completions", max_retries=1, probe_command="probe --ready"
 ):
     with (
-        patch("run_agent.get_tool_definitions", return_value=[]),
-        patch("run_agent.check_toolset_requirements", return_value={}),
-        patch("run_agent.OpenAI", return_value=MagicMock()),
+        patch("model_tools.get_tool_definitions", return_value=[]),
+        patch("model_tools.check_toolset_requirements", return_value={}),
+        patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()),
         patch(
             "hermes_cli.config.load_config_readonly",
             return_value={
@@ -414,7 +414,7 @@ def _run(agent, api_side_effect, *, conversation_history=None):
         patch.object(agent, "_save_trajectory"),
         patch.object(agent, "_cleanup_task_resources"),
         patch("agent.conversation_loop.time.sleep"),
-        patch("agent.conversation_loop.jittered_backoff", return_value=0.0),
+        patch("agent.retry_utils.jittered_backoff", return_value=0.0),
         patch("agent.agent_runtime_helpers.time.sleep"),
     ):
         return agent.run_conversation(
@@ -610,8 +610,10 @@ def test_real_openai_http_503_probe_then_same_boundary_recovers(
     tmp_path, monkeypatch
 ):
     wire_payloads = []
+    wire_stream_flags = []
     marker_observations = []
     agent_holder = []
+    recovery_ready = False
 
     class Handler(BaseHTTPRequestHandler):
         def _json(self, status, payload):
@@ -623,10 +625,12 @@ def test_real_openai_http_503_probe_then_same_boundary_recovers(
             self.wfile.write(body)
 
         def do_GET(self):
+            nonlocal recovery_ready
             if self.path == "/ready":
                 marker_observations.append(
                     delegate_tool._is_live_api_outage_wait(agent_holder[0])
                 )
+                recovery_ready = True
                 self._json(200, {"ready": True})
                 return
             self._json(404, {"error": "not found"})
@@ -636,8 +640,11 @@ def test_real_openai_http_503_probe_then_same_boundary_recovers(
                 self._json(404, {"error": "not found"})
                 return
             size = int(self.headers.get("Content-Length", "0"))
-            wire_payloads.append(json.loads(self.rfile.read(size)))
-            if len(wire_payloads) == 1:
+            payload = json.loads(self.rfile.read(size))
+            wire_payloads.append(payload)
+            streaming = payload.get("stream", False)
+            wire_stream_flags.append(streaming)
+            if not streaming or not recovery_ready:
                 self._json(
                     503,
                     {
@@ -718,8 +725,8 @@ def test_real_openai_http_503_probe_then_same_boundary_recovers(
 
     try:
         with (
-            patch("run_agent.get_tool_definitions", return_value=[]),
-            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("model_tools.get_tool_definitions", return_value=[]),
+            patch("model_tools.check_toolset_requirements", return_value={}),
         ):
             agent = AIAgent(
                 api_key="test-key-not-secret",
@@ -757,7 +764,7 @@ def test_real_openai_http_503_probe_then_same_boundary_recovers(
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
             patch("agent.conversation_loop.time.sleep"),
-            patch("agent.conversation_loop.jittered_backoff", return_value=0.0),
+            patch("agent.retry_utils.jittered_backoff", return_value=0.0),
             patch("agent.agent_runtime_helpers.time.sleep"),
         ):
             result = agent.run_conversation(
@@ -770,9 +777,14 @@ def test_real_openai_http_503_probe_then_same_boundary_recovers(
 
     assert result["completed"] is True
     assert result["final_response"] == "recovered over real HTTP"
-    assert len(wire_payloads) == 2
+    assert len(wire_payloads) == 3
+    assert wire_stream_flags == [True, False, True]
     assert marker_observations == [True]
-    assert wire_payloads[0]["messages"] == wire_payloads[1]["messages"]
+    assert (
+        wire_payloads[0]["messages"]
+        == wire_payloads[1]["messages"]
+        == wire_payloads[2]["messages"]
+    )
     assert [message["role"] for message in wire_payloads[0]["messages"]].count("user") == 1
     assert [message["role"] for message in wire_payloads[0]["messages"]].count("tool") == 1
     assert [message["role"] for message in result["messages"]].count("user") == 1

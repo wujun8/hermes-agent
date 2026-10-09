@@ -124,7 +124,7 @@ class TestExceptionHandling:
         assert caplog.records[0].levelname == "WARNING"
         assert "bad-profile" not in caplog.records[0].message
         assert "outside profiles root" not in caplog.records[0].message
-    
+
 
 
 class TestRoutingConsultation:

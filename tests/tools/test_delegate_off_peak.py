@@ -52,7 +52,7 @@ def test_new_dispatch_uses_only_the_active_profiles_native_deepseek_route(
     tmp_path, monkeypatch, caplog
 ):
     """Resolve real profile config/secrets and inspect the route passed to child construction."""
-    import yaml
+    import hermes_yaml as yaml
 
     import hermes_cli.config as hermes_config
     import hermes_constants
@@ -301,7 +301,7 @@ def test_new_dispatch_uses_only_the_active_profiles_native_deepseek_route(
 
 def test_inherit_off_peak_keeps_the_profiles_named_supplier_route(tmp_path, monkeypatch, caplog):
     """The cheaper model stays on each profile's normal provider, endpoint, and key."""
-    import yaml
+    import hermes_yaml as yaml
 
     import hermes_cli.config as hermes_config
     import run_agent

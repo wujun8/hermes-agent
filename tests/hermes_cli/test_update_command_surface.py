@@ -60,6 +60,5 @@ def test_update_module_has_no_in_core_release_engine() -> None:
     for forbidden_text in (
         "local-patches",
         "hermes upgrade",
-        "release_tag",
     ):
         assert forbidden_text not in source

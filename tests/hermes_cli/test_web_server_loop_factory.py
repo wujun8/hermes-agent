@@ -6,7 +6,7 @@ import uvicorn._compat as uvicorn_compat
 from hermes_cli import web_server
 
 
-@pytest.mark.linux_only
+@pytest.mark.platforms("linux")
 def test_linux_serve_runner_receives_uvicorn_loop_factory(monkeypatch):
     loop_factory = object()
     config_calls = []
@@ -42,7 +42,7 @@ def test_linux_serve_runner_receives_uvicorn_loop_factory(monkeypatch):
     assert bare_runner_calls == []
 
 
-@pytest.mark.linux_only
+@pytest.mark.platforms("linux")
 def test_linux_serve_treats_keyboardinterrupt_as_clean_shutdown(monkeypatch):
     loop_factory = object()
     seen = {}

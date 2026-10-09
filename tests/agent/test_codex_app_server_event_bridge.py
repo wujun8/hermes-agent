@@ -29,7 +29,6 @@ from agent.codex_runtime import (
     make_codex_app_server_event_bridge,
 )
 
-
 def _make_stub_agent() -> SimpleNamespace:
     """Minimal stand-in for AIAgent that records every callback fire."""
     return SimpleNamespace(
@@ -42,22 +41,15 @@ def _make_stub_agent() -> SimpleNamespace:
         _touch_activity=MagicMock(name="_touch_activity"),
     )
 
-
 def _item_started(item: dict) -> dict:
     return {"method": "item/started", "params": {"item": item}}
-
 
 def _item_completed(item: dict) -> dict:
     return {"method": "item/completed", "params": {"item": item}}
 
-
 # ---------- name / args / preview / result mapping ----------
 
-
 class TestCodexItemToToolName:
-
-
-
 
     def test_dynamic_tool_call_uses_tool_field(self):
         assert _codex_item_to_tool_name(
@@ -75,10 +67,6 @@ class TestCodexItemToToolName:
         assert _codex_item_to_tool_name(
             {"type": "mcpToolCall", "server": "hermes-tools", "tool": "browser_navigate"}
         ) == "browser_navigate"
-
-
-
-
 
 class TestCodexItemToArgs:
 
@@ -98,13 +86,11 @@ class TestCodexItemToArgs:
             ]
         }
 
-
     def test_non_dict_arguments_get_wrapped(self):
         args = _codex_item_to_args({
             "type": "dynamicToolCall", "arguments": ["a", "b"],
         })
         assert args == {"arguments": ["a", "b"]}
-
 
 class TestCodexItemToPreview:
     def test_command_preview_truncated(self):
@@ -126,10 +112,6 @@ class TestCodexItemToPreview:
         assert "/p0.py" in preview and "/p2.py" in preview
         assert "+2 more" in preview
 
-
-
-
-
 class TestCodexItemCompletionPayload:
     def test_command_success_returns_aggregated_output(self):
         result, is_error = _codex_item_completion_payload({
@@ -140,8 +122,6 @@ class TestCodexItemCompletionPayload:
         assert result == "hello\nworld\n"
         assert is_error is False
 
-
-
     def test_mcp_tool_error_is_error(self):
         result, is_error = _codex_item_completion_payload({
             "type": "mcpToolCall",
@@ -150,10 +130,7 @@ class TestCodexItemCompletionPayload:
         assert "[error]" in result
         assert is_error is True
 
-
-
 # ---------- bridge: dispatch contracts ----------
-
 
 class TestStreamDeltaDispatch:
     def test_app_server_event_refreshes_turn_activity(self):
@@ -161,7 +138,7 @@ class TestStreamDeltaDispatch:
         bridge = make_codex_app_server_event_bridge(agent)
         bridge({"method": "item/reasoning/delta", "params": {"delta": "thinking..."}})
         agent._touch_activity.assert_called_once_with(
-            "codex app-server event: item/reasoning/delta"
+            "codex app-server: item/reasoning/delta"
         )
 
     def test_agent_message_delta_fires_stream_delta(self):
@@ -175,8 +152,6 @@ class TestStreamDeltaDispatch:
         assert agent._fire_stream_delta.call_args_list[0].args == ("hello ",)
         assert agent._fire_stream_delta.call_args_list[1].args == ("world",)
 
-
-
     def test_reasoning_delta_fires_reasoning_callback(self):
         agent = _make_stub_agent()
         bridge = make_codex_app_server_event_bridge(agent)
@@ -184,7 +159,6 @@ class TestStreamDeltaDispatch:
                 "params": {"delta": "thinking..."}})
         agent._fire_reasoning_delta.assert_called_once_with("thinking...")
         agent._fire_stream_delta.assert_not_called()
-
 
 class TestToolProgressDispatch:
     def test_command_started_fires_tool_started(self):
@@ -230,10 +204,6 @@ class TestToolProgressDispatch:
         assert completed.kwargs["is_error"] is False
         assert completed.kwargs["result"] == "hi\n"
 
-
-
-
-
     def test_web_search_builtin_fires_started_and_completed(self):
         """Codex's built-in webSearch produces a start/complete bubble pair
         with the query as preview and args (#26541)."""
@@ -254,9 +224,6 @@ class TestToolProgressDispatch:
         assert calls[0].args[1] == "web_search"
         assert calls[0].args[2] == "hermes agent docs"
         assert calls[0].args[3] == {"query": "hermes agent docs"}
-
-
-
 
 class TestAgentMessageInterimDispatch:
     def test_completed_agent_message_emits_interim(self):
@@ -295,8 +262,6 @@ class TestAgentMessageInterimDispatch:
             {"role": "assistant", "content": "Still checking."}
         )
 
-
-
     def test_show_commentary_off_suppresses_interim(self):
         """display.show_commentary=false silences agentMessage interim
         delivery on the app-server runtime (same contract as the
@@ -313,7 +278,6 @@ class TestAgentMessageInterimDispatch:
             "type": "commandExecution", "id": "cmd-1", "command": "ls",
         }))
         agent.tool_progress_callback.assert_called_once()
-
 
 class TestBridgeRobustness:
 
@@ -341,9 +305,6 @@ class TestBridgeRobustness:
             "type": "agentMessage", "id": "am-x", "text": "hi",
         }))
 
-
-
-
 # ---------- end-to-end: bridge is wired in run_codex_app_server_turn ----------
 
 
@@ -357,13 +318,22 @@ class TestBridgeWiredInRuntime:
         from agent import codex_runtime
 
         captured: dict = {}
+        captured_turn: dict = {}
 
         class FakeSession:
             def __init__(self, **kwargs):
                 captured.update(kwargs)
 
-            def run_turn(self, user_input, **_):
+            def ensure_started(self):
+                return "th1"
+
+            def run_turn(self, user_input, *, model=None, reasoning_effort=None,
+                         service_tier=None, turn_timeout=None):
                 from agent.transports.codex_app_server_session import TurnResult
+                captured_turn.update(
+                    user_input=user_input, model=model, reasoning_effort=reasoning_effort,
+                    service_tier=service_tier, turn_timeout=turn_timeout,
+                )
                 return TurnResult(
                     final_text="done",
                     projected_messages=[],
@@ -385,6 +355,8 @@ class TestBridgeWiredInRuntime:
         agent = SimpleNamespace(
             session_cwd=None,
             _codex_session=None,
+            model="gpt-5.5",
+            codex_app_server_turn_timeout_seconds=7200.0,
             tool_progress_callback=MagicMock(),
             _fire_stream_delta=MagicMock(),
             _fire_reasoning_delta=MagicMock(),
@@ -406,7 +378,7 @@ class TestBridgeWiredInRuntime:
             _session_db=None,
         )
 
-        codex_runtime.run_codex_app_server_turn(
+        result = codex_runtime.run_codex_app_server_turn(
             agent,
             user_message="hi",
             original_user_message="hi",
@@ -414,6 +386,11 @@ class TestBridgeWiredInRuntime:
             effective_task_id="t",
         )
 
+        assert result["completed"] is True
+        assert captured_turn == {
+            "user_input": "hi", "model": "gpt-5.5", "reasoning_effort": None,
+            "service_tier": None, "turn_timeout": 7200.0,
+        }
         assert "on_event" in captured, (
             "run_codex_app_server_turn must pass on_event=<bridge> to the "
             "session — without it the gateway sees no live progress (#33200)"
@@ -436,3 +413,55 @@ class TestBridgeWiredInRuntime:
         agent.tool_progress_callback.assert_called_once()
         assert agent.tool_progress_callback.call_args.args[0] == "tool.started"
         assert agent.tool_progress_callback.call_args.args[1] == "exec_command"
+
+
+@pytest.mark.parametrize("note", [
+    {"method": method, "params": {"delta": "progress"}}
+    for method in (
+        "item/agentMessage/delta", "item/reasoning/delta", "item/reasoning/summaryDelta",
+        "item/reasoning/textDelta", "item/reasoning/summaryTextDelta",
+        "item/commandExecution/outputDelta", "item/fileChange/outputDelta",
+    )
+] + [
+    {"method": method, "params": {"item": {"id": "i1", "type": kind, "text": "progress"}}}
+    for method in ("item/started", "item/completed")
+    for kind in ("agentMessage", "reasoning", "commandExecution", "mcpToolCall", "dynamicToolCall")
+])
+def test_real_progress_keeps_watchdog_alive_but_silence_still_aborts(monkeypatch, note):
+    """Display hooks are optional; real progress must reach the watchdog regardless."""
+    import threading
+    from agent import activity_tracking, turn_liveness
+
+    clock = SimpleNamespace(now=1000.0)
+    timer = SimpleNamespace(time=lambda: clock.now, monotonic=lambda: clock.now)
+    monkeypatch.setattr(activity_tracking, "time", timer)
+    monkeypatch.setattr(turn_liveness, "time", timer)
+    agent = activity_tracking.ActivityTrackingMixin()
+    agent.show_commentary = False
+    agent._touch_activity("starting new turn")
+    abort = MagicMock(return_value=True)
+    watchdog = turn_liveness.TurnLivenessWatchdog(
+        agent, session_id="test", timeout_s=600, poll_s=1,
+        stop_event=threading.Event(), activity_lock=agent._liveness_activity_lock(),
+        is_turn_active=lambda: True, commit_abort=abort, deactivate_turn=MagicMock(),
+    )
+    bridge = make_codex_app_server_event_bridge(agent)
+    # More than 600 seconds of total runtime, with progress every 300 seconds.
+    for _ in range(4):
+        clock.now += 300
+        bridge(note)
+        watchdog._tick()
+        abort.assert_not_called()
+    last_activity = agent._last_activity_ts
+    # Empty deltas / unrelated transport frames must not manufacture progress.
+    clock.now += 601
+    for idle_note in (
+        {"method": "item/agentMessage/delta", "params": {"delta": ""}},
+        {"method": "thread/tokenUsage/updated", "params": {}},
+        {"method": "unknown/keepalive", "params": {}},
+        {"method": "item/started", "params": {}},
+    ):
+        bridge(idle_note)
+    assert agent._last_activity_ts == last_activity
+    assert watchdog._tick() is False
+    abort.assert_called_once()

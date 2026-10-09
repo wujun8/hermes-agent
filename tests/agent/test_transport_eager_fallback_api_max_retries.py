@@ -30,9 +30,9 @@ def _make_tool_defs():
 
 def _make_agent_with_fallback(fb_chain, *, api_max_retries=3):
     with (
-        patch("run_agent.get_tool_definitions", return_value=_make_tool_defs()),
-        patch("run_agent.check_toolset_requirements", return_value={}),
-        patch("run_agent.OpenAI", return_value=MagicMock()),
+        patch("model_tools.get_tool_definitions", return_value=_make_tool_defs()),
+        patch("model_tools.check_toolset_requirements", return_value={}),
+        patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()),
     ):
         agent = AIAgent(
             api_key="primary-key-abcdef12",

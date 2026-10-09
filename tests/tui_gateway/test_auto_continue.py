@@ -13,24 +13,32 @@ time is positive proof the turn never finished. Contract pinned here:
 * ``_maybe_schedule_auto_continue`` re-submits a fresh interrupted prompt as
   a continuation note (display_kind ``auto_continue``), refuses stale /
   disabled / crash-looping / already-running cases, and bounds attempts via
-  the marker's attempt counter.
+  the marker's attempt counter;
+* a marker whose writer is still alive is ownership evidence, not crash
+  evidence: a second backend resuming the same session over one HERMES_HOME
+  schedules nothing and leaves the marker for its owner to clear (#94778).
 """
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 import threading
 import time
 import types
+from pathlib import Path
 
 import pytest
 
-from agent.api_outage_recovery import should_auto_resume_api_outage_result
 from tui_gateway import server
 from tui_gateway.turn_marker import (
     clear_turn_marker,
+    marker_writer_state,
     read_turn_marker,
     record_turn_start,
 )
+from agent.api_outage_recovery import should_auto_resume_api_outage_result
 
 
 class _InlineThread:
@@ -99,26 +107,19 @@ def turn_env(monkeypatch, tmp_path, marker_home):
     monkeypatch.setattr(server, "_register_session_cwd", lambda session: None)
     monkeypatch.setattr(server, "_tts_stream_begin", lambda: None)
     monkeypatch.setattr(server, "_sync_session_key_after_compress", lambda *a, **k: None)
-    monkeypatch.setattr(server, "_get_usage", lambda agent, **_kwargs: {})
+    monkeypatch.setattr(server, "_get_usage", lambda agent: {})
 
 
 # ── Marker module ──────────────────────────────────────────────────────
 
 
 def test_marker_roundtrip(tmp_path):
-    record_turn_start(
-        tmp_path,
-        "abc",
-        "fix the bug",
-        attempts=1,
-        resume_reason="api_outage_recovery",
-    )
+    record_turn_start(tmp_path, "abc", "fix the bug", attempts=1)
 
     marker = read_turn_marker(tmp_path, "abc")
     assert marker is not None
     assert marker["prompt"] == "fix the bug"
     assert marker["attempts"] == 1
-    assert marker["resume_reason"] == "api_outage_recovery"
     assert marker["started_at"] == pytest.approx(time.time(), abs=5)
 
     clear_turn_marker(tmp_path, "abc")
@@ -205,58 +206,6 @@ def test_interrupt_racing_marker_write_cannot_leave_recovery_state(
     assert "_active_turn_marker_key" not in session
 
 
-def test_busy_interrupt_attributes_the_new_message_as_user_owned(
-    monkeypatch, marker_home
-):
-    """A busy prompt's interrupt must never look like an auto-resumable outage wait."""
-    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "interrupt")
-    interrupted = []
-
-    class _Agent:
-        def interrupt(self, message=None):
-            interrupted.append(message)
-
-    session = _session(
-        agent=_Agent(),
-        running=True,
-        inflight_turn={"user": "original request", "assistant": "partial reply"},
-    )
-
-    response = server._handle_busy_submit(
-        "rid", "sid", session, "new request", "transport"
-    )
-
-    assert response["result"]["status"] == "queued"
-    deadline = time.time() + 1
-    while not interrupted and time.time() < deadline:
-        time.sleep(0.01)
-    assert interrupted == ["new request"]
-    assert not should_auto_resume_api_outage_result(
-        {
-            "interrupted": True,
-            "resume_reason": "api_outage_recovery",
-            "interrupt_message": interrupted[0],
-        }
-    )
-
-
-@pytest.mark.parametrize("interrupt_message", ["Stop requested", "/stop", "/new", "/reset", "new request"])
-def test_user_owned_interrupt_controls_are_never_auto_resumed(interrupt_message):
-    result = {
-        "interrupted": True,
-        "resume_reason": "api_outage_recovery",
-        "interrupt_message": interrupt_message,
-    }
-
-    assert should_auto_resume_api_outage_result(result) is False
-
-
-def test_unattributed_api_outage_wait_is_the_only_auto_resume_case():
-    assert should_auto_resume_api_outage_result(
-        {"interrupted": True, "resume_reason": "api_outage_recovery"}
-    ) is True
-
-
 # ── Turn lifecycle owns the marker ─────────────────────────────────────
 
 
@@ -296,67 +245,6 @@ def test_handled_failure_still_clears_marker(emits, turn_env, marker_home):
 
     server._run_prompt_submit("rid", "sid", session, "do the thing")
 
-    assert read_turn_marker(marker_home, "session-key") is None
-
-
-def test_api_recovery_interrupt_schedules_runtime_continuation(
-    emits, turn_env, marker_home, monkeypatch
-):
-    scheduled: list[tuple[str, str]] = []
-
-    def _run(message, **kwargs):
-        return {
-            "final_response": "Operation interrupted while waiting for API outage recovery.",
-            "interrupted": True,
-            "completed": False,
-            "resume_reason": "api_outage_recovery",
-        }
-
-    monkeypatch.setattr(
-        server,
-        "_maybe_schedule_auto_continue",
-        lambda sid, session, key: scheduled.append((sid, key)) or {"attempt": 1},
-    )
-    agent = types.SimpleNamespace(
-        session_id="session-key", run_conversation=_run, clear_interrupt=lambda: None
-    )
-    session = _session(agent=agent, running=True)
-
-    server._run_prompt_submit("rid", "sid", session, "do the thing")
-
-    assert scheduled == [("sid", "session-key")]
-    marker = read_turn_marker(marker_home, "session-key")
-    assert marker is not None
-    assert marker["resume_reason"] == "api_outage_recovery"
-
-
-def test_explicit_interrupt_does_not_schedule_runtime_continuation(
-    emits, turn_env, marker_home, monkeypatch
-):
-    scheduled: list = []
-
-    def _run(message, **kwargs):
-        return {
-            "final_response": "Operation interrupted while waiting for API outage recovery.",
-            "interrupted": True,
-            "completed": False,
-            "resume_reason": "api_outage_recovery",
-            "interrupt_message": "Stop requested",
-        }
-
-    monkeypatch.setattr(
-        server,
-        "_maybe_schedule_auto_continue",
-        lambda *args, **kwargs: scheduled.append((args, kwargs)),
-    )
-    agent = types.SimpleNamespace(
-        session_id="session-key", run_conversation=_run, clear_interrupt=lambda: None
-    )
-    session = _session(agent=agent, running=True)
-
-    server._run_prompt_submit("rid", "sid", session, "do the thing")
-
-    assert scheduled == []
     assert read_turn_marker(marker_home, "session-key") is None
 
 
@@ -411,158 +299,6 @@ def test_hosted_terminal_receipt_failure_keeps_crash_marker(
         terminal_callback=_terminal,
     )
 
-    assert read_turn_marker(marker_home, "session-key") is not None
-
-
-def test_api_recovery_hosted_receipt_preserves_both_owners_and_schedules(
-    emits, turn_env, marker_home, monkeypatch
-):
-    scheduled: list[tuple[str, str]] = []
-    receipts: list[tuple[dict, dict | None]] = []
-    hosted_task = {
-        "room_id": "room",
-        "task_id": "task",
-        "thread_id": "thread",
-        "turn_id": "turn",
-        "execution_generation": 1,
-    }
-
-    def _run(message, **kwargs):
-        return {
-            "final_response": "Operation interrupted while waiting for API outage recovery.",
-            "interrupted": True,
-            "completed": False,
-            "resume_reason": "api_outage_recovery",
-        }
-
-    def _terminal(receipt):
-        receipts.append((dict(receipt), read_turn_marker(marker_home, "session-key")))
-
-    monkeypatch.setattr(
-        server,
-        "_maybe_schedule_auto_continue",
-        lambda sid, session, key: scheduled.append((sid, key)) or {"attempt": 1},
-    )
-    agent = types.SimpleNamespace(
-        session_id="session-key", run_conversation=_run, clear_interrupt=lambda: None
-    )
-    session = _session(
-        agent=agent,
-        running=True,
-        source="bot_room",
-        _hosted_room_task=dict(hosted_task),
-    )
-
-    server._run_prompt_submit(
-        "rid",
-        "sid",
-        session,
-        "do the thing",
-        terminal_callback=_terminal,
-    )
-
-    assert len(receipts) == 1
-    receipt, marker_at_callback = receipts[0]
-    assert receipt["status"] == "cancelled"
-    assert marker_at_callback is not None
-    assert marker_at_callback["resume_reason"] == "api_outage_recovery"
-    assert read_turn_marker(marker_home, "session-key") is not None
-    assert session["_hosted_room_task"] == hosted_task
-    assert scheduled == [("sid", "session-key")]
-
-
-def test_hosted_terminal_receipt_failure_preserves_marker_and_task(
-    emits, turn_env, marker_home
-):
-    hosted_task = {
-        "room_id": "room",
-        "task_id": "task",
-        "thread_id": "thread",
-        "turn_id": "turn",
-        "execution_generation": 1,
-    }
-    attempted: list[dict] = []
-
-    def _run(message, **kwargs):
-        return {"final_response": "done"}
-
-    def _terminal(receipt):
-        attempted.append(dict(receipt))
-        raise RuntimeError("state store unavailable")
-
-    agent = types.SimpleNamespace(
-        session_id="session-key", run_conversation=_run, clear_interrupt=lambda: None
-    )
-    session = _session(
-        agent=agent,
-        running=True,
-        source="bot_room",
-        _hosted_room_task=dict(hosted_task),
-    )
-
-    server._run_prompt_submit(
-        "rid",
-        "sid",
-        session,
-        "do the thing",
-        terminal_callback=_terminal,
-    )
-
-    assert len(attempted) == 1
-    assert read_turn_marker(marker_home, "session-key") is not None
-    assert session["_hosted_room_task"] == hosted_task
-
-
-def test_stale_hosted_callback_cannot_clear_newer_task(
-    emits, turn_env, marker_home
-):
-    old_task = {
-        "room_id": "room",
-        "task_id": "old-task",
-        "thread_id": "thread",
-        "turn_id": "old-turn",
-        "execution_generation": 1,
-    }
-    new_task = {
-        "room_id": "room",
-        "task_id": "new-task",
-        "thread_id": "thread",
-        "turn_id": "new-turn",
-        "execution_generation": 2,
-    }
-    callback_calls: list[dict] = []
-    session: dict
-
-    def _run(message, **kwargs):
-        with session["history_lock"]:
-            session["_turn_generation"] += 1
-            session["_hosted_room_task"] = dict(new_task)
-        return {"final_response": "old task finished"}
-
-    def _terminal(receipt):
-        callback_calls.append(dict(receipt))
-
-    agent = types.SimpleNamespace(
-        session_id="session-key", run_conversation=_run, clear_interrupt=lambda: None
-    )
-    session = _session(
-        agent=agent,
-        running=True,
-        source="bot_room",
-        _hosted_room_task=dict(old_task),
-    )
-
-    server._run_prompt_submit(
-        "rid",
-        "sid",
-        session,
-        "old task",
-        terminal_callback=_terminal,
-    )
-
-    assert callback_calls == []
-    assert session["_turn_generation"] == 2
-    assert session["_hosted_room_task"] == new_task
     assert read_turn_marker(marker_home, "session-key") is not None
 
 
@@ -660,23 +396,6 @@ def test_fresh_marker_schedules_continuation(emits, schedule_env, marker_home):
     assert ("message.start", "sid", None) in [(e, s, p) for e, s, p in emits]
 
 
-def test_api_recovery_marker_uses_continue_note(emits, schedule_env, marker_home):
-    record_turn_start(
-        marker_home,
-        "session-key",
-        "fix the flaky test",
-        resume_reason="api_outage_recovery",
-    )
-
-    result = server._maybe_schedule_auto_continue("sid", _session(), "session-key")
-
-    assert result is not None
-    (text, kwargs), = schedule_env
-    assert text == server._api_outage_recovery_note()
-    assert "CONTINUE the interrupted task" in text
-    assert kwargs["display_kind"] == "auto_continue"
-
-
 def test_hosted_room_marker_is_left_to_the_driver(schedule_env, marker_home):
     record_turn_start(marker_home, "session-key", "hosted prompt")
 
@@ -689,6 +408,34 @@ def test_hosted_room_marker_is_left_to_the_driver(schedule_env, marker_home):
     assert result is None
     assert not schedule_env
     assert read_turn_marker(marker_home, "session-key") is not None
+
+
+@pytest.fixture()
+def unseen_intro(monkeypatch):
+    """An onboarding-enabled install whose desktop intro has not been seen yet."""
+    import hermes_cli.setup_profile as setup_profile
+    monkeypatch.setattr(setup_profile, "onboarding_eligible", lambda: True)
+    monkeypatch.setattr(setup_profile, "read_state", lambda: {"intro": "unseen"})
+
+
+def test_desktop_setup_turn_is_left_to_the_intro(schedule_env, marker_home, unseen_intro):
+    record_turn_start(marker_home, "session-key", "[/initiate-setup]\nset me up")
+
+    result = server._maybe_schedule_auto_continue("sid", _session(source="desktop"), "session-key")
+
+    assert result is None
+    assert not schedule_env
+    assert read_turn_marker(marker_home, "session-key") is None
+
+
+def test_tui_setup_turn_still_auto_continues(emits, schedule_env, marker_home, unseen_intro):
+    record_turn_start(marker_home, "session-key", "[/initiate-setup]\nset me up")
+
+    result = server._maybe_schedule_auto_continue("sid", _session(source="tui"), "session-key")
+
+    assert result is not None
+    (text, _kwargs), = schedule_env
+    assert "[/initiate-setup]" in text
 
 
 def test_stale_marker_is_cleared_not_continued(schedule_env, marker_home, monkeypatch):
@@ -800,3 +547,382 @@ def test_failed_agent_build_leaves_marker_for_retry(
 
 
 # ── End to end: continuation runs a real turn and clears the marker ────
+
+
+# ── Marker writer identity: a live writer is an owner, not a corpse ────
+#
+# The scheduler used to treat every marker it found as proof the writing
+# process died. Two backends over one HERMES_HOME break that assumption: A is
+# mid-turn on session S while B resumes S — B read A's live marker as a crash
+# and started a second turn over it (#94778). Ownership now comes from the
+# writer's pid + create time.
+
+_CHILD_WRITER = """
+import os, sys, time
+from pathlib import Path
+from tui_gateway.turn_marker import record_turn_start
+
+home = Path(sys.argv[1])
+record_turn_start(home, "session-key", "interrupted prompt")
+print(f"ready {os.getpid()}", flush=True)
+# Linger until the test drops a sentinel. Self-exit, not terminate(): a venv
+# python.exe on Windows re-execs the real interpreter, so Popen.pid is the
+# launcher and killing it does not reliably reach the process that holds the
+# marker.
+deadline = time.time() + 120
+while not (home / "writer-exit").exists() and time.time() < deadline:
+    time.sleep(0.05)
+"""
+
+
+def _wait_for_marker(home, key, timeout=30.0):
+    """Bounded poll — the marker is written by another process, so a fixed
+    sleep in the parent would just be a flaky test."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if read_turn_marker(home, key) is not None:
+            return
+        time.sleep(0.05)
+    raise AssertionError(f"child writer produced no marker within {timeout}s")
+
+
+def test_marker_writer_state_rejects_a_recycled_pid():
+    """Same pid, different process: the create time is what makes the pid an
+    identity. A start time from yesterday cannot be this process."""
+    assert marker_writer_state(
+        {"writer_pid": os.getpid(), "writer_start_time": time.time() - 86400}
+    ) != "alive"
+
+
+def test_second_backend_defers_to_a_live_marker_writer(emits, schedule_env, marker_home):
+    """Two backends, one HERMES_HOME, one session: A is mid-turn (alive writer)
+
+    B resumes S and must read the marker as ownership evidence, not crash
+    evidence — no continuation, no misleading "Resuming interrupted turn…"
+    frame, no duplicate turn, and A's marker left for A to clear. Once A is
+    really gone the same call does schedule, so the live-writer gate is what
+    held B back and not some other switch.
+    """
+    repo_root = Path(server.__file__).resolve().parents[1]
+    child = subprocess.Popen(
+        [sys.executable, "-c", _CHILD_WRITER, str(marker_home)],
+        cwd=str(repo_root),
+        env={**os.environ, "PYTHONPATH": str(repo_root)},
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        ready = child.stdout.readline().strip()
+        if not ready.startswith("ready "):
+            child.kill()
+            _, stderr = child.communicate(timeout=10)
+            raise AssertionError(f"child writer never started: {ready!r} / {stderr!r}")
+        writer_pid = int(ready.split()[1])
+        _wait_for_marker(marker_home, "session-key")
+        assert writer_pid != os.getpid()
+
+        written = read_turn_marker(marker_home, "session-key")
+        assert written["writer_pid"] == writer_pid
+        assert marker_writer_state(written) == "alive"
+
+        session = _session()
+        assert server._maybe_schedule_auto_continue("sid", session, "session-key") is None
+        assert not schedule_env  # nothing queued behind the live writer
+        assert session.get("_auto_continue_scheduled") is None  # not even claimed
+        assert not [e for e in emits if e[0] in ("status.update", "message.start")]
+        assert read_turn_marker(marker_home, "session-key") is not None  # A's marker intact
+
+        child.terminate()  # the launcher; the real writer exits on the sentinel below
+        child.wait(timeout=10)
+        (marker_home / "writer-exit").write_text("go", encoding="utf-8")
+        deadline = time.time() + 30
+        while time.time() < deadline and marker_writer_state(
+            read_turn_marker(marker_home, "session-key")
+        ) != "dead":
+            time.sleep(0.05)
+        assert marker_writer_state(read_turn_marker(marker_home, "session-key")) == "dead", (
+            f"writer pid {writer_pid} (child pid {child.pid}) still reads live"
+        )
+
+        assert server._maybe_schedule_auto_continue("sid", _session(), "session-key") is not None
+        assert len(schedule_env) == 1
+    finally:
+        (marker_home / "writer-exit").touch()  # release the child even on an early failure
+        if child.poll() is None:
+            child.kill()
+        child.wait(timeout=10)
+
+
+def test_busy_interrupt_attributes_the_new_message_as_user_owned(
+    monkeypatch, marker_home
+):
+    """A busy prompt's interrupt must never look like an auto-resumable outage wait."""
+    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "interrupt")
+    interrupted = []
+
+    class _Agent:
+        def interrupt(self, message=None):
+            interrupted.append(message)
+
+    session = _session(
+        agent=_Agent(),
+        running=True,
+        inflight_turn={"user": "original request", "assistant": "partial reply"},
+    )
+
+    response = server._handle_busy_submit(
+        "rid", "sid", session, "new request", "transport"
+    )
+
+    assert response["result"]["status"] == "queued"
+    deadline = time.time() + 1
+    while not interrupted and time.time() < deadline:
+        time.sleep(0.01)
+    assert interrupted == ["new request"]
+    assert not should_auto_resume_api_outage_result(
+        {
+            "interrupted": True,
+            "resume_reason": "api_outage_recovery",
+            "interrupt_message": interrupted[0],
+        }
+    )
+
+@pytest.mark.parametrize("interrupt_message", ["Stop requested", "/stop", "/new", "/reset", "new request"])
+def test_user_owned_interrupt_controls_are_never_auto_resumed(interrupt_message):
+    result = {
+        "interrupted": True,
+        "resume_reason": "api_outage_recovery",
+        "interrupt_message": interrupt_message,
+    }
+
+    assert should_auto_resume_api_outage_result(result) is False
+
+def test_unattributed_api_outage_wait_is_the_only_auto_resume_case():
+    assert should_auto_resume_api_outage_result(
+        {"interrupted": True, "resume_reason": "api_outage_recovery"}
+    ) is True
+
+def test_api_recovery_interrupt_schedules_runtime_continuation(
+    emits, turn_env, marker_home, monkeypatch
+):
+    scheduled: list[tuple[str, str]] = []
+
+    def _run(message, **kwargs):
+        return {
+            "final_response": "Operation interrupted while waiting for API outage recovery.",
+            "interrupted": True,
+            "completed": False,
+            "resume_reason": "api_outage_recovery",
+        }
+
+    monkeypatch.setattr(
+        server,
+        "_maybe_schedule_auto_continue",
+        lambda sid, session, key: scheduled.append((sid, key)) or {"attempt": 1},
+    )
+    agent = types.SimpleNamespace(
+        session_id="session-key", run_conversation=_run, clear_interrupt=lambda: None
+    )
+    session = _session(agent=agent, running=True)
+
+    server._run_prompt_submit("rid", "sid", session, "do the thing")
+
+    assert scheduled == [("sid", "session-key")]
+    marker = read_turn_marker(marker_home, "session-key")
+    assert marker is not None
+    assert marker["resume_reason"] == "api_outage_recovery"
+
+def test_explicit_interrupt_does_not_schedule_runtime_continuation(
+    emits, turn_env, marker_home, monkeypatch
+):
+    scheduled: list = []
+
+    def _run(message, **kwargs):
+        return {
+            "final_response": "Operation interrupted while waiting for API outage recovery.",
+            "interrupted": True,
+            "completed": False,
+            "resume_reason": "api_outage_recovery",
+            "interrupt_message": "Stop requested",
+        }
+
+    monkeypatch.setattr(
+        server,
+        "_maybe_schedule_auto_continue",
+        lambda *args, **kwargs: scheduled.append((args, kwargs)),
+    )
+    agent = types.SimpleNamespace(
+        session_id="session-key", run_conversation=_run, clear_interrupt=lambda: None
+    )
+    session = _session(agent=agent, running=True)
+
+    server._run_prompt_submit("rid", "sid", session, "do the thing")
+
+    assert scheduled == []
+    assert read_turn_marker(marker_home, "session-key") is None
+
+def test_api_recovery_hosted_receipt_preserves_both_owners_and_schedules(
+    emits, turn_env, marker_home, monkeypatch
+):
+    scheduled: list[tuple[str, str]] = []
+    receipts: list[tuple[dict, dict | None]] = []
+    hosted_task = {
+        "room_id": "room",
+        "task_id": "task",
+        "thread_id": "thread",
+        "turn_id": "turn",
+        "execution_generation": 1,
+    }
+
+    def _run(message, **kwargs):
+        return {
+            "final_response": "Operation interrupted while waiting for API outage recovery.",
+            "interrupted": True,
+            "completed": False,
+            "resume_reason": "api_outage_recovery",
+        }
+
+    def _terminal(receipt):
+        receipts.append((dict(receipt), read_turn_marker(marker_home, "session-key")))
+
+    monkeypatch.setattr(
+        server,
+        "_maybe_schedule_auto_continue",
+        lambda sid, session, key: scheduled.append((sid, key)) or {"attempt": 1},
+    )
+    agent = types.SimpleNamespace(
+        session_id="session-key", run_conversation=_run, clear_interrupt=lambda: None
+    )
+    session = _session(
+        agent=agent,
+        running=True,
+        source="bot_room",
+        _hosted_room_task=dict(hosted_task),
+    )
+
+    server._run_prompt_submit(
+        "rid",
+        "sid",
+        session,
+        "do the thing",
+        terminal_callback=_terminal,
+    )
+
+    assert len(receipts) == 1
+    receipt, marker_at_callback = receipts[0]
+    assert receipt["status"] == "cancelled"
+    assert marker_at_callback is not None
+    assert marker_at_callback["resume_reason"] == "api_outage_recovery"
+    assert read_turn_marker(marker_home, "session-key") is not None
+    assert session["_hosted_room_task"] == hosted_task
+    assert scheduled == [("sid", "session-key")]
+
+def test_hosted_terminal_receipt_failure_preserves_marker_and_task(
+    emits, turn_env, marker_home
+):
+    hosted_task = {
+        "room_id": "room",
+        "task_id": "task",
+        "thread_id": "thread",
+        "turn_id": "turn",
+        "execution_generation": 1,
+    }
+    attempted: list[dict] = []
+
+    def _run(message, **kwargs):
+        return {"final_response": "done"}
+
+    def _terminal(receipt):
+        attempted.append(dict(receipt))
+        raise RuntimeError("state store unavailable")
+
+    agent = types.SimpleNamespace(
+        session_id="session-key", run_conversation=_run, clear_interrupt=lambda: None
+    )
+    session = _session(
+        agent=agent,
+        running=True,
+        source="bot_room",
+        _hosted_room_task=dict(hosted_task),
+    )
+
+    server._run_prompt_submit(
+        "rid",
+        "sid",
+        session,
+        "do the thing",
+        terminal_callback=_terminal,
+    )
+
+    assert len(attempted) == 1
+    assert read_turn_marker(marker_home, "session-key") is not None
+    assert session["_hosted_room_task"] == hosted_task
+
+def test_stale_hosted_callback_cannot_clear_newer_task(
+    emits, turn_env, marker_home
+):
+    old_task = {
+        "room_id": "room",
+        "task_id": "old-task",
+        "thread_id": "thread",
+        "turn_id": "old-turn",
+        "execution_generation": 1,
+    }
+    new_task = {
+        "room_id": "room",
+        "task_id": "new-task",
+        "thread_id": "thread",
+        "turn_id": "new-turn",
+        "execution_generation": 2,
+    }
+    callback_calls: list[dict] = []
+    session: dict
+
+    def _run(message, **kwargs):
+        with session["history_lock"]:
+            session["_turn_generation"] += 1
+            session["_hosted_room_task"] = dict(new_task)
+        return {"final_response": "old task finished"}
+
+    def _terminal(receipt):
+        callback_calls.append(dict(receipt))
+
+    agent = types.SimpleNamespace(
+        session_id="session-key", run_conversation=_run, clear_interrupt=lambda: None
+    )
+    session = _session(
+        agent=agent,
+        running=True,
+        source="bot_room",
+        _hosted_room_task=dict(old_task),
+    )
+
+    server._run_prompt_submit(
+        "rid",
+        "sid",
+        session,
+        "old task",
+        terminal_callback=_terminal,
+    )
+
+    assert callback_calls == []
+    assert session["_turn_generation"] == 2
+    assert session["_hosted_room_task"] == new_task
+    assert read_turn_marker(marker_home, "session-key") is not None
+
+def test_api_recovery_marker_uses_continue_note(emits, schedule_env, marker_home):
+    record_turn_start(
+        marker_home,
+        "session-key",
+        "fix the flaky test",
+        resume_reason="api_outage_recovery",
+    )
+
+    result = server._maybe_schedule_auto_continue("sid", _session(), "session-key")
+
+    assert result is not None
+    (text, kwargs), = schedule_env
+    assert text == server._api_outage_recovery_note()
+    assert "CONTINUE the interrupted task" in text
+    assert kwargs["display_kind"] == "auto_continue"

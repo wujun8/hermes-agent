@@ -3,33 +3,9 @@
 from prompt_toolkit.completion import CompleteEvent
 from prompt_toolkit.document import Document
 
-from hermes_cli.commands import (
-    COMMAND_REGISTRY,
-    COMMANDS,
-    COMMANDS_BY_CATEGORY,
-    CommandDef,
-    GATEWAY_KNOWN_COMMANDS,
-    SUBCOMMANDS,
-    command_desktop_meta,
-    gateway_help_lines,
-    infer_argument_mode,
-    is_gateway_known_command,
-    resolve_command,
-)
+from hermes_cli.commands import COMMAND_REGISTRY, COMMANDS_BY_CATEGORY, CommandDef, GATEWAY_KNOWN_COMMANDS, command_desktop_meta, gateway_help_lines, infer_argument_mode, resolve_command
 from hermes_cli.commands_completion import SlashCommandAutoSuggest, SlashCommandCompleter
-from hermes_cli.commands_platforms import (
-    _CMD_NAME_LIMIT,
-    _SLACK_RESERVED_COMMANDS,
-    _SLACK_VIA_HERMES_ONLY,
-    _clamp_command_names,
-    _sanitize_telegram_name,
-    slack_app_manifest,
-    slack_native_slashes,
-    slack_subcommand_map,
-    telegram_bot_commands,
-    telegram_menu_commands,
-    telegram_menu_max_commands,
-)
+from hermes_cli.commands_platforms import _CMD_NAME_LIMIT, _SLACK_RESERVED_COMMANDS, _SLACK_VIA_HERMES_ONLY, _clamp_command_names, _sanitize_telegram_name, slack_app_manifest, slack_native_slashes, slack_subcommand_map, telegram_bot_commands, telegram_menu_commands
 
 
 def _completions(completer: SlashCommandCompleter, text: str):
@@ -48,14 +24,6 @@ def _completions(completer: SlashCommandCompleter, text: str):
 class TestCommandRegistry:
 
 
-    def test_save_command_supports_formats(self):
-        cmd = resolve_command("save")
-        assert cmd is not None
-        assert cmd.name == "save"
-        # /save is a cross-platform session export: json (default), md, html
-        assert not cmd.cli_only
-        for token in ("json", "md", "html"):
-            assert token in (cmd.args_hint or "")
 
     def test_no_duplicate_canonical_names(self):
         names = [cmd.name for cmd in COMMAND_REGISTRY]
@@ -72,6 +40,45 @@ class TestCommandRegistry:
                     # This should only happen if the alias points to the same entry
                     assert resolve_command(alias).name == cmd.name or alias == cmd.name, \
                         f"Alias '{alias}' of '{cmd.name}' shadows canonical '{target.name}'"
+
+    def test_skills_desktop_meta_limits_exec_to_review_subcommands(self):
+        # #98330: /skills mixes desktop-relevant write-approval review verbs with CLI-hub
+        # mutations; desktop_subcommands exposes only the review slice to the desktop
+        # surface (completion + exec) without widening the whole family.
+        skills = resolve_command("skills")
+        assert skills is not None
+        assert skills.desktop is None
+        assert command_desktop_meta(skills) == {
+            "argument_mode": "options",
+            "desktop": None,
+            "desktop_subcommands": ["pending", "approve", "reject", "diff", "approval"],
+        }
+        assert set(skills.desktop_subcommands or ()) <= set(skills.subcommands)
+
+    def test_empty_desktop_subcommand_scope_serializes_as_deny_all(self):
+        assert command_desktop_meta(
+            CommandDef("demo", "Demo", "Session", desktop_subcommands=())
+        ) == {
+            "argument_mode": None,
+            "desktop": None,
+            "desktop_subcommands": [],
+        }
+
+
+    def test_argument_mode_infers_text_from_any_args_hint(self):
+        assert infer_argument_mode(CommandDef("demo", "Demo", "Session", args_hint="<prompt>")) == "text"
+        assert infer_argument_mode(CommandDef("ask", "Ask", "Session", args_hint="<query>")) == "text"
+        assert infer_argument_mode(CommandDef("note", "Note", "Session", args_hint="[message]")) == "text"
+
+
+    def test_save_command_supports_formats(self):
+        cmd = resolve_command("save")
+        assert cmd is not None
+        assert cmd.name == "save"
+        # /save is a cross-platform session export: json (default), md, html
+        assert not cmd.cli_only
+        for token in ("json", "md", "html"):
+            assert token in (cmd.args_hint or "")
 
     def test_desktop_meta_lives_on_the_command_def(self):
         review = resolve_command("review")
@@ -92,34 +99,29 @@ class TestCommandRegistry:
         assert goal is not None
         assert goal.argument_mode == "mixed"
 
-    def test_argument_mode_infers_text_from_any_args_hint(self):
-        assert infer_argument_mode(CommandDef("demo", "Demo", "Session", args_hint="<prompt>")) == "text"
-        assert infer_argument_mode(CommandDef("ask", "Ask", "Session", args_hint="<query>")) == "text"
-        assert infer_argument_mode(CommandDef("note", "Note", "Session", args_hint="[message]")) == "text"
-
 
 # ---------------------------------------------------------------------------
 # resolve_command tests
 # ---------------------------------------------------------------------------
 
-class TestResolveCommand:
+class TestResolveCommandAliases:
+    """One-letter aliases resolve to their command, never a longer canonical
+    (exact lookup treats the alias as a full name — /s is not a /sessions prefix)."""
 
+    def test_q_resolves_to_queue(self):
+        cmd = resolve_command("q")
+        assert cmd is not None and cmd.name == "queue"
 
-    def test_topic_is_gateway_command(self):
-        topic = resolve_command("topic")
-        assert topic is not None
-        assert topic.name == "topic"
-        assert "topic" in GATEWAY_KNOWN_COMMANDS
+    def test_s_resolves_to_steer(self):
+        cmd = resolve_command("s")
+        assert cmd is not None and cmd.name == "steer"
 
-    def test_context_command_registered_with_ctx_alias(self):
-        ctx = resolve_command("context")
-        assert ctx is not None
-        assert ctx.name == "context"
-        assert resolve_command("ctx").name == "context"
-        assert "all" in (ctx.subcommands or ())
-        # Available on both CLI and gateway surfaces
-        assert not ctx.cli_only and not ctx.gateway_only
-        assert "context" in GATEWAY_KNOWN_COMMANDS
+    def test_exact_names_still_win_over_the_alias(self):
+        cmd = resolve_command("sessions")
+        assert cmd is not None and cmd.name == "sessions"
+        cmd = resolve_command("steer")
+        assert cmd is not None and cmd.name == "steer"
+
 
 
 # ---------------------------------------------------------------------------
@@ -129,6 +131,12 @@ class TestResolveCommand:
 class TestDerivedDicts:
 
 
+
+    def test_commands_by_category_covers_all_categories(self):
+        registry_categories = {cmd.category for cmd in COMMAND_REGISTRY if not cmd.gateway_only}
+        assert set(COMMANDS_BY_CATEGORY.keys()) == registry_categories
+
+
     def test_commands_dict_includes_aliases(self):
         assert "/bg" in COMMANDS
         assert "/reset" in COMMANDS
@@ -136,10 +144,6 @@ class TestDerivedDicts:
         assert "/exit" in COMMANDS
         assert "/reload_mcp" in COMMANDS
         assert "/gateway" in COMMANDS
-
-    def test_commands_by_category_covers_all_categories(self):
-        registry_categories = {cmd.category for cmd in COMMAND_REGISTRY if not cmd.gateway_only}
-        assert set(COMMANDS_BY_CATEGORY.keys()) == registry_categories
 
 
 # ---------------------------------------------------------------------------
@@ -178,6 +182,8 @@ class TestGatewayKnownCommands:
         assert "micro" not in {name for name, _description in telegram_menu}
 
 
+
+
 class TestGatewayHelpLines:
 
     def test_excludes_cli_only_commands_without_config_gate(self):
@@ -191,6 +197,7 @@ class TestGatewayHelpLines:
                 assert not re.search(pattern, joined), \
                     f"cli_only command /{cmd.name} should not be in gateway help"
 
+
     def test_bg_and_btw_are_separate_commands(self):
         lines = gateway_help_lines()
         joined = "\n".join(lines)
@@ -201,13 +208,8 @@ class TestGatewayHelpLines:
         assert not bg_line
 
 
+
 class TestTelegramBotCommands:
-    def test_returns_list_of_tuples(self):
-        cmds = telegram_bot_commands()
-        assert len(cmds) > 10
-        for name, desc in cmds:
-            assert isinstance(name, str)
-            assert isinstance(desc, str)
 
     def test_no_hyphens_in_command_names(self):
         """Telegram does not support hyphens in command names."""
@@ -231,7 +233,6 @@ class TestTelegramBotCommands:
         assert ("dashy", "does a - b - c") in telegram_bot_commands(
             include_plugins=False)
 
-
     def test_includes_builtin_commands_with_required_args(self):
         """Built-in arg-taking commands (e.g. /queue, /steer, /bg, /btw)
         are now included because their handlers return usage text when
@@ -243,11 +244,16 @@ class TestTelegramBotCommands:
         assert "steer" in names
 
 
+    def test_returns_list_of_tuples(self):
+        cmds = telegram_bot_commands()
+        assert len(cmds) > 10
+        for name, desc in cmds:
+            assert isinstance(name, str)
+            assert isinstance(desc, str)
+
+
+
 class TestSlackSubcommandMap:
-    def test_returns_dict(self):
-        mapping = slack_subcommand_map()
-        assert isinstance(mapping, dict)
-        assert len(mapping) > 10
 
     def test_values_are_slash_prefixed(self):
         for key, val in slack_subcommand_map().items():
@@ -259,6 +265,12 @@ class TestSlackSubcommandMap:
         for cmd in COMMAND_REGISTRY:
             if cmd.cli_only and not cmd.gateway_config_gate:
                 assert cmd.name not in mapping
+
+
+    def test_returns_dict(self):
+        mapping = slack_subcommand_map()
+        assert isinstance(mapping, dict)
+        assert len(mapping) > 10
 
 
 class TestSlackNativeSlashes:
@@ -321,12 +333,14 @@ class TestSlackAppManifest:
             # HTML-escapes args — we want the raw text)
             assert "should_escape" in entry
 
+
     def test_btw_is_in_manifest(self):
         """Regression: /btw must be a native Slack slash, not just a
         /hermes subcommand."""
         m = slack_app_manifest()
         commands = [c["command"] for c in m["features"]["slash_commands"]]
         assert "/btw" in commands
+
 
 
 # ---------------------------------------------------------------------------
@@ -337,9 +351,6 @@ class TestGatewayConfigGate:
     """Tests for the gateway_config_gate mechanism on CommandDef."""
 
 
-    def test_verbose_in_gateway_known_commands(self):
-        """Config-gated commands are always recognized by the gateway."""
-        assert "verbose" in GATEWAY_KNOWN_COMMANDS
 
     def test_config_gate_excluded_from_help_when_off(self, tmp_path, monkeypatch):
         """When the config gate is falsy, the command should not appear in help."""
@@ -360,6 +371,11 @@ class TestGatewayConfigGate:
 
         mapping = slack_subcommand_map()
         assert "verbose" in mapping
+
+
+    def test_verbose_in_gateway_known_commands(self):
+        """Config-gated commands are always recognized by the gateway."""
+        assert "verbose" in GATEWAY_KNOWN_COMMANDS
 
 
 # ---------------------------------------------------------------------------
@@ -437,18 +453,6 @@ class TestStackedSkillCompletion:
 # ── SUBCOMMANDS extraction ──────────────────────────────────────────────
 
 
-class TestSubcommands:
-    def test_explicit_subcommands_extracted(self):
-        """Commands with explicit subcommands on CommandDef are extracted."""
-        assert "/skills" in SUBCOMMANDS
-        assert "install" in SUBCOMMANDS["/skills"]
-
-
-    def test_commands_without_subcommands_not_in_dict(self):
-        """Plain commands should not appear in SUBCOMMANDS."""
-        assert "/help" not in SUBCOMMANDS
-        assert "/quit" not in SUBCOMMANDS
-        assert "/clear" not in SUBCOMMANDS
 
 
 # ── Subcommand tab completion ───────────────────────────────────────────
@@ -1026,6 +1030,9 @@ class TestTelegramMenuCommands:
 # ---------------------------------------------------------------------------
 
 from hermes_cli.commands_platforms import discord_skill_commands_by_category
+from hermes_cli.commands import COMMANDS
+from hermes_cli.commands import SUBCOMMANDS
+from hermes_cli.commands import is_gateway_known_command
 
 
 class TestDiscordSkillCommandsByCategory:
@@ -1193,3 +1200,36 @@ class TestPluginCommandEnumeration:
         slack_names = set(slack_subcommand_map())
         assert "status" in tg_names
         assert "status" in slack_names
+
+
+class TestResolveCommand:
+
+
+    def test_topic_is_gateway_command(self):
+        topic = resolve_command("topic")
+        assert topic is not None
+        assert topic.name == "topic"
+        assert "topic" in GATEWAY_KNOWN_COMMANDS
+
+    def test_context_command_registered_with_ctx_alias(self):
+        ctx = resolve_command("context")
+        assert ctx is not None
+        assert ctx.name == "context"
+        assert resolve_command("ctx").name == "context"
+        assert "all" in (ctx.subcommands or ())
+        # Available on both CLI and gateway surfaces
+        assert not ctx.cli_only and not ctx.gateway_only
+        assert "context" in GATEWAY_KNOWN_COMMANDS
+
+class TestSubcommands:
+    def test_explicit_subcommands_extracted(self):
+        """Commands with explicit subcommands on CommandDef are extracted."""
+        assert "/skills" in SUBCOMMANDS
+        assert "install" in SUBCOMMANDS["/skills"]
+
+
+    def test_commands_without_subcommands_not_in_dict(self):
+        """Plain commands should not appear in SUBCOMMANDS."""
+        assert "/help" not in SUBCOMMANDS
+        assert "/quit" not in SUBCOMMANDS
+        assert "/clear" not in SUBCOMMANDS

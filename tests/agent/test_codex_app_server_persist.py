@@ -32,7 +32,6 @@ from agent.codex_runtime import run_codex_app_server_turn
 from hermes_state import SessionDB
 from run_agent import AIAgent
 
-
 def _make_turn():
     return SimpleNamespace(
         interrupted=False,
@@ -45,13 +44,16 @@ def _make_turn():
         should_retire=False,
     )
 
-
 def _make_agent(session_db=None, session_id="sess-codex"):
     agent = MagicMock()
     # Pre-seed the session so run_codex_app_server_turn skips the spawn block.
     agent._codex_session = MagicMock()
     agent._codex_session.run_turn.return_value = _make_turn()
     agent._codex_session_prompt = None  # seeded session: no recorded composition to compare
+    agent._codex_session_model_provider = None
+    agent.model = "gpt-5.5"
+    agent.reasoning_config = {}
+    agent.request_overrides = {}
     agent.tool_progress_callback = None
     agent._iters_since_skill = 0
     agent._skill_nudge_interval = 0
@@ -61,7 +63,6 @@ def _make_agent(session_db=None, session_id="sess-codex"):
     agent.session_id = session_id
     agent.codex_app_server_turn_timeout_seconds = None
     return agent
-
 
 def test_codex_success_flushes_and_reports_persisted():
     """Codex success turn must self-persist and return agent_persisted=True."""
@@ -77,7 +78,6 @@ def test_codex_success_flushes_and_reports_persisted():
     assert isinstance(result["messages"][-1]["timestamp"], float)
     # With the agent as sole persister, the gateway must SKIP its DB write.
     assert result["agent_persisted"] is True
-
 
 def test_codex_turn_does_not_use_request_timeout_as_whole_turn_budget():
     """A per-request timeout must not cap a multi-request app-server turn."""
@@ -110,7 +110,6 @@ def test_codex_turn_uses_dedicated_explicit_whole_turn_budget():
 
     assert agent._codex_session.run_turn.call_args.kwargs["turn_timeout"] == 7200.0
 
-
 def test_codex_user_interrupt_is_reported_and_cleared():
     agent = _make_agent(session_db=None)
     turn = _make_turn()
@@ -137,7 +136,6 @@ def test_codex_user_interrupt_is_reported_and_cleared():
     assert result["interrupt_message"] == "new correction"
     agent.clear_interrupt.assert_called_once_with()
     assert agent._interrupt_requested is False
-
 
 def test_codex_turn_persists_each_message_exactly_once():
     """The user turn (flushed at turn start) must not be duplicated; the
@@ -201,5 +199,3 @@ def test_codex_turn_persists_each_message_exactly_once():
         if db is not None:
             db.close()
         shutil.rmtree(tmp, ignore_errors=True)
-
-

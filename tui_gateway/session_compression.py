@@ -42,9 +42,8 @@ def _compressor_ctor_default(name: str, fallback: Any) -> Any:
 def _default_threshold_tokens_cap():
     """The cap a fresh agent build installs when the key is absent: DEFAULT_CONFIG's
     ``compression.threshold_tokens``. agent_init reads the MERGED config, so "no key in
-    config.yaml" still installs the 256K default at construction; key removal here must
-    restore that same value. ``None`` instead would re-derive the uncapped ratio trigger
-    (500K on a 1M-window model) and the default cap would be gone after the first turn
+    config.yaml" installs that default at construction; key removal here must restore the
+    same value, or a live session would diverge from a rebuilt one after the first turn
     (#117093). An explicit ``threshold_tokens: null`` stays ratio-only — the key is present,
     so ``.get`` returns it untouched."""
     from hermes_cli.config_defaults import DEFAULT_CONFIG
@@ -198,18 +197,34 @@ def _sync_agent_compression_with_config(sid: str, session: dict) -> None:
 def _apply_pending_model_switch(sid: str, session: dict) -> None:
     """Apply a model switch queued (``session["pending_model_switch"]``) while a turn was running. Runs on
     the TURN thread at turn start — nothing in flight — so the in-place swap (client rebuild) is safe. A
-    failed switch keeps the current model and never blocks the turn."""
+    failed switch keeps the current model and never blocks the turn.
+
+    A dropped pick is a warning notice, not an ``error``: clients paint ``error`` as a failed turn
+    (Desktop's red retry card under the user's message) while this turn runs normally on the old model.
+    The session.info re-sync moves the pill off the pick the session never adopted."""
     pending = session.pop("pending_model_switch", None)
     if not pending or session.get("agent") is None:
         return
+    model = pending.get("display_model") or pending["raw"]
     try:
         result = _apply_model_switch(sid, session, pending["raw"], confirm_expensive_model=bool(pending.get("confirm_expensive_model")))
-        # Honour the expensive-model confirm: surface the warning and drop the switch rather than spend
-        # on a model the user never confirmed.
-        if result.get("confirm_required"):
-            _emit("error", sid, {"message": result.get("confirm_message") or result.get("warning") or ""})
+        # Honour the expensive-model confirm: drop the switch rather than spend on a model the user
+        # never confirmed.
+        if not result.get("confirm_required"):
+            return
+        detail = result.get("confirm_message") or result.get("warning") or ""
+        logger.warning("Queued model switch to %s dropped for session %s: %s", model, sid, detail.split("\n", 1)[0])
+        current = getattr(session["agent"], "model", "") or "the current model"
+        # One line: the TUI status bar truncates and the Desktop toast collapses newlines. The full
+        # guard text comes back in the confirm prompt when the user picks it again.
+        text = f"Stayed on {current}: switching to {model} needs confirmation. Pick it again to confirm."
     except Exception as e:
-        _emit("error", sid, {"message": f"Could not switch model: {e}"})
+        logger.warning("Queued model switch to %s failed for session %s: %s", model, sid, e)
+        text = f"Could not switch model: {e}"
+    _emit("notification.show", sid, {
+        "text": text.rstrip(), "level": "warn", "kind": "ttl", "ttl_ms": 12000,
+        "key": "model_switch.dropped", "id": "model_switch.dropped"})
+    _emit_session_info(sid, session)
 
 
 class CompressionLockHeld(Exception):
@@ -218,6 +233,36 @@ class CompressionLockHeld(Exception):
     def __init__(self, holder: str | None = None):
         self.holder = holder
         super().__init__(f"Compression lock held: {holder or 'unknown'}")
+
+
+class CompressionBusy(Exception):
+    """Raised by _manual_compress_turn when a turn already holds the session; callers map it to their busy reply."""
+
+
+@contextlib.contextmanager
+def _manual_compress_turn(sid: str, session: dict, *, control_token=None):
+    """Hold the session busy (``running``) for a whole manual compaction: snapshot, LLM summary, commit
+    and session-key re-anchor. A prompt.submit arriving meanwhile takes the busy path (demoted to queue
+    by ``_session_compression_in_flight``) instead of snapshotting a history version the compaction is
+    about to bump, which dropped the turn's reply (#133504). The queued prompt drains on release."""
+    with session["history_lock"]:
+        active_control = session.get("_session_control_inflight")
+        if active_control is not None and active_control is not control_token:
+            raise CompressionBusy(_MICRO_CONTROL_BUSY_MESSAGE)
+        if session.get("running"):
+            raise CompressionBusy(busy_message("compress", bool(session.get("_manual_compress_active"))))
+        session["running"] = session["_manual_compress_active"] = True
+    try:
+        yield
+    finally:
+        with session["history_lock"]:
+            session.pop("_manual_compress_active", None)
+            session["running"] = False
+        if control_token is not None:
+            _release_session_control(session, control_token)
+        # The compaction emitted session.info with running=true; close that edge or Desktop latches busy.
+        _emit_session_info_for_session(sid, session)
+        _drain_queued_prompt("__compress__", sid, session)
 
 
 def _compress_session_history(
@@ -245,8 +290,13 @@ def _compress_session_history(
     # RPC thread: bind the session cwd, or the boundary prompt rebuild resolves the backend's cwd and
     # persists a prompt every other process then rejects as stale runtime (fresh build, no tools pin).
     tokens = _set_session_context(session.get("session_key") or "", cwd=_session_cwd(session))
+    def snapshot_is_current():
+        with session["history_lock"]:
+            return int(session.get("history_version", 0)) == history_version
+
     try:
-        result = compress_now(agent, before_messages, request, task_id=session.get("session_key") or "default")
+        result = compress_now(agent, before_messages, request, task_id=session.get("session_key") or "default",
+                              snapshot_is_current=snapshot_is_current)
     finally:
         _clear_session_context(tokens)
     if result.status == "preview":
@@ -312,67 +362,22 @@ def _sync_session_key_after_compress_legacy(
             old_key,
             new_session_id,
         )
-
-    try:
-        from tools.approval import (
-            disable_session_yolo,
-            enable_session_yolo,
-            is_session_yolo_enabled,
-            register_gateway_notify,
-            unregister_gateway_notify,
-        )
-
-        try:
-            unregister_gateway_notify(old_key)
-        except Exception:
-            pass
-        with _session_history_context(session):
-            active_control = session.get("_session_control_inflight")
-            if active_control is not None and active_control is not control_token:
-                logger.warning(
-                    "Compression rotation skipped while session control is active: sid=%s",
-                    sid,
-                )
-                return
-            session["session_key"] = new_session_id
-            session["session_generation"] = int(
-                session.get("session_generation", 0) or 0
-            ) + 1
-        try:
-            yolo_was_on = is_session_yolo_enabled(old_key)
-        except Exception:
-            yolo_was_on = False
-        if yolo_was_on:
-            try:
-                enable_session_yolo(new_session_id)
-                disable_session_yolo(old_key)
-            except Exception:
-                pass
-        try:
-            register_gateway_notify(
-                new_session_id,
-                lambda data: _emit_approval_request(sid, data),
-            )
-        except Exception:
-            pass
-    except Exception:
-        with _session_history_context(session):
-            active_control = session.get("_session_control_inflight")
-            if active_control is not None and active_control is not control_token:
-                logger.warning(
-                    "Compression rotation skipped while session control is active: sid=%s",
-                    sid,
-                )
-                return
-            session["session_key"] = new_session_id
-            session["session_generation"] = int(
-                session.get("session_generation", 0) or 0
-            ) + 1
-
-    session["_queued_prompt_generation"] = int(
-        session.get("_queued_prompt_generation", 0)
-    ) + 1
-
+    with _session_history_context(session):
+        active_control = session.get("_session_control_inflight")
+        if active_control is not None and active_control is not control_token:
+            logger.warning("Compression rotation skipped while session control is active: sid=%s", sid)
+            return
+        session["session_key"] = new_session_id
+        session["session_generation"] = int(session.get("session_generation", 0) or 0) + 1
+    with contextlib.suppress(Exception):
+        from tools import approval
+        with contextlib.suppress(Exception):
+            approval.unregister_gateway_notify(old_key)
+        from tools.approval_yolo import transfer_session_yolo
+        transfer_session_yolo(old_key, new_session_id)
+        with contextlib.suppress(Exception):
+            approval.register_gateway_notify(new_session_id, lambda data: _emit_approval_request(sid, data))
+    session["_queued_prompt_generation"] = int(session.get("_queued_prompt_generation", 0)) + 1
     if clear_pending_title:
         session["pending_title"] = None
     if restart_slash_worker:

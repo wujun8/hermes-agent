@@ -8,9 +8,12 @@ set -euo pipefail
 HERMES_DIR="${HERMES_DIR:-${HERMES_HOME:-${HOME}/.hermes}}"
 CONFIG_FILE="${HERMES_DIR}/config.yaml"
 ENV_FILE="${HERMES_DIR}/.env"
-# Hermes serve may re-exec without the entrypoint PATH; prefer the container venv.
-if [[ -x /opt/hermes-venv/bin/python3 ]]; then
-  export PATH="/opt/hermes-venv/bin:${PATH}"
+# Use the caller's PM interpreter, or activate this checkout when run directly.
+_PROBE_SOURCE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ -n "${HERMES_PYTHON:-}" && -x "$HERMES_PYTHON" ]]; then
+  _PROBE_PYTHON=("$HERMES_PYTHON")
+else
+  _PROBE_PYTHON=("$_PROBE_SOURCE/scripts/run-in-hermes-env" python3)
 fi
 CURL_TIMEOUT="${CURL_TIMEOUT:-30}"
 # Set LIST_MODELS=1 to call /v1/models (informational only; does not change the test model).
@@ -102,20 +105,16 @@ load_env_file "$ENV_FILE" "$(compgen -A variable)"
 _CFG_FILE=$(mk_temp "hermes-test-cfg")
 _REQUEST_HEADERS=$(mk_temp "hermes-test-headers")
 chmod 600 "$_CFG_FILE" "$_REQUEST_HEADERS"
-python3 - "$CONFIG_FILE" "$_REQUEST_HEADERS" >"$_CFG_FILE" <<'PY' || die "Failed to parse $CONFIG_FILE"
+"${_PROBE_PYTHON[@]}" - "$_PROBE_SOURCE" "$CONFIG_FILE" "$_REQUEST_HEADERS" >"$_CFG_FILE" <<'PY' || die "Failed to parse $CONFIG_FILE"
 import ipaddress
 import os
 import re
 import sys
 from urllib.parse import unquote, urlsplit, urlunsplit
 
-try:
-    import yaml
-except ImportError:
-    sys.stderr.write("PyYAML is required (pip install pyyaml)\n")
-    sys.exit(1)
-
-config_path, headers_path = sys.argv[1:]
+source_root, config_path, headers_path = sys.argv[1:]
+sys.path.insert(0, source_root)
+import hermes_yaml as yaml
 with open(config_path, encoding="utf-8") as fh:
     cfg = yaml.safe_load(fh) or {}
 model = cfg.get("model") or {}

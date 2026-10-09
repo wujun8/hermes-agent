@@ -135,9 +135,9 @@ def test_show_retry_status_vprint_uses_status_callback_without_buffering():
 )
 def test_agent_reads_show_retry_status_as_boolean(configured, expected):
     with (
-        patch("run_agent.get_tool_definitions", return_value=[]),
-        patch("run_agent.check_toolset_requirements", return_value={}),
-        patch("run_agent.OpenAI"),
+        patch("model_tools.get_tool_definitions", return_value=[]),
+        patch("model_tools.check_toolset_requirements", return_value={}),
+        patch("agent.process_bootstrap.OpenAI"),
         patch(
             "hermes_cli.config.load_config_readonly",
             return_value={"agent": {"show_retry_status": configured}},
@@ -180,9 +180,9 @@ def test_real_config_set_get_and_agent_read_show_retry_status(
     assert load_config()["agent"]["show_retry_status"] is True
 
     with (
-        patch("run_agent.get_tool_definitions", return_value=[]),
-        patch("run_agent.check_toolset_requirements", return_value={}),
-        patch("run_agent.OpenAI"),
+        patch("model_tools.get_tool_definitions", return_value=[]),
+        patch("model_tools.check_toolset_requirements", return_value={}),
+        patch("agent.process_bootstrap.OpenAI"),
     ):
         agent = AIAgent(
             api_key="test-key-1234567890",
