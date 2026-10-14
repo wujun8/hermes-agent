@@ -323,78 +323,11 @@ def _live_slash_command_output(
     name: str,
     arg: str,
     *,
-    micro_target: _MicroControlTarget | None = None,
     compression_control_token=None,
 ) -> Optional[str]:
     """Answer a slash command from the live session instead of the slash worker; None = not ours."""
     name = (name or "").lstrip("/").lower()
     arg = arg or ""
-    if name == "micro":
-        # A cold session deliberately stays on the profile-aware worker path;
-        # only an already-built agent can apply policy directly in memory.
-        if micro_target is None and (session is None or session.get("agent") is None):
-            return None
-        if micro_target is not None:
-            # The lease holder owns this exact identity snapshot.  Do not read
-            # mutable session routing fields after history_lock is released.
-            agent = micro_target.agent
-            session_key = micro_target.session_key
-            agent_key = micro_target.agent_session_id
-            profile_home = micro_target.profile_home
-        else:
-            agent = session["agent"]
-            session_key = str(session.get("session_key") or "")
-            agent_key = str(getattr(agent, "session_id", "") or "")
-            profile_home = session.get("profile_home")
-        if not session_key.strip() or not agent_key.strip():
-            return (
-                "Micro-compaction error: live session identity is incomplete; "
-                "refusing to mutate"
-            )
-        if session_key != agent_key:
-            return (
-                "Micro-compaction error: live session identity mismatch; "
-                "refusing to mutate"
-            )
-        from hermes_cli.micro_command import execute_micro_command
-
-        from types import MappingProxyType
-
-        target_session_view = (
-            MappingProxyType({"profile_home": profile_home})
-            if micro_target is not None
-            else session
-        )
-        micro_state = (
-            micro_target.session.get(_MICRO_CONTROL_STATE_KEY)
-            if micro_target is not None
-            else None
-        )
-        micro_subcommand = (arg or "").strip().lower().split(maxsplit=1)[0]
-        if isinstance(micro_state, dict) and micro_subcommand in {
-            "on",
-            "off",
-            "inherit",
-        }:
-            micro_state["requested_override"] = {
-                "on": True,
-                "off": False,
-                "inherit": None,
-            }[micro_subcommand]
-            micro_state["mutation_succeeded"] = False
-        db_context = _session_db(target_session_view)
-        with db_context as db:
-            result = execute_micro_command(
-                agent=agent,
-                session_db=db,
-                session_id=session_key,
-                raw_args=arg,
-                ensure_session=getattr(agent, "_ensure_db_session", None),
-                config_loader=_session_micro_config_loader(target_session_view),
-            )
-        if isinstance(micro_state, dict) and "requested_override" in micro_state:
-            micro_state["mutation_succeeded"] = "override saved:" in str(result).lower()
-        return result
     if name == "model" and not arg.strip():
         return _format_live_model_output(session or {})
     if (

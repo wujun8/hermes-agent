@@ -650,9 +650,8 @@ def _lock_in_submit_turn(
     with _session_turn_admission(session) as admitted:
         if not admitted:
             return _err(rid, 5035, "backend is retiring; reconnect to continue"), fields
-        if (session.get("_session_control_inflight") is not None
-                and not session.get("_manual_compress_active")):
-            return _err(rid, 4009, _MICRO_CONTROL_BUSY_MESSAGE), fields
+        if _plugin_control_blocks_prompt(session):
+            return _err(rid, 4009, _PLUGIN_SESSION_CONTROL_BUSY_MESSAGE), fields
         # A watch session's run lives in the PARENT turn (own running flag False); typing
         # mid-run would build a second agent racing the child on the same stored session.
         if session.get("lazy") and _child_run_active(
@@ -677,8 +676,36 @@ def _lock_in_submit_turn(
     return None, fields
 
 
+def _plugin_control_blocks_prompt(session):
+    return (session.get("_session_control_inflight") is not None
+            and not session.get("_manual_compress_active"))
+
+
 # Per-turn client surfaces that carry a model-bound note (session_notifications._surface_note).
 _CLIENT_SURFACES = frozenset({"hud", "voice-live"})
+
+
+def _wait_for_submit_idle(
+    rid, sid, session, text, transport, params, *, has_truncation, internal_hosted_submit,
+    turn_author, display_kind,
+):
+    """Wait outside history_lock, retrying the exact turn claim after busy delivery."""
+    while True:
+        with session["history_lock"]:
+            if _plugin_control_blocks_prompt(session):
+                return _err(rid, 4009, _PLUGIN_SESSION_CONTROL_BUSY_MESSAGE)
+            if not session.get("running"):
+                return None
+            if internal_hosted_submit:
+                return _err(rid, 4091, "hosted room member session is busy")
+            busy_transport = transport or session.get("transport")
+        if has_truncation:
+            return _err(rid, 4009, "session busy")
+        busy_response = _handle_busy_submit(
+            rid, sid, session, text, busy_transport, queued=bool(params.get("queued")),
+            turn_author=turn_author, display_kind=display_kind)
+        if busy_response is not None:
+            return busy_response
 
 
 @method("prompt.submit")
@@ -713,13 +740,13 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 4124, "turn author is stamped by the gateway, never by a client")
     turn_author = raw_author.author if raw_author is not None else None
 
+
     # A live control command owns this session until its config/DB/runtime work
     # has finished. Check before the active-session slot and again in the
     # history claim below so releasing the lock cannot turn into a prompt race.
     with session["history_lock"]:
-        if (session.get("_session_control_inflight") is not None
-                    and not session.get("_manual_compress_active")):
-            return _err(rid, 4009, _MICRO_CONTROL_BUSY_MESSAGE)
+        if _plugin_control_blocks_prompt(session):
+            return _err(rid, 4009, _PLUGIN_SESSION_CONTROL_BUSY_MESSAGE)
     hosted_task = params.get("_hosted_task")
     hosted_terminal_callback = params.get("_hosted_terminal_callback")
     internal_hosted_submit = hosted_task is not None or hosted_terminal_callback is not None
@@ -767,23 +794,11 @@ def _(rid, params: dict) -> dict:
         # history_lock is released (a non-interruptible tool may hold it); if the old turn
         # finished between the two acquisitions, retry the claim rather than strand this
         # prompt in a queue whose drain already ran.
-        while True:
-            with session["history_lock"]:
-                if (session.get("_session_control_inflight") is not None
-                    and not session.get("_manual_compress_active")):
-                    return _err(rid, 4009, _MICRO_CONTROL_BUSY_MESSAGE)
-                if not session.get("running"):
-                    break
-                if internal_hosted_submit:
-                    return _err(rid, 4091, "hosted room member session is busy")
-                busy_transport = t or session.get("transport")
-            if has_truncation:
-                return _err(rid, 4009, "session busy")
-            busy_response = _handle_busy_submit(
-                rid, sid, session, text, busy_transport, queued=bool(params.get("queued")),
-                turn_author=turn_author, display_kind=display_kind)
-            if busy_response is not None:
-                return busy_response
+        if busy_response := _wait_for_submit_idle(
+            rid, sid, session, text, t, params, has_truncation=has_truncation,
+            internal_hosted_submit=internal_hosted_submit, turn_author=turn_author,
+            display_kind=display_kind):
+            return busy_response
         raw_rebind_ids = params.get("rebind_survivor_row_ids")
         requested_rebind_ids = (
             {r for r in raw_rebind_ids if isinstance(r, int) and not isinstance(r, bool)}

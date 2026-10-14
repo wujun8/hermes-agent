@@ -5,7 +5,7 @@ import mimetypes
 import os
 import stat
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from fastapi import HTTPException, Request
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -20,6 +20,7 @@ class ManagedFilesPolicy:
     default_path: Path
     locked_root: Path | None
     can_change_path: bool
+    additional_roots: tuple[Path, ...] = ()
 
 
 def _resolve_fs_candidate(raw: str, *, cwd: str | None = None) -> Path:
@@ -141,6 +142,22 @@ def _dashboard_local_update_managed_externally() -> bool:
     return True
 
 
+def _hosted_workspace_roots() -> tuple[Path, ...]:
+    """The launch home's operator configuration owns the process-wide boundary."""
+    from hermes_constants import get_default_hermes_root
+    from hermes_cli.config_effective import load_user_config_effective
+
+    config = load_user_config_effective(get_default_hermes_root() / "config.yaml", fail_closed=True)
+    raw_roots = (config.get("dashboard") or {}).get("files_allowed_roots", [])
+    if not isinstance(raw_roots, list) or any(
+        not isinstance(raw, str) or not raw.strip()
+        or not Path(raw).is_absolute() or ".." in Path(raw).parts
+        for raw in raw_roots
+    ):
+        raise HTTPException(status_code=500, detail="dashboard.files_allowed_roots must be absolute paths")
+    return tuple(_canonical_path(Path(raw)) for raw in raw_roots)
+
+
 def _managed_files_policy(request: Optional[Request], *, create_root: bool = True) -> ManagedFilesPolicy:
     raw_forced_root = os.environ.get(_MANAGED_FILES_ROOT_ENV, "").strip()
     if raw_forced_root:
@@ -152,10 +169,22 @@ def _managed_files_policy(request: Optional[Request], *, create_root: bool = Tru
     # root actually IS /opt/data or HERMES_DASHBOARD_FILES_ROOT is set.
     if _default_hermes_root_is_opt_data():
         root = _ensure_managed_root(_HOSTED_MANAGED_FILES_ROOT) if create_root else _HOSTED_MANAGED_FILES_ROOT
-        return ManagedFilesPolicy(default_path=root, locked_root=root, can_change_path=False)
+        return ManagedFilesPolicy(
+            default_path=root, locked_root=root, can_change_path=False,
+            additional_roots=_hosted_workspace_roots(),
+        )
 
     home = _canonical_path(Path.home())
     return ManagedFilesPolicy(default_path=home, locked_root=None, can_change_path=True)
+
+
+def _policy_for_managed_target(policy: ManagedFilesPolicy, target: Path) -> ManagedFilesPolicy:
+    if policy.locked_root is None:
+        return policy
+    for root in (policy.locked_root, *policy.additional_roots):
+        if _path_is_under(root, target):
+            return replace(policy, default_path=root, locked_root=root)
+    raise HTTPException(status_code=403, detail="Path outside managed files root")
 
 
 def _resolve_managed_path(
@@ -187,10 +216,7 @@ def _resolve_managed_path(
     else:
         resolved = _canonical_path(candidate, require_exists=not for_write)
 
-    if root is not None and not _path_is_under(root, resolved):
-        raise HTTPException(status_code=403, detail="Path outside managed files root")
-
-    return policy, resolved, str(resolved)
+    return _policy_for_managed_target(policy, resolved), resolved, str(resolved)
 
 
 def _managed_response_meta(policy: ManagedFilesPolicy) -> Dict[str, Any]:
@@ -212,10 +238,13 @@ def _hosted_fs_read_guard(target: Path, request: Optional[Request] = None) -> Pa
     ``request`` is unused (the policy is env/home driven) and optional so the
     route functions stay callable directly, e.g. from agent-side tests.
     """
-    root = _managed_files_policy(request, create_root=False).locked_root
-    if root is not None and not _hosted_fs_path_allowed(root, target):
-        raise HTTPException(status_code=403, detail="Path is outside the managed read boundary")
-    return root
+    policy = _managed_files_policy(request, create_root=False)
+    if policy.locked_root is None:
+        return None
+    for root in (policy.locked_root, *policy.additional_roots):
+        if _hosted_fs_path_allowed(root, target):
+            return root
+    raise HTTPException(status_code=403, detail="Path is outside the managed read boundary")
 
 
 def _managed_file_entry(

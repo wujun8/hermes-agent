@@ -10,7 +10,6 @@ Symbols that tests patch on ``run_agent.*`` (``OpenAI``, ``get_tool_definitions`
 from __future__ import annotations
 
 import logging
-import math
 import os
 import re
 import sys
@@ -39,11 +38,7 @@ from agent.think_scrubber import StreamingThinkScrubber
 from agent.tool_guardrails import (
     ToolCallGuardrailConfig, ToolCallGuardrailController
 )
-from hermes_cli.config import DEFAULT_CONFIG, cfg_get, load_config_readonly
-from hermes_cli.micro_compaction import (
-    MICRO_COMPACT_OVERRIDE_KEY,
-    effective_micro_compact,
-)
+from hermes_cli.config import DEFAULT_CONFIG, cfg_get
 from hermes_cli.route_identity import normalize_route_base_url
 from hermes_cli.timeouts import get_provider_request_timeout
 from hermes_constants import get_hermes_home
@@ -56,115 +51,6 @@ logger = logging.getLogger("run_agent")
 
 # Deduped: the gateway builds a fresh AIAgent per message, so it would warn every turn.
 _warned_unavailable_providers: set[tuple[str, str]] = set()
-
-
-def apply_micro_compact_policy(
-    agent: Any,
-    *,
-    session_override: bool | None,
-    global_value: Any,
-) -> bool:
-    """Apply the durable tri-state policy to an agent and its engine."""
-    override = (
-        session_override
-        if session_override is True or session_override is False
-        else None
-    )
-    enabled, source = effective_micro_compact(global_value, override)
-    if getattr(agent, "compression_checkpoint_required", False) is True:
-        enabled = False
-
-    agent.micro_compact_override = override
-    agent.micro_compact_enabled = enabled
-    agent.micro_compact_source = source
-    agent._micro_compact_global_value = global_value
-
-    model_config = getattr(agent, "_session_init_model_config", None)
-    if not isinstance(model_config, dict):
-        model_config = {}
-        agent._session_init_model_config = model_config
-    if override is None:
-        model_config.pop(MICRO_COMPACT_OVERRIDE_KEY, None)
-    else:
-        model_config[MICRO_COMPACT_OVERRIDE_KEY] = override
-
-    supported = False
-    engine = getattr(agent, "context_compressor", None)
-    setter = getattr(engine, "set_micro_compact_enabled", None)
-    if callable(setter):
-        try:
-            setter(enabled)
-            supported = True
-        except Exception as exc:
-            logger.warning("Micro-compaction engine capability update failed: %s", exc)
-    agent.micro_compact_runtime_supported = supported
-    return supported
-
-
-def hydrate_micro_compact_policy(
-    agent: Any,
-    *,
-    session_db: Any,
-    session_id: str,
-    global_value: Any,
-) -> bool:
-    """Read a session override when possible, then apply the effective policy."""
-    session_override = None
-    if (
-        not getattr(agent, "_persist_disabled", False)
-        and session_db is not None
-        and session_id
-    ):
-        try:
-            session_meta = session_db.get_session(session_id)
-            getter = getattr(session_db, "session_micro_compact_override", None)
-            if callable(getter):
-                session_override = getter(session_meta)
-        except Exception as exc:
-            logger.debug(
-                "Micro-compaction session policy hydration unavailable for %s: %s",
-                session_id,
-                exc,
-            )
-    return apply_micro_compact_policy(
-        agent,
-        session_override=session_override,
-        global_value=global_value,
-    )
-
-
-def refresh_micro_compact_policy(agent: Any) -> bool:
-    """Refresh inherited policy from config while preserving explicit policy."""
-    raw_override = getattr(agent, "micro_compact_override", None)
-    session_override = (
-        raw_override if raw_override is True or raw_override is False else None
-    )
-    if session_override is not None:
-        return apply_micro_compact_policy(
-            agent,
-            session_override=session_override,
-            global_value=getattr(agent, "_micro_compact_global_value", False),
-        )
-
-    try:
-        config = load_config_readonly()
-        compression = config.get("compression", {}) if isinstance(config, dict) else {}
-        if not isinstance(compression, dict):
-            compression = {}
-        global_value = compression.get("micro_compact", False)
-    except Exception as exc:
-        logger.warning(
-            "Micro-compaction policy refresh could not load config; retaining "
-            "last effective value: %s",
-            exc,
-        )
-        return getattr(agent, "micro_compact_enabled", False) is True
-
-    return apply_micro_compact_policy(
-        agent,
-        session_override=None,
-        global_value=global_value,
-    )
 
 
 def _unavailable_warning_key(name: str) -> tuple[str, str]:
@@ -441,37 +327,6 @@ def _normalize_run_budget_seconds(value) -> Optional[float]:
     except (TypeError, ValueError):
         return None
     return seconds if seconds > 0 else None  # NaN compares False → None
-
-
-def _normalize_codex_app_server_turn_timeout_seconds(
-    value, *, warn_invalid: bool = False,
-) -> Optional[float]:
-    """Positive finite float or None for the optional app-server turn deadline.
-
-    ``bool`` is rejected so YAML ``true`` cannot become a one-second deadline.  A
-    non-positive finite value deliberately disables the optional deadline; malformed
-    or non-finite values also disable it and may emit a config warning.
-    """
-    if value is None:
-        return None
-    invalid = isinstance(value, bool)
-    seconds = None
-    if not invalid:
-        try:
-            seconds = float(value)
-        except (TypeError, ValueError, OverflowError):
-            invalid = True
-        else:
-            invalid = not math.isfinite(seconds)
-    if invalid:
-        if warn_invalid:
-            _ra().logger.warning(
-                "Invalid agent.codex_app_server_turn_timeout_seconds=%r; "
-                "absolute app-server turn timeout disabled",
-                value,
-            )
-        return None
-    return seconds if seconds > 0 else None
 
 
 
@@ -1541,15 +1396,6 @@ def _apply_agent_section(agent, _agent_cfg):
             _agent_section.get("run_budget_seconds")
         )
 
-    # Optional hard wall-clock cap for a complete Codex app-server turn. This is
-    # separate from HERMES_API_TIMEOUT, which remains a per-request setting.
-    agent.codex_app_server_turn_timeout_seconds = (
-        _normalize_codex_app_server_turn_timeout_seconds(
-            _agent_section.get("codex_app_server_turn_timeout_seconds"),
-            warn_invalid=True,
-        )
-    )
-
     # Empty-response guard: a malformed section falls back to schema defaults (on, $0.25).
     from agent.empty_response_guard import resolve_guard_settings
     (
@@ -2179,41 +2025,23 @@ def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_c
     agent.compression_enabled = cs.enabled
     agent.compression_in_place = cs.in_place
     _cc = agent.context_compressor
-    agent.compression_checkpoint_required = cs.checkpoint_required
-    # Micro-compaction has no pre-compress checkpoint hook; suppress it while the gate is
-    # armed (mirrors native_compaction.py).
+    # Suppress micro-compaction while checkpoint-required is armed; it lacks a checkpoint hook.
     if cs.checkpoint_required and cs.micro_compact:
         logger.warning(
             "compression.checkpoint_required is enabled: post-turn "
             "micro-compaction is disabled for this agent so every lossy "
             "rewrite passes through the checkpoint-gated compressor."
         )
+        cs.micro_compact = False
     for _attr, _value in (
-        ("_micro_compact_every_n_turns", cs.micro_compact_every_n_turns),
+        ("_micro_compact_enabled", cs.micro_compact), ("_micro_compact_every_n_turns", cs.micro_compact_every_n_turns),
         ("_micro_compact_defrag_threshold_tokens", cs.micro_compact_defrag_tokens),
     ):
         if hasattr(_cc, _attr):
             setattr(_cc, _attr, _value)
-    agent.micro_compact_override = None
-    agent.micro_compact_enabled = False
-    agent.micro_compact_source = "global"
-    agent._micro_compact_global_value = cs.micro_compact
-    agent.micro_compact_runtime_supported = False
-    agent._refresh_micro_compact_policy = lambda: refresh_micro_compact_policy(agent)
-    if getattr(agent, "_persist_disabled", False):
-        apply_micro_compact_policy(
-            agent,
-            session_override=None,
-            global_value=cs.micro_compact,
-        )
-    else:
-        hydrate_micro_compact_policy(
-            agent,
-            session_db=session_db,
-            session_id=agent.session_id,
-            global_value=cs.micro_compact,
-        )
     agent.compression_checkpoint_required = cs.checkpoint_required
+    from agent.session_policies import hydrate_session_policies
+    hydrate_session_policies(agent, session_db=session_db)
     from agent.conversation_compression import _warn_checkpoint_required_without_capable_provider
     _warn_checkpoint_required_without_capable_provider(agent)
     agent.codex_app_server_auto_compaction = cs.codex_app_server_auto

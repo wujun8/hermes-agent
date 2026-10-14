@@ -287,20 +287,8 @@ def _close_transcript_tail(agent, messages, final_response, interrupted, _recove
 def _micro_compact_after_turn(agent, messages, final_response, logger, task_id) -> None:
     """Post-turn micro-compaction: absorb the oldest uncompacted exchange into the
     rolling summary before persist, amortizing compression across turns."""
-    # Inherited policy follows current global config at each turn boundary; an
-    # explicit session override is reapplied without a config read. Persistence-
-    # isolated forks must not read or mutate canonical session policy.
-    if not getattr(agent, "_persist_disabled", False):
-        _refresh_policy = getattr(agent, "_refresh_micro_compact_policy", None)
-        if callable(_refresh_policy):
-            try:
-                _refresh_policy()
-            except Exception as _refresh_err:
-                logger.warning(
-                    "Micro-compaction policy refresh failed: %s",
-                    _refresh_err,
-                    exc_info=True,
-                )
+    from agent.session_policies import refresh_session_policies, context_option_supported
+    refresh_session_policies(agent)
     try:
         _compressor = getattr(agent, "context_compressor", None)
         # Strict `is True` + callable gates: plugin context engines and MagicMock
@@ -310,7 +298,7 @@ def _micro_compact_after_turn(agent, messages, final_response, logger, task_id) 
         # call on a throwaway transcript and could compact the CANONICAL session rows.
         if (
             _compressor
-            and getattr(agent, "micro_compact_runtime_supported", True) is not False
+            and context_option_supported(agent, "micro_compact_enabled")
             and getattr(_compressor, '_micro_compact_enabled', False) is True
             and callable(getattr(_compressor, '_micro_compact', None))
             and final_response

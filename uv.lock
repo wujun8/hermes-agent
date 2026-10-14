@@ -97,7 +97,6 @@ snowballstemmer = false
 concurrent-log-handler = false
 cryptography = false
 pydantic = false
-chinesecalendar = false
 agent-client-protocol = false
 fire = false
 httpx2 = false
@@ -1054,15 +1053,6 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/35/4f/b911ed898b26a09789eba9c9200c999aff6c61b4bafaf4838e56d1a1e1a3/charset_normalizer-3.5.1-cp37-abi3-win_amd64.whl", hash = "sha256:70055ff39b97c99e7ae40ea3e393fb62aa2e44dbd9b29f8d14f42fb0025c3959", size = 199764, upload-time = "2026-08-15T08:20:13.908Z" },
     { url = "https://files.pythonhosted.org/packages/f0/a7/920baf467bfd9bf689f3b318340f37aee4572a71f162bd8db51da55ba4fa/charset_normalizer-3.5.1-cp37-abi3-win_arm64.whl", hash = "sha256:87e4f41d375c0b9be2fb5251aee4b8a689169e134535aed81bf085c3b647451e", size = 287318, upload-time = "2026-08-15T08:20:15.551Z" },
     { url = "https://files.pythonhosted.org/packages/cc/61/d01fc49b8dea277640b55a9e15960dbca9fdc8c9fde18e572d39c59f4019/charset_normalizer-3.5.1-py3-none-any.whl", hash = "sha256:6df0ec430f9a831772c23ca5a224cba36517a58a84bb32c32bb59a9fa67c47f6", size = 68658, upload-time = "2026-08-15T08:20:43.306Z" },
-]
-
-[[package]]
-name = "chinesecalendar"
-version = "1.11.0"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/ac/6f/c14fe8aedc706fab826c0ae7fccd1c8f69610254dcb004cd386a0662b3d5/chinesecalendar-1.11.0.tar.gz", hash = "sha256:1b85d920ffee8e19a98a2a27a699a99f39ca224b3b1096aa574384d3837f5492", size = 17359, upload-time = "2025-11-04T10:22:36.108Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/19/e7/8f0215070e3a154e861a5838282f493649fa6ebcee01c9e919922917bd25/chinesecalendar-1.11.0-py2.py3-none-any.whl", hash = "sha256:9479ead6010e6001472efdf97317699882c16604c7858ba26862dc9d36d56d46", size = 11222, upload-time = "2025-11-04T10:22:34.704Z" },
 ]
 
 [[package]]
@@ -2355,7 +2345,6 @@ source = { editable = "." }
 dependencies = [
     { name = "browser-harness" },
     { name = "certifi" },
-    { name = "chinesecalendar" },
     { name = "concurrent-log-handler", marker = "sys_platform == 'win32'" },
     { name = "croniter" },
     { name = "cryptography" },
@@ -2669,7 +2658,6 @@ requires-dist = [
     { name = "brotlicffi", marker = "extra == 'messaging'", specifier = "==1.2.0.2" },
     { name = "browser-harness", marker = "python_full_version >= '3.14'", specifier = "==0.1.13" },
     { name = "certifi", marker = "python_full_version >= '3.14'", specifier = "==2026.5.20" },
-    { name = "chinesecalendar", marker = "python_full_version >= '3.14'", specifier = "==1.11.0" },
     { name = "concurrent-log-handler", marker = "python_full_version >= '3.14' and sys_platform == 'win32'", specifier = "==0.9.29" },
     { name = "croniter", marker = "python_full_version >= '3.14'", specifier = "==6.0.0" },
     { name = "cryptography", marker = "python_full_version >= '3.14'", specifier = "==50.0.1" },

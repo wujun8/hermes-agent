@@ -167,8 +167,6 @@ You can also set `providers.<id>.stale_timeout_seconds` for the non-streaming st
 
 Leaving these unset keeps the legacy defaults (`HERMES_API_TIMEOUT=1800`s, `HERMES_API_CALL_STALE_TIMEOUT=90`s, native Anthropic 900s). The non-streaming stale detector is auto-disabled for local endpoints when left implicit and can scale upward for very large contexts. Not currently wired for AWS Bedrock (both `bedrock_converse` and AnthropicBedrock SDK paths use boto3 with its own timeout configuration). See the commented example in [`cli-config.yaml.example`](https://github.com/NousResearch/hermes-agent/blob/main/cli-config.yaml.example).
 
-The optional Codex app-server runtime has a separate whole-turn wall-clock hard limit: `agent.codex_app_server_turn_timeout_seconds`. It defaults to `null` (disabled); set a positive number of seconds to enable it. The limit covers the entire agentic turn, including its model requests and tool calls, so a long-running task that keeps making progress can exceed 1800 seconds when this limit is disabled. `providers.<id>.request_timeout_seconds` and the legacy `HERMES_API_TIMEOUT` remain per-request timeouts only; they do not cap an app-server turn.
-
 ### API Retry Status
 
 Hermes retries transient API failures according to `agent.api_max_retries` and normally buffers retry/fallback status messages unless all recovery attempts fail. To display every retry status immediately while the request is still running, enable:
@@ -1376,8 +1374,7 @@ Hermes has separate timeout layers for streaming, plus a stale detector for non-
 | Stale stream detection | 180s | Raised to a 900s ceiling (`agent.local_stream_stale_timeout`) | `HERMES_STREAM_STALE_TIMEOUT` |
 | Stale non-stream detection | 90s | Auto-disabled when left implicit | `providers.<id>.stale_timeout_seconds` or `HERMES_API_CALL_STALE_TIMEOUT` |
 | Responses first-event watchdog | 120s | Raised to the 900s ceiling (`agent.local_stream_stale_timeout`) | `HERMES_CODEX_TTFB_TIMEOUT_SECONDS` |
-| API call (non-streaming; per request) | 1800s | Unchanged | `providers.<id>.request_timeout_seconds` / `timeout_seconds` or `HERMES_API_TIMEOUT` |
-| Codex app-server agentic turn | disabled (`null`) | — | `agent.codex_app_server_turn_timeout_seconds` |
+| API call (non-streaming) | 1800s | Unchanged | `providers.<id>.request_timeout_seconds` / `timeout_seconds` or `HERMES_API_TIMEOUT` |
 | Post-terminal stream drain (Codex/Responses) | 2s | Unchanged | `agent.stream_drain_timeout` |
 
 The **socket read timeout** controls how long httpx waits for the next chunk of data from the provider. Local LLMs can take minutes for prefill on large contexts before producing the first token, so Hermes raises this to 30 minutes when it detects a local endpoint. If you explicitly set `HERMES_STREAM_READ_TIMEOUT`, that value is always used regardless of endpoint detection.
@@ -3040,10 +3037,6 @@ Configure subagent behavior for the delegate tool:
 delegation:
   # model: "google/gemini-3-flash-preview"  # Override model (empty = inherit parent)
   # provider: "openrouter"                  # Override provider (empty = inherit parent)
-  deepseek_off_peak_enabled: true            # Apply the off-peak route to newly dispatched children
-  deepseek_off_peak_provider: "deepseek"    # Native DeepSeek (default); "inherit" keeps the normal route, or name another provider
-  deepseek_off_peak_model: "deepseek-flash" # Target model during off-peak windows
-  deepseek_off_peak_api_mode: ""             # Empty = derive from target route; or a registered wire mode, e.g. chat_completions
   # base_url: "http://localhost:1234/v1"    # Direct OpenAI-compatible endpoint (takes precedence over provider)
   # api_key: "local-key"                    # API key for base_url (falls back to OPENAI_API_KEY)
   # api_mode: ""                            # Wire protocol for base_url: "chat_completions", "codex_responses", or "anthropic_messages". Empty = auto-detect from URL (e.g. /anthropic suffix → anthropic_messages). Set explicitly for non-standard endpoints the heuristic can't detect.
@@ -3059,21 +3052,7 @@ delegation:
   oneshot_max_children: 2                   # Total subagents a one-shot run (hermes chat -q / --oneshot) may spawn; 0 = unlimited. Interactive and gateway sessions are never capped by this.
 ```
 
-**Off-peak routing:** `delegation.deepseek_off_peak_enabled` defaults to `true` and affects only newly dispatched children from Hermes' native `delegate_task` tool; the primary agent, already-running children, and internal routes such as `/review` keep their own routes. During peak hours the usual `delegation.provider` / `delegation.model` route is unchanged. Set the option to `false` to disable schedule-based routing:
-
-```bash
-hermes config set delegation.deepseek_off_peak_enabled false
-```
-
-All three off-peak route settings use the same schedule: 09:00–12:00 and 14:00–18:00 Beijing time, Monday–Friday except China statutory public holidays; lunch, weekends (including make-up workdays), and public holidays are off-peak. The default `deepseek_off_peak_provider: "deepseek"` resolves the native DeepSeek provider with `deepseek-flash` and the active profile's DeepSeek credentials, and refuses non-official DeepSeek endpoints. To keep the normal supplier/provider, endpoint, credentials, and request settings while changing only the model, set `deepseek_off_peak_provider: "inherit"`; `deepseek_off_peak_model` defaults to `deepseek-flash`. An optional `deepseek_off_peak_api_mode` overrides transport and is validated against built-in and registered transports (for example `chat_completions`). When empty, the selected route's provider resolver derives transport for the off-peak model; pure parent inheritance resolves against the parent's named provider when possible. A different named `deepseek_off_peak_provider` resolves its own credential bundle and does not reuse the normal route's endpoint/key/transport overrides.
-
-This schedule mirrors DeepSeek's published billing windows; it does **not** guarantee off-peak rates from a third-party supplier when using `inherit` or another named provider. Such suppliers may use different model availability, calendars, and prices; confirm their terms directly. DeepSeek's published pricing applies only when requests are billed by DeepSeek under its own account and endpoint terms. See [DeepSeek pricing](https://api-docs.deepseek.com/zh-cn/quick_start/pricing).
-
-If the selected low-route credentials are missing/unresolvable, Hermes warns and keeps the normal delegation route. For native `deepseek`, an endpoint other than `api.deepseek.com` is also rejected; other named providers are not subject to that DeepSeek-host check. If a request later fails, fallback follows only the route owner's configured `delegation.fallback_providers`; Hermes does not re-evaluate the schedule during the run.
-
-The current `chinesecalendar==1.11.0` holiday data covers 2004–2026. Outside that range, Hermes conservatively keeps the normal route during weekday peak windows, where holiday status is unknown; other deterministically off-peak times still use the configured off-peak route. Upgrade the dependency when the next year's China holiday calendar is published. No scheduled restart is required, and this setting does not change Codex's global agent configuration.
-
-**Subagent provider:model override:** Outside automatic off-peak routing, subagents inherit the parent agent's provider and model when no override is set. Set `delegation.provider` and `delegation.model` to route subagents to a different provider:model pair — e.g., use a cheap/fast model for narrowly-scoped subtasks while your primary agent runs an expensive reasoning model.
+**Subagent provider:model override:** Subagents inherit the parent agent's provider and model when no override is set. Set `delegation.provider` and `delegation.model` to route subagents to a different provider:model pair — e.g., use a cheap/fast model for narrowly-scoped subtasks while your primary agent runs an expensive reasoning model.
 
 **Subagent fallback chain:** Set `delegation.fallback_providers` to give workers their own chain (same entry shape as the top-level list). An explicitly pinned child (by provider, endpoint, or model) uses that chain only when it is declared; otherwise it fails loudly instead of borrowing the parent agent's route. For an unpinned child, an absent or `null` setting preserves parent-chain inheritance. Use `fallback_providers: []` under `delegation:` to disable child fallback entirely.
 

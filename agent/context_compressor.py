@@ -2990,13 +2990,12 @@ class ContextCompressor(SummaryDispatchMixin, PreLlmSkipMixin, MicroCompactionMi
         # must ABORT and preserve the session regardless of abort_on_summary_failure (see _TERMINAL_SUMMARY_FAILURES).
         self._clear_terminal_summary_failures()
 
-    def set_micro_compact_enabled(self, enabled: bool) -> None:
-        """Set the micro-compaction capability flag without resetting state."""
-        self._micro_compact_enabled = bool(enabled)
-
-    def get_micro_compact_enabled(self) -> bool:
-        """Return whether micro-compaction is enabled for this engine."""
-        return self._micro_compact_enabled is True
+    def set_session_option(self, name: str, value: bool) -> bool:
+        """Apply a supported runtime option without resetting rolling state."""
+        if name != "micro_compact_enabled":
+            return False
+        self._micro_compact_enabled = value is True
+        return True
 
     def update_from_response(self, usage: Dict[str, Any]):
         """Update tracked token usage from API response."""

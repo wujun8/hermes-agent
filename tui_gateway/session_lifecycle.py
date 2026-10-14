@@ -62,8 +62,8 @@ _SESSION_OWNERSHIP_UNAVAILABLE = "Hermes could not safely reserve this session. 
 _AUTOMATIC_SESSION_END_REASONS = frozenset({"ws_orphan_reap", "ws_disconnect", "idle_timeout", "lru_evict", "tui_shutdown"})
 
 
-class _MicroControlTarget(NamedTuple):
-    """Frozen identity/routing snapshot for one live ``/micro`` invocation."""
+class _PluginSessionControlTarget(NamedTuple):
+    """Frozen identity/routing snapshot for one live plugin session command invocation."""
 
     sid: str
     session: dict
@@ -71,6 +71,7 @@ class _MicroControlTarget(NamedTuple):
     agent: Any
     agent_session_id: str
     profile_home: str | None
+    profile_root: str
     generation: int
     token: object
 
@@ -90,8 +91,8 @@ class _CompressionReanchorIdentity(NamedTuple):
 
 
 @dataclass(frozen=True)
-class _MicroControlReleaseResult:
-    """Structured result for releasing one live ``/micro`` control lease."""
+class _PluginSessionControlReleaseResult:
+    """Structured result for releasing one live plugin session command control lease."""
 
     success: bool
     warning: str = ""
@@ -102,23 +103,23 @@ class _MicroControlReleaseResult:
 
 
 _SESSION_CONTROL_BUSY = object()
-_MICRO_TURN_BUSY = object()
-_MICRO_TURN_BUSY_MESSAGE = (
-    "session busy — /micro can't run mid-turn; interrupt the current turn first"
+_PLUGIN_SESSION_TURN_BUSY = object()
+_PLUGIN_SESSION_TURN_BUSY_MESSAGE = (
+    "session busy — session commands can't run mid-turn; interrupt the current turn first"
 )
-_MICRO_CONTROL_BUSY_MESSAGE = "session busy — /micro control command already in progress"
+_PLUGIN_SESSION_CONTROL_BUSY_MESSAGE = "session busy — a session control command is already in progress"
 _MANUAL_COMPRESSION_TURN_BUSY_MESSAGE = (
     "session busy — /interrupt the current turn before /compress"
 )
 _DEFERRED_COMPRESSION_ROTATION_KEY = "_deferred_compression_rotation"
 _MANUAL_COMPRESSION_CONTROL_KEY = "_manual_compression_control"
-_MICRO_CONTROL_STATE_KEY = "_micro_control_state"
+_PLUGIN_SESSION_CONTROL_STATE_KEY = "_plugin_session_control_state"
 _COMPRESSION_SYNC_UNCHANGED = "unchanged"
 _COMPRESSION_SYNC_APPLIED = "applied"
 _COMPRESSION_SYNC_DEFERRED = "deferred"
 _COMPRESSION_SYNC_FAILED = "failed"
 _COMPRESSION_SYNC_IDENTITY_CHANGED = "identity_changed"
-_MICRO_OVERRIDE_UNKNOWN = object()
+_PLUGIN_SESSION_OVERRIDE_UNKNOWN = object()
 def _lease_metadata(live_session_id: str) -> dict:
     """Writer identity for a lease: ``live_session_id`` is half of ``_is_same_writer``; the delivery flag is
     what Bot Chat gates live delivery on (session_notifications)."""
@@ -164,6 +165,7 @@ def _release_unowned_active_session_lease(lease, *, sid: str) -> bool:
     try:
         lease.release()
     except BaseException as exc:
+        logger.debug('release unowned active session lease failed', exc_info=True)
         logger.warning(
             "active-session lease cleanup failed before prompt ownership was installed: sid=%s error=%s",
             sid,
@@ -363,6 +365,7 @@ def _release_active_session_slot(
         try:
             released = _release_active_session_lease(lease)
         except BaseException as exc:
+            logger.debug('release active session slot failed', exc_info=True)
             logger.warning("Failed to release active session slot: %s", exc)
             return False
         if released and session.get("active_session_lease") is lease:
@@ -409,6 +412,7 @@ def _release_active_session_slot(
         try:
             released = _release_active_session_lease(expected_lease)
         except BaseException as exc:
+            logger.debug('release active session slot failed', exc_info=True)
             released = False
             logger.warning(
                 "Failed to release prompt active-session lease: sid=%s error=%s", sid, exc
@@ -421,6 +425,7 @@ def _release_active_session_slot(
             return False
         return True
     except BaseException as exc:
+        logger.debug('release active session slot failed', exc_info=True)
         logger.warning(
             "Prompt active-session lease validation failed: sid=%s error=%s", sid, exc
         )
@@ -442,6 +447,7 @@ def _release_prompt_active_session_slot(
             reject_active=True,
         )
     except BaseException as exc:
+        logger.debug('release prompt active session slot failed', exc_info=True)
         logger.warning("Prompt active-session lease cleanup failed: sid=%s error=%s", sid, exc)
         return False
 
@@ -538,64 +544,71 @@ def _transfer_active_session_slot(sid: str, session: dict, *, new_session_id: st
     return True
 
 
-def _session_micro_config_loader_for_profile(profile_home: str | None):
-    """Return a readonly micro config loader bound to one profile path."""
-    from hermes_cli.config import load_config_readonly
+def _session_plugin_config_loader_for_profile(profile_home: str | None):
+    """Return a readonly session command config loader bound to one profile path."""
+    from hermes_cli.session_commands import load_session_command_config
 
     profile_home = str(profile_home or "").strip()
     if not profile_home:
-        return load_config_readonly
+        return load_session_command_config
 
     def load_profile_config():
         token = set_hermes_home_override(profile_home)
         try:
-            return load_config_readonly()
+            return load_session_command_config()
         finally:
             reset_hermes_home_override(token)
 
     return load_profile_config
 
 
-def _session_micro_config_loader(session: dict):
-    """Return the readonly micro policy config loader for this session."""
-    return _session_micro_config_loader_for_profile(session.get("profile_home"))
+def _session_plugin_config_loader(session: dict):
+    """Return the readonly session command policy config loader for this session."""
+    return _session_plugin_config_loader_for_profile(session.get("profile_home"))
 
 
-def _claim_live_micro_control(sid: str, session: dict | None):
-    """Atomically claim an idle live session for one direct ``/micro`` call."""
+def _claim_live_plugin_session_control(sid: str, session: dict | None):
+    """Atomically claim an idle authorized session, including an agentless draft."""
     if session is None:
-        return None, None
+        return None, "Session command error: session not found; refusing to mutate"
     history_lock = session.get("history_lock")
     if history_lock is None:
-        return None, None
+        return None, _SESSION_CONTROL_BUSY
 
-    with history_lock:
-        active = bool(session.get("running"))
+    key_hint = str(session.get("session_key") or "")
+    profile_hint = session.get("profile_home")
+    profile_root = str(Path(profile_hint or get_hermes_home()).resolve())
+    child_active = _child_run_active(key_hint, profile_hint)
+    with _sessions_lock, history_lock:
+        if _sessions.get(sid) is not session:
+            return None, "Session command error: session changed; refusing to mutate"
         session_key = str(session.get("session_key") or "")
-        if not active:
-            active = _child_run_active(session_key, session.get("profile_home"))
+        if session_key != key_hint or session.get("profile_home") != profile_hint:
+            return None, _SESSION_CONTROL_BUSY
+        active = bool(session.get("running")) or child_active
         if active:
-            return None, _MICRO_TURN_BUSY
+            return None, _PLUGIN_SESSION_TURN_BUSY
         if session.get("_session_control_inflight") is not None:
+            return None, _SESSION_CONTROL_BUSY
+        ready = session.get("agent_ready")
+        if session.get("agent_build_started") and ready is not None and not ready.is_set():
             return None, _SESSION_CONTROL_BUSY
 
         agent = session.get("agent")
-        if agent is None:
-            return None, None
         agent_key = str(getattr(agent, "session_id", "") or "")
-        if not session_key.strip() or not agent_key.strip():
+        if not session_key.strip() or (agent is not None and not agent_key.strip()):
             return (
                 None,
-                "Micro-compaction error: live session identity is incomplete; refusing to mutate",
+                "Session command error: live session identity is incomplete; refusing to mutate",
             )
-        if session_key != agent_key:
+        if agent is not None and session_key != agent_key:
             return (
                 None,
-                "Micro-compaction error: live session identity mismatch; refusing to mutate",
+                "Session command error: live session identity mismatch; refusing to mutate",
             )
 
         token = object()
-        target = _MicroControlTarget(
+        target = _PluginSessionControlTarget(
             sid=str(sid or ""),
             session=session,
             session_key=session_key,
@@ -606,11 +619,12 @@ def _claim_live_micro_control(sid: str, session: dict | None):
                 if session.get("profile_home") is not None
                 else None
             ),
+            profile_root=profile_root,
             generation=int(session.get("session_generation", 0) or 0),
             token=token,
         )
         session["_session_control_inflight"] = token
-        session[_MICRO_CONTROL_STATE_KEY] = {}
+        session[_PLUGIN_SESSION_CONTROL_STATE_KEY] = {}
         return target, None
 
 
@@ -625,7 +639,7 @@ def _claim_manual_compression_control(session: dict):
         if not active:
             active = _child_run_active(session_key, session.get("profile_home"))
         if active:
-            return None, _MICRO_TURN_BUSY
+            return None, _PLUGIN_SESSION_TURN_BUSY
         if session.get("_session_control_inflight") is not None:
             return None, _SESSION_CONTROL_BUSY
         token = object()
@@ -635,12 +649,12 @@ def _claim_manual_compression_control(session: dict):
 
 
 def _manual_compression_busy_text(claim_error) -> str:
-    if claim_error is _MICRO_TURN_BUSY:
+    if claim_error is _PLUGIN_SESSION_TURN_BUSY:
         return _MANUAL_COMPRESSION_TURN_BUSY_MESSAGE
-    return _MICRO_CONTROL_BUSY_MESSAGE
+    return _PLUGIN_SESSION_CONTROL_BUSY_MESSAGE
 
 
-def _marker_matches_micro_target(marker: dict | None, target: _MicroControlTarget) -> bool:
+def _marker_matches_plugin_session_target(marker: dict | None, target: _PluginSessionControlTarget) -> bool:
     if not isinstance(marker, dict) or marker.get("control_token") is not target.token:
         return False
     try:
@@ -649,68 +663,70 @@ def _marker_matches_micro_target(marker: dict | None, target: _MicroControlTarge
         return False
 
 
-def _micro_rotation_override_warning(
-    target: _MicroControlTarget,
+def _plugin_session_rotation_override_warning(
+    target: _PluginSessionControlTarget,
     marker: dict,
     state: dict | None,
 ) -> str | None:
-    """Fail closed if a forced rotation left /micro's exact override on old row."""
-    if not isinstance(state, dict) or not state.get("mutation_succeeded"):
+    """Verify every committed policy write against the exact continuation and live cache."""
+    writes = state.get("writes") if isinstance(state, dict) else None
+    if not isinstance(writes, dict) or not writes:
         return None
-    if "requested_override" not in state:
-        return None
-    requested = state["requested_override"]
     new_session_id = str(marker.get("agent_session_id") or "")
     if not new_session_id:
         return (
-            "Micro-compaction warning: forced compression rotation produced no "
-            "current session id; retry /micro on the current session"
+            "Session command warning: forced compression rotation produced no "
+            "current session id; retry session command on the current session"
         )
     try:
-        with _session_db(target.session) as db:
+        from hermes_state import SessionDB
+
+        with _session_db({"profile_home": target.profile_root}) as db:
             row = db.get_session(new_session_id) if db is not None else None
             if row is None:
                 return (
-                    "Micro-compaction warning: /micro changed only the old row "
-                    "because compression rotated the session; retry /micro on the current session"
+                    "Session command warning: session command changed only the old row "
+                    "because compression rotated the session; retry session command on the current session"
                 )
-            getter = getattr(db, "session_micro_compact_override", None)
-            actual = getter(row) if callable(getter) else None
+            actual = {key: SessionDB.session_policy_override(row, key) for key in writes}
     except Exception as exc:
+        logger.exception("Plugin session continuation policy verification failed: session_id=%s continuation=%s",
+                         target.sid, new_session_id)
         return (
-            "Micro-compaction warning: could not verify the current continuation "
-            f"override after rotation ({exc}); retry /micro on the current session"
+            "Session command warning: could not verify the current continuation "
+            f"override after rotation ({exc}); retry session command on the current session"
         )
-    if actual is not requested:
+    if any(actual[key] is not requested for key, requested in writes.items()):
         return (
-            "Micro-compaction warning: /micro changed only the old row because "
-            "compression rotated the session; retry /micro on the current session"
+            "Session command warning: session command changed only the old row because "
+            "compression rotated the session; retry session command on the current session"
         )
-    live_override = getattr(
-        target.agent, "micro_compact_override", _MICRO_OVERRIDE_UNKNOWN
-    )
-    if live_override is not _MICRO_OVERRIDE_UNKNOWN and live_override is not requested:
+    live_overrides = getattr(target.agent, "_session_policy_overrides", {})
+    if not isinstance(live_overrides, dict) or any(
+        live_overrides.get(key, _PLUGIN_SESSION_OVERRIDE_UNKNOWN) is not requested
+        for key, requested in writes.items()
+    ):
         return (
-            "Micro-compaction warning: the current Agent policy did not retain "
-            "the requested override after rotation; retry /micro on the current session"
+            "Session command warning: the current Agent policy did not retain "
+            "the requested override after rotation; retry session command on the current session"
         )
     return None
 
 
-def _release_live_micro_control(
-    target: _MicroControlTarget,
-) -> _MicroControlReleaseResult:
-    """Release one live ``/micro`` claim, retaining it through re-anchor I/O."""
+def _release_live_plugin_session_control(
+    target: _PluginSessionControlTarget,
+) -> _PluginSessionControlReleaseResult:
+    """Release one live plugin session command claim, retaining it through re-anchor I/O."""
     session = target.session
     marker = None
     state = None
     reanchor_token = None
     expected_reanchor = None
 
-    def _identity_warning() -> _MicroControlReleaseResult:
-        return _MicroControlReleaseResult(
+    def _identity_warning() -> _PluginSessionControlReleaseResult:
+        return _PluginSessionControlReleaseResult(
             False,
-            "Micro-compaction warning: live session changed (identity changed) during "
+            "Session command warning: live session changed (identity changed) during "
             "deferred re-anchor; refusing to mutate the replacement",
         )
 
@@ -741,13 +757,13 @@ def _release_live_micro_control(
                 == target.profile_home
             )
             if not lease_matches:
-                return _MicroControlReleaseResult(
+                return _PluginSessionControlReleaseResult(
                     False,
-                    "Micro-compaction warning: live session changed before the "
+                    "Session command warning: live session changed before the "
                     "completion could clear its control lease",
                 )
             candidate = session.get(_DEFERRED_COMPRESSION_ROTATION_KEY)
-            if _marker_matches_micro_target(candidate, target):
+            if _marker_matches_plugin_session_target(candidate, target):
                 marker = candidate
                 reanchor_token = target.token
                 new_session_id = str(marker.get("agent_session_id") or "")
@@ -766,7 +782,7 @@ def _release_live_micro_control(
                     old_session_key=target.session_key,
                     profile_home=target.profile_home,
                 )
-            state = session.get(_MICRO_CONTROL_STATE_KEY)
+            state = session.get(_PLUGIN_SESSION_CONTROL_STATE_KEY)
             if marker is None:
                 session.pop("_session_control_inflight", None)
 
@@ -785,13 +801,13 @@ def _release_live_micro_control(
                     and int(session.get("session_generation", 0) or 0)
                     == target.generation
                 )
-                if session.get(_MICRO_CONTROL_STATE_KEY) is state:
-                    session.pop(_MICRO_CONTROL_STATE_KEY, None)
+                if session.get(_PLUGIN_SESSION_CONTROL_STATE_KEY) is state:
+                    session.pop(_PLUGIN_SESSION_CONTROL_STATE_KEY, None)
             if unchanged:
-                return _MicroControlReleaseResult(True)
-            return _MicroControlReleaseResult(
+                return _PluginSessionControlReleaseResult(True)
+            return _PluginSessionControlReleaseResult(
                 False,
-                "Micro-compaction warning: live session changed while /micro "
+                "Session command warning: live session changed while session command "
                 "was running; refusing to report a new target mutation",
             )
 
@@ -803,41 +819,43 @@ def _release_live_micro_control(
                 expected_reanchor=expected_reanchor,
             )
         except BaseException as exc:
-            return _MicroControlReleaseResult(
+            logger.exception("Deferred plugin session command re-anchor failed: session_id=%s", target.sid)
+            return _PluginSessionControlReleaseResult(
                 False,
-                "Micro-compaction warning: deferred compression rotation remains "
-                f"pending after release ({exc}); retry /micro on the current session",
+                "Session command warning: deferred compression rotation remains "
+                f"pending after release ({exc}); retry session command on the current session",
             )
         if sync_status == _COMPRESSION_SYNC_IDENTITY_CHANGED:
             return _identity_warning()
         if sync_status not in {_COMPRESSION_SYNC_APPLIED, _COMPRESSION_SYNC_UNCHANGED}:
-            return _MicroControlReleaseResult(
+            return _PluginSessionControlReleaseResult(
                 False,
-                "Micro-compaction warning: deferred compression rotation remains "
-                "pending after release; retry /micro on the current session",
+                "Session command warning: deferred compression rotation remains "
+                "pending after release; retry session command on the current session",
             )
 
         if not _canonical_state():
             return _identity_warning()
 
-        warning = _micro_rotation_override_warning(target, marker, state)
+        warning = _plugin_session_rotation_override_warning(target, marker, state)
         if not _canonical_state():
             return _identity_warning()
         with _sessions_lock:
-            if session.get(_MICRO_CONTROL_STATE_KEY) is state:
-                session.pop(_MICRO_CONTROL_STATE_KEY, None)
+            if session.get(_PLUGIN_SESSION_CONTROL_STATE_KEY) is state:
+                session.pop(_PLUGIN_SESSION_CONTROL_STATE_KEY, None)
         if warning:
-            return _MicroControlReleaseResult(
+            return _PluginSessionControlReleaseResult(
                 False,
                 warning,
                 reanchored=True,
             )
-        return _MicroControlReleaseResult(True, reanchored=True)
+        return _PluginSessionControlReleaseResult(True, reanchored=True)
     except BaseException as exc:
-        return _MicroControlReleaseResult(
+        logger.exception("Plugin session control release failed: session_id=%s", target.sid)
+        return _PluginSessionControlReleaseResult(
             False,
-            "Micro-compaction warning: could not complete live-control release "
-            f"({exc}); retry /micro on the current session",
+            "Session command warning: could not complete live-control release "
+            f"({exc}); retry session command on the current session",
         )
     finally:
         if reanchor_token is not None:
@@ -846,7 +864,7 @@ def _release_live_micro_control(
                     if session.get("_session_control_inflight") is reanchor_token:
                         session.pop("_session_control_inflight", None)
             except BaseException:
-                pass
+                logger.exception("Plugin session re-anchor token cleanup failed: session_id=%s", target.sid)
 
 
 def _try_claim_session_control(session: dict):
@@ -860,7 +878,7 @@ def _try_claim_session_control(session: dict):
 
 
 def _release_session_control(session: dict, token) -> None:
-    """Release a non-micro transition reservation, best effort."""
+    """Release a non-plugin transition reservation, best effort."""
     try:
         with session["history_lock"]:
             if session.get("_session_control_inflight") is token:
@@ -868,7 +886,7 @@ def _release_session_control(session: dict, token) -> None:
             if session.get(_MANUAL_COMPRESSION_CONTROL_KEY) is token:
                 session.pop(_MANUAL_COMPRESSION_CONTROL_KEY, None)
     except BaseException:
-        pass
+        logger.debug('release session control failed', exc_info=True)
 
 
 # Sources this backend must never end in state.db: the messaging gateway owns those sessions and the TUI is only
@@ -1634,16 +1652,16 @@ def register(server) -> None:
     """Publish this module's helpers onto ``server``, rebound to its globals."""
     # Generated NamedTuple/dataclass methods close over module-private helpers;
     # keep the classes intact instead of rebinding those generated methods.
-    server._MicroControlTarget = _MicroControlTarget
+    server._PluginSessionControlTarget = _PluginSessionControlTarget
     server._CompressionReanchorIdentity = _CompressionReanchorIdentity
-    server._MicroControlReleaseResult = _MicroControlReleaseResult
+    server._PluginSessionControlReleaseResult = _PluginSessionControlReleaseResult
     bind_module(
         globals(),
         server,
         skip=(
             "_",
-            "_MicroControlTarget",
+            "_PluginSessionControlTarget",
             "_CompressionReanchorIdentity",
-            "_MicroControlReleaseResult",
+            "_PluginSessionControlReleaseResult",
         ),
     )

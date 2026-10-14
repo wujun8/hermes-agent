@@ -23,9 +23,8 @@ from hermes_state_common import (
     _sql_in_window, _sql_json_extract, _sql_session_last_active, _sql_session_last_active_by_id,
     escape_like as _escape_like, _SQL_IN_CHUNK, _id_chunks, _placeholders as _session_ids_placeholders,
 )
-from hermes_cli.micro_compaction import MICRO_COMPACT_OVERRIDE_KEY
 from hermes_state_compression import _CHAIN_CAP
-
+from hermes_state_session_policies import SessionPolicyMixin
 # caplog tests pin the "hermes_state" logger name.
 logger = logging.getLogger("hermes_state")
 
@@ -325,7 +324,7 @@ _INHERIT_PARENT_ROUTING_SQL = (
 )
 
 
-class SessionSessionsMixin:
+class SessionSessionsMixin(SessionPolicyMixin):
     """Session rows: create/inherit, lifecycle flags, model_config, listing, deletion."""
 
     def _own_profile_name(self) -> Optional[str]:
@@ -852,74 +851,6 @@ class SessionSessionsMixin:
                    WHERE id = ?""",
             lambda merged: (merged, model, session_id),
         )
-
-    def set_session_micro_compact_override(
-        self, session_id: str, override: bool | None
-    ) -> None:
-        """Atomically set or clear a session's micro-compaction override."""
-        if override is not None and not isinstance(override, bool):
-            raise ValueError(
-                "micro-compaction override must be a literal bool or None"
-            )
-
-        def _do(conn):
-            row = conn.execute(
-                "SELECT model_config FROM sessions WHERE id = ?",
-                (session_id,),
-            ).fetchone()
-            if row is None:
-                raise ValueError(f"Session row not found: {session_id}")
-
-            raw = row["model_config"] if isinstance(row, sqlite3.Row) else row[0]
-            if raw is None:
-                config: Dict[str, Any] = {}
-            elif isinstance(raw, dict):
-                config = dict(raw)
-            elif isinstance(raw, str):
-                try:
-                    parsed = json.loads(raw)
-                except (TypeError, ValueError, json.JSONDecodeError) as exc:
-                    raise ValueError(
-                        f"Session {session_id} model_config is malformed JSON"
-                    ) from exc
-                if not isinstance(parsed, dict):
-                    raise ValueError(
-                        f"Session {session_id} model_config must be a JSON object"
-                    )
-                config = parsed
-            else:
-                raise ValueError(
-                    f"Session {session_id} model_config must be a JSON object"
-                )
-
-            if override is None:
-                config.pop(MICRO_COMPACT_OVERRIDE_KEY, None)
-            else:
-                config[MICRO_COMPACT_OVERRIDE_KEY] = override
-            conn.execute(
-                "UPDATE sessions SET model_config = ? WHERE id = ?",
-                (json.dumps(config), session_id),
-            )
-
-        self._execute_write(_do)
-
-    @staticmethod
-    def session_micro_compact_override(
-        session_meta: Optional[Dict[str, Any]],
-    ) -> bool | None:
-        """Read a strict tri-state micro-compaction override from a row dict."""
-        if not isinstance(session_meta, dict):
-            return None
-        raw = session_meta.get("model_config")
-        if isinstance(raw, str):
-            try:
-                raw = json.loads(raw)
-            except (TypeError, ValueError, json.JSONDecodeError):
-                return None
-        if not isinstance(raw, dict):
-            return None
-        value = raw.get(MICRO_COMPACT_OVERRIDE_KEY)
-        return value if isinstance(value, bool) else None
 
     def set_session_yolo(self, session_id: str, enabled: bool) -> None:
         """Persist the per-session YOLO flag so ``/yolo`` survives ``--resume``; no-op without a row."""

@@ -676,7 +676,7 @@ class _Resume:
         """Register ``record`` live under the resume lock, or reuse a concurrent winner's session."""
         live = _claim_or_reuse_live(sid, self.target, record, None)
         if live is _SESSION_CONTROL_BUSY:
-            return _err(self.rid, 4009, _MICRO_CONTROL_BUSY_MESSAGE)
+            return _err(self.rid, 4009, _PLUGIN_SESSION_CONTROL_BUSY_MESSAGE)
         return None if live is None else _resume_reuse_live(self, *live)
 
     def restore(self):
@@ -912,7 +912,7 @@ def _resume_prepare_live_locked(ctx: _Resume, sid: str, session: dict) -> dict |
         inline_images=ctx.inline_images,
     )
     if rebound is None:
-        return _err(ctx.rid, 4009, _MICRO_CONTROL_BUSY_MESSAGE)
+        return _err(ctx.rid, 4009, _PLUGIN_SESSION_CONTROL_BUSY_MESSAGE)
     return None
 
 
@@ -928,7 +928,7 @@ def _resume_live_payload(ctx: _Resume, sid: str, session: dict) -> dict:
         inline_images=ctx.inline_images,
     )
     if payload is None:
-        return _err(ctx.rid, 4009, _MICRO_CONTROL_BUSY_MESSAGE)
+        return _err(ctx.rid, 4009, _PLUGIN_SESSION_CONTROL_BUSY_MESSAGE)
     payload["resumed"] = ctx.target
     if ctx.defer_history:
         payload.update(messages=[], hydrating=bool(session.get("resume_hydrating")),
@@ -2110,145 +2110,6 @@ def _save_via_compute_host(rid, params: dict) -> dict:
     return _ok(rid, result)
 
 
-def _compress_via_compute_host(rid, params: dict, session: dict) -> dict:
-    """``session.compress`` for a turn-isolated session: forward ``/compress`` to the host."""
-    sid = str(params.get("session_id") or "")
-    focus_topic = _str_param(params, "focus_topic")
-
-    def _on_late_ack(late: dict, _sid=sid) -> None:
-        _adopt_late_compute_host_compress_ack(_sid, session, late, route_name="session.compress")
-    try:
-        ack = _send_compute_host_control(
-            sid, route_name="session.compress", command="/compress" + (f" {focus_topic}" if focus_topic else ""),
-            # compression.context_total_ceiling_seconds: the host legitimately runs that long.
-            wait=True, timeout=_compute_host_compress_wait_seconds(), on_late_ack=_on_late_ack)
-    except queue.Empty:
-        # Waiter gave up, host still compressing; the late-ack handler adopts the rotated session when it
-        # lands. Not an error (a 5019 here reported timeouts that later succeeded).
-        return _ok(rid, {"status": "pending", "turn_isolation": True,
-                         "message": ("compression still running in the background; "
-                                     "the transcript will refresh when it finishes")})
-    except Exception as exc:
-        return _err(rid, 5019, f"compute-host compress failed: {exc}")
-    if (resp := _compute_host_ack_error(rid, ack, 4009, "compute-host compress failed")) is not None:
-        return resp
-    _apply_compute_host_metadata_mirror(session, ack)
-    if isinstance(host_result := ack.get("result"), dict):
-        # Host-owned result verbatim (carries `status: aborted` / `summary.aborted`).
-        return _ok(rid, {**host_result, "turn_isolation": True})
-    host_info = ack.get("session_info") if isinstance(ack.get("session_info"), dict) else {}
-    return _ok(rid, {
-        "status": "compressed", "turn_isolation": True,
-        # `messages` goes top-level for the transcript replacement; don't duplicate it in the ack.
-        "host_ack": {key: value for key, value in ack.items() if key != "messages"}, "info": host_info,
-        "messages": _history_to_messages(ack.get("messages"), profile_home=session.get("profile_home")) if isinstance(ack.get("messages"), list) else [],
-        "usage": host_info.get("usage") if isinstance(host_info.get("usage"), dict) else {}})
-
-
-def _compress_live(
-    rid,
-    sid: str,
-    session: dict,
-    focus_topic: str,
-    control_token=None,
-) -> dict:
-    """In-process ``session.compress``: status pinned "compressing", then the before/after summary + messages."""
-    from agent.conversation_compression import finalize_context_engine_compression_notification
-    from agent.manual_compression_feedback import summarize_manual_compression
-    from agent.model_metadata import estimate_request_tokens_rough
-    with session["history_lock"]:
-        before_messages = list(session.get("history", []))
-        history_version = int(session.get("history_version", 0))
-    before_count = len(before_messages)
-    _agent = session["agent"]
-    _sys_prompt = getattr(_agent, "_cached_system_prompt", "") or ""
-    _tools = getattr(_agent, "tools", None) or None
-
-    def _tokens(msgs) -> int:
-        # Re-reads prompt + tools each call: _compress_context may have rebuilt the system prompt.
-        sys_prompt = getattr(_agent, "_cached_system_prompt", "") or _sys_prompt
-        tools = getattr(_agent, "tools", None) or _tools
-        return estimate_request_tokens_rough(msgs, system_prompt=sys_prompt, tools=tools) if msgs else 0
-    before_tokens = _tokens(before_messages)
-    if before_count >= 4:
-        focus_suffix = f', focus: "{focus_topic}"' if focus_topic else ""
-        _status_update(sid, "compressing",
-                       f"⠋ compressing {before_count} messages (~{before_tokens:,} tok){focus_suffix}…")
-    try:
-        removed, usage = _compress_session_history(
-            session, focus_topic, approx_tokens=before_tokens, before_messages=before_messages,
-            history_version=history_version)
-        with session["history_lock"]:
-            messages = list(session.get("history", []))
-        after_tokens = _tokens(messages)
-        agent = session["agent"]
-        _sync_session_key_after_compress(
-            sid,
-            session,
-            control_token=control_token,
-        )
-        summary = summarize_manual_compression(before_messages, messages, before_tokens, after_tokens,
-                                               compression_state=getattr(agent, "context_compressor", None))
-        info = _session_info(agent, session)
-        _emit("session.info", sid, info)
-        finalize_context_engine_compression_notification(agent, committed=True)
-        return _ok(rid, {
-            "status": "aborted" if summary["aborted"] else "compressed", "removed": removed,
-            "before_messages": before_count, "after_messages": len(messages),
-            "before_tokens": before_tokens, "after_tokens": after_tokens, "summary": summary,
-            "usage": usage, "info": info, "messages": _history_to_messages(messages, profile_home=session.get("profile_home"))})
-    finally:
-        # Always clear the pinned compressing status (success, no-op, or raise).
-        _status_update(sid, "ready")
-
-
-def _run_session_compression(
-    rid,
-    params: dict,
-    session: dict,
-    control_token,
-) -> dict:
-    """Run session compression after its exact session-control lease is held."""
-    if _session_uses_compute_host(session):
-        return _compress_via_compute_host(rid, params, session)
-    if session.get("running"):
-        return _err(
-            rid,
-            4009,
-            "session busy — /interrupt the current turn before /compress",
-        )
-    from agent.conversation_compression import (
-        finalize_context_engine_compression_notification,
-    )
-
-    sid = params.get("session_id", "")
-    try:
-        with _manual_compress_turn(sid, session, control_token=control_token):
-            return _compress_live(
-                rid, sid, session, _str_param(params, "focus_topic"), control_token=control_token,
-            )
-    except CompressionBusy as exc:
-        return _err(rid, 4009, str(exc))
-    except CompressionLockHeld as exc:
-        _status_update(sid, "ready")
-        from agent.manual_compression_feedback import describe_compression_lock_skip
-
-        return _ok(
-            rid,
-            {
-                "compressed": False,
-                "lock_held": True,
-                "message": describe_compression_lock_skip(exc.holder),
-            },
-        )
-    except Exception as exc:
-        finalize_context_engine_compression_notification(
-            session["agent"],
-            committed=False,
-        )
-        return _err(rid, 5005, str(exc))
-
-
 @method("session.compress")
 @_profile_scoped
 def _(rid, params: dict) -> dict:
@@ -2304,7 +2165,7 @@ def _(rid, params: dict) -> dict:
     with _session_resume_lock:  # lock only the ownership claim; finalization must not block resumes
         session = _pop_session_by_id(params.get("session_id", ""))
     if session is _SESSION_CONTROL_BUSY:
-        return _err(rid, 4009, _MICRO_CONTROL_BUSY_MESSAGE)
+        return _err(rid, 4009, _PLUGIN_SESSION_CONTROL_BUSY_MESSAGE)
     return _ok(rid, {"closed": _teardown_popped_session(session, end_reason="tui_close")})
 
 

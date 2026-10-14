@@ -887,18 +887,12 @@ def test_bare_custom_uses_loopback_model_base_url_when_provider_not_custom(monke
 def test_codex_app_server_opt_in_routes_only_named_custom_providers(monkeypatch):
     """#75186: ``model.openai_runtime: codex_app_server`` reaches a configured ``providers.<name>``
     entry (codex selects it by id from its own config); anonymous ``custom`` has no stable id and
-    stays on chat_completions, while the named entry without the opt-in keeps its configured
-    Responses transport."""
+    stays on chat_completions, as does the named entry without the opt-in."""
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     config = {
         "model": {"provider": "custom:my-gateway", "default": "gpt-5.4", "openai_runtime": "codex_app_server"},
-        "providers": {"my-gateway": {
-            "api": "https://gateway.example.com/v1",
-            "api_key": "test-key",
-            "default_model": "gpt-5.4",
-            "api_mode": "codex_responses",
-        }},
+        "providers": {"my-gateway": {"api": "https://gateway.example.com/v1", "api_key": "test-key", "default_model": "gpt-5.4"}},
     }
     monkeypatch.setattr(rp, "load_config", lambda: config)
 
@@ -911,13 +905,8 @@ def test_codex_app_server_opt_in_routes_only_named_custom_providers(monkeypatch)
                                             explicit_api_key="k")
     assert anonymous["api_mode"] == "chat_completions"
 
-    # Opt-in must not move a named Chat/Anthropic endpoint onto the Codex transport.
-    for ineligible_mode in ("chat_completions", "anthropic_messages"):
-        config["providers"]["my-gateway"]["api_mode"] = ineligible_mode
-        assert rp.resolve_runtime_provider(requested="custom:my-gateway")["api_mode"] == ineligible_mode
-    config["providers"]["my-gateway"]["api_mode"] = "codex_responses"
     config["model"].pop("openai_runtime")
-    assert rp.resolve_runtime_provider(requested="custom:my-gateway")["api_mode"] == "codex_responses"
+    assert rp.resolve_runtime_provider(requested="custom:my-gateway")["api_mode"] == "chat_completions"
 
 
 def test_named_custom_provider_uses_saved_credentials(monkeypatch):

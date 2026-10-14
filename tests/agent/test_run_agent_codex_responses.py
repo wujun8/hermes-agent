@@ -1961,15 +1961,14 @@ def test_interim_commentary_is_not_marked_already_streamed_without_callbacks(mon
     }
 
 
-def test_app_server_bridge_commentary_then_final_keeps_final_on_its_own_delivery_path(monkeypatch):
-    """Commentary is delivered once; final text streams and stays available to final delivery.
-    Resetting commentary deltas prevents a combined buffer from defeating final de-duplication.
-    A phase=final_answer completion must not also be emitted as an interim message."""
+def test_app_server_bridge_commentary_then_final_agent_messages_are_each_already_streamed(monkeypatch):
+    """#74248 boundary 2: codex app-server emits commentary deltas + completed, then final deltas +
+    completed. The completed final must compare against ITS OWN deltas, not "commentary + final", or
+    it is re-delivered with already_streamed=False and the gateway posts a second copy."""
     from agent.codex_runtime import make_codex_app_server_event_bridge
 
     agent = _build_agent(monkeypatch)
-    deltas = []
-    agent.stream_delta_callback = deltas.append
+    agent.stream_delta_callback = lambda text: None
     deliveries = []
     agent.interim_assistant_callback = lambda text, *, already_streamed=False: deliveries.append(
         (text, already_streamed)
@@ -1984,9 +1983,8 @@ def test_app_server_bridge_commentary_then_final_keeps_final_on_its_own_delivery
     _agent_message("m1", "Checking the config.", "commentary")
     _agent_message("m2", "Native compaction is active.", "final_answer")
 
-    assert deliveries == [("Checking the config.", True)]
-    assert deltas == ["Checking the config.", "Native compaction is active."]
-    assert agent._current_streamed_assistant_text == "Native compaction is active."
+    assert deliveries == [("Checking the config.", True), ("Native compaction is active.", True)]
+    assert agent._current_streamed_assistant_text == ""
 
 
 def test_interim_content_was_streamed_matches_prefix_not_exact(monkeypatch):

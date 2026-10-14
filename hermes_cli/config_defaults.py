@@ -83,9 +83,6 @@ DEFAULT_CONFIG = {
         # elapsed; implicit provider stale timeouts capped to remaining budget. CLI equivalent:
         # `hermes chat --run-budget N`.
         "run_budget_seconds": None,
-        # Optional hard wall-clock cap (seconds) for one complete Codex app-server turn. null =
-        # disabled; only positive finite values enable it. 0 and negative values disable it.
-        "codex_app_server_turn_timeout_seconds": None,
         "api_outage_recovery": {
             "enabled": False,
             "probe_command": "",
@@ -1007,8 +1004,8 @@ DEFAULT_CONFIG = {
             "unicode_cols": 0,  # Hard override for terminal column width; 0 = derive from scale.
         },
     },
-
     "dashboard": {
+        "files_allowed_roots": [],  # Extra hosted workspace roots; explicit FILES_ROOT stays strict.
         # Visual theme: "default" | "midnight" | "ember" | "mono" | "cyberpunk" | "rose"
         "theme": "default",
         # Process-isolation rollout controls. Read via the raw config loader, so tui_gateway.server
@@ -1339,14 +1336,6 @@ DEFAULT_CONFIG = {
     # cheaper/faster model. Uses the same runtime provider resolution as CLI/gateway startup, so
     # every configured provider is supported.
     "delegation": {
-        # Route new dispatches through the provider during DeepSeek billing off-peak windows.
-        # "deepseek" uses native DeepSeek; "inherit" keeps the normal provider/endpoint/key.
-        "deepseek_off_peak_provider": "deepseek",
-        "deepseek_off_peak_model": "deepseek-flash",
-        # Empty derives the target provider's wire mode; non-empty must be a registered transport.
-        "deepseek_off_peak_api_mode": "",
-        # false = always use the configured delegation route below.
-        "deepseek_off_peak_enabled": True,
         "model": "",  # e.g. "google/gemini-3-flash-preview" (empty = inherit parent)
         "provider": "",  # e.g. "openrouter" (empty = inherit parent provider + credentials)
         # Fallback chain for delegated children (same entry format as the top-level list).

@@ -541,41 +541,22 @@ def test_turn_finalizer_never_micro_compacts_while_checkpoint_gate_armed(
     assert _run(checkpoint_required=False) == 1
 
 
-def test_agent_init_suppresses_micro_compaction_under_checkpoint_gate():
-    """checkpoint_required wins over both global and session enablement.
+def test_session_policy_cannot_enable_lossy_micro_compaction_under_checkpoint_gate():
+    from agent.session_policies import SessionPolicyRuntime
 
-    The private fork routes micro-compaction through the shared tri-state policy
-    helper rather than mutating a compressor private attribute directly.  The
-    gate therefore has to remain effective for a durable ``session=True``
-    override as well as the global config value.
-    """
-    from types import SimpleNamespace
-
-    from agent.agent_init import apply_micro_compact_policy
-
-    class _RecordingCompressor:
+    class Engine:
         def __init__(self):
             self.calls = []
 
-        def set_micro_compact_enabled(self, enabled):
-            self.calls.append(enabled)
+        def set_session_option(self, name, enabled):
+            self.calls.append((name, enabled))
+            return True
 
-    compressor = _RecordingCompressor()
-    agent = SimpleNamespace(
-        compression_checkpoint_required=True,
-        context_compressor=compressor,
-        _session_init_model_config={},
-    )
-
-    assert apply_micro_compact_policy(
-        agent,
-        session_override=True,
-        global_value=True,
-    ) is True
-    assert agent.micro_compact_override is True
-    assert agent.micro_compact_source == "session"
-    assert agent.micro_compact_enabled is False
-    assert compressor.calls == [False]
+    engine = Engine()
+    runtime = SessionPolicyRuntime(SimpleNamespace(
+        compression_checkpoint_required=True, context_compressor=engine))
+    assert runtime.set_context_option("micro_compact_enabled", True) is True
+    assert engine.calls == [("micro_compact_enabled", False)]
 
 
 def _warn_text(caplog) -> str:

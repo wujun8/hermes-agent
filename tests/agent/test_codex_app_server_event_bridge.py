@@ -15,7 +15,6 @@ tests can stay focused on the wire format ↔ callback contract.
 
 from __future__ import annotations
 
-import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -38,7 +37,6 @@ def _make_stub_agent() -> SimpleNamespace:
         _emit_interim_assistant_message=MagicMock(
             name="_emit_interim_assistant_message"
         ),
-        _touch_activity=MagicMock(name="_touch_activity"),
     )
 
 def _item_started(item: dict) -> dict:
@@ -133,14 +131,6 @@ class TestCodexItemCompletionPayload:
 # ---------- bridge: dispatch contracts ----------
 
 class TestStreamDeltaDispatch:
-    def test_app_server_event_refreshes_turn_activity(self):
-        agent = _make_stub_agent()
-        bridge = make_codex_app_server_event_bridge(agent)
-        bridge({"method": "item/reasoning/delta", "params": {"delta": "thinking..."}})
-        agent._touch_activity.assert_called_once_with(
-            "codex app-server: item/reasoning/delta"
-        )
-
     def test_agent_message_delta_fires_stream_delta(self):
         agent = _make_stub_agent()
         bridge = make_codex_app_server_event_bridge(agent)
@@ -238,30 +228,6 @@ class TestAgentMessageInterimDispatch:
             {"role": "assistant", "content": "I'll check the config first."}
         )
 
-    def test_completed_final_answer_is_not_emitted_as_interim(self):
-        agent = _make_stub_agent()
-        bridge = make_codex_app_server_event_bridge(agent)
-        bridge(_item_completed({
-            "type": "agentMessage",
-            "id": "am-final",
-            "text": "The task is complete.",
-            "phase": " FINAL_ANSWER ",
-        }))
-        agent._emit_interim_assistant_message.assert_not_called()
-
-    def test_completed_commentary_still_emits_interim(self):
-        agent = _make_stub_agent()
-        bridge = make_codex_app_server_event_bridge(agent)
-        bridge(_item_completed({
-            "type": "agentMessage",
-            "id": "am-commentary",
-            "text": "Still checking.",
-            "phase": "commentary",
-        }))
-        agent._emit_interim_assistant_message.assert_called_once_with(
-            {"role": "assistant", "content": "Still checking."}
-        )
-
     def test_show_commentary_off_suppresses_interim(self):
         """display.show_commentary=false silences agentMessage interim
         delivery on the app-server runtime (same contract as the
@@ -306,113 +272,6 @@ class TestBridgeRobustness:
         }))
 
 # ---------- end-to-end: bridge is wired in run_codex_app_server_turn ----------
-
-
-class TestBridgeWiredInRuntime:
-    """Verify run_codex_app_server_turn actually constructs the session
-    with `on_event=<bridge>`. This is the integration guard that prevents
-    a future refactor from dropping the bridge wiring and silently
-    regressing Discord/Telegram live progress visibility."""
-
-    def test_session_constructor_receives_on_event(self, monkeypatch):
-        from agent import codex_runtime
-
-        captured: dict = {}
-        captured_turn: dict = {}
-
-        class FakeSession:
-            def __init__(self, **kwargs):
-                captured.update(kwargs)
-
-            def ensure_started(self):
-                return "th1"
-
-            def run_turn(self, user_input, *, model=None, reasoning_effort=None,
-                         service_tier=None, turn_timeout=None):
-                from agent.transports.codex_app_server_session import TurnResult
-                captured_turn.update(
-                    user_input=user_input, model=model, reasoning_effort=reasoning_effort,
-                    service_tier=service_tier, turn_timeout=turn_timeout,
-                )
-                return TurnResult(
-                    final_text="done",
-                    projected_messages=[],
-                    tool_iterations=0,
-                    turn_id="t1",
-                    thread_id="th1",
-                )
-
-            def close(self):
-                pass
-
-        monkeypatch.setattr(
-            "agent.transports.codex_app_server_session.CodexAppServerSession",
-            FakeSession,
-        )
-
-        # Minimal stub agent — the runtime only touches a handful of
-        # attributes and we mock the heavy ones to keep the test fast.
-        agent = SimpleNamespace(
-            session_cwd=None,
-            _codex_session=None,
-            model="gpt-5.5",
-            codex_app_server_turn_timeout_seconds=7200.0,
-            tool_progress_callback=MagicMock(),
-            _fire_stream_delta=MagicMock(),
-            _fire_reasoning_delta=MagicMock(),
-            _emit_interim_assistant_message=MagicMock(),
-            _iters_since_skill=0,
-            _skill_nudge_interval=0,
-            valid_tool_names=set(),
-            _sync_external_memory_for_turn=lambda **_: None,
-            _spawn_background_review=lambda **_: None,
-            # Usage accounting attrs read by _record_codex_app_server_usage.
-            session_api_calls=0,
-            session_prompt_tokens=0,
-            session_completion_tokens=0,
-            session_reasoning_tokens=0,
-            session_cached_tokens=0,
-            session_total_tokens=0,
-            context_compressor=None,
-            event_callback=None,
-            _session_db=None,
-        )
-
-        result = codex_runtime.run_codex_app_server_turn(
-            agent,
-            user_message="hi",
-            original_user_message="hi",
-            messages=[],
-            effective_task_id="t",
-        )
-
-        assert result["completed"] is True
-        assert captured_turn == {
-            "user_input": "hi", "model": "gpt-5.5", "reasoning_effort": None,
-            "service_tier": None, "turn_timeout": 7200.0,
-        }
-        assert "on_event" in captured, (
-            "run_codex_app_server_turn must pass on_event=<bridge> to the "
-            "session — without it the gateway sees no live progress (#33200)"
-        )
-        assert callable(captured["on_event"]), (
-            "on_event must be the bridge callable, not None or a sentinel"
-        )
-        assert "on_activity" not in captured, (
-            "a synthetic wait heartbeat would make a completely silent app-server "
-            "look like real progress to Hermes' liveness watchdog"
-        )
-
-        # And the bridge must actually drive the agent's callbacks when
-        # fed a representative notification.
-        captured["on_event"](_item_started({
-            "type": "commandExecution",
-            "id": "wired-1",
-            "command": "ls",
-        }))
-        agent.tool_progress_callback.assert_called_once()
-        assert agent.tool_progress_callback.call_args.args[0] == "tool.started"
-        assert agent.tool_progress_callback.call_args.args[1] == "exec_command"
 
 
 @pytest.mark.parametrize("note", [

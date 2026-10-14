@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Optional
 
@@ -118,12 +118,6 @@ COMMAND_REGISTRY: list[CommandDef] = [
                subcommands=("new", "list", "prune")),
     CommandDef("compress", "Compress conversation context (add 'here [N]' to keep recent N turns; --preview shows what would happen)", "Session",
                aliases=("compact",), args_hint="[here [N] | focus topic | --preview|--dry-run]"),
-    CommandDef("micro", "Set the current session's micro-compaction policy", "Configuration",
-               cli_only=False,
-               args_hint="[on|off|inherit|status]",
-               subcommands=("on", "off", "inherit", "status"),
-               advertise_in_gateway_menu=False,
-               busy_policy="reject"),
     CommandDef("rollback", "List or restore filesystem checkpoints (restores keep your hand-edits; --all overrides)", "Session",
                args_hint="[number] [--all]"),
     CommandDef("snapshot", "Create or restore state snapshots of Hermes config/state", "Session",
@@ -450,14 +444,40 @@ _LAZY_LOCALIZED_TABLES = {"COMMANDS": build_commands, "COMMANDS_BY_CATEGORY": bu
 
 # Subcommands lookup: "/cmd" -> ["sub1", ...]; explicit ``subcommands`` first (in
 # registry order), then pipe patterns in args_hint ("[on|off|status]") as fallback.
-SUBCOMMANDS: dict[str, list[str]] = {
+_BUILTIN_SUBCOMMANDS: dict[str, list[str]] = {
     f"/{_cmd.name}": list(_cmd.subcommands) for _cmd in COMMAND_REGISTRY if _cmd.subcommands}
 
 _PIPE_SUBS_RE = re.compile(r"[a-z]+(?:\|[a-z]+)+")
 for _cmd in COMMAND_REGISTRY:
     _m = _PIPE_SUBS_RE.search(_cmd.args_hint) if _cmd.args_hint else None
-    if _m and f"/{_cmd.name}" not in SUBCOMMANDS:
-        SUBCOMMANDS[f"/{_cmd.name}"] = _m.group(0).split("|")
+    if _m and f"/{_cmd.name}" not in _BUILTIN_SUBCOMMANDS:
+        _BUILTIN_SUBCOMMANDS[f"/{_cmd.name}"] = _m.group(0).split("|")
+
+
+class _CommandSubcommands(Mapping):
+    """Live plugin completions for consumers that import this table before discovery."""
+
+    def _snapshot(self) -> dict[str, list[str]]:
+        result = dict(_BUILTIN_SUBCOMMANDS)
+        for name, meta in _plugin_command_records().items():
+            subcommands = meta.get("subcommands") or ()
+            if subcommands:
+                result[f"/{name}"] = list(subcommands)
+            elif match := _PIPE_SUBS_RE.search(str(meta.get("args_hint") or "")):
+                result[f"/{name}"] = match.group(0).split("|")
+        return result
+
+    def __getitem__(self, key):
+        return self._snapshot()[key]
+
+    def __iter__(self):
+        return iter(self._snapshot())
+
+    def __len__(self):
+        return len(self._snapshot())
+
+
+SUBCOMMANDS: Mapping[str, list[str]] = _CommandSubcommands()
 
 
 # /help sub-groups for the large "Session" category (category itself is load-bearing for gateway
@@ -480,8 +500,7 @@ def is_gateway_known_command(name: str | None) -> bool:
     up lazily); decides whether the gateway emits ``command:<name>`` hooks."""
     if not name:
         return False
-    return name in GATEWAY_KNOWN_COMMANDS or any(
-        plugin_name == name for plugin_name, _d, _h in _iter_plugin_command_entries())
+    return name in GATEWAY_KNOWN_COMMANDS or name.replace("_", "-") in _plugin_command_records()
 
 
 # Commands with explicit mid-run handling (busy_policy != "reject"). Kept
@@ -508,7 +527,13 @@ def should_bypass_active_session(command_name: str | None) -> bool:
 
     See #10370, #4665, #5057, #6252.
     """
-    return resolve_command(command_name) is not None if command_name else False
+    if not command_name:
+        return False
+    if resolve_command(command_name) is not None:
+        return True
+    from hermes_cli.session_commands import is_session_command
+    meta = _plugin_command_records().get(command_name.lower().lstrip("/").replace("_", "-"), {})
+    return is_session_command(meta.get("handler"))
 
 
 def _resolve_config_gates() -> set[str]:
@@ -580,20 +605,34 @@ def gateway_help_lines(allowed: Optional[Iterable[str]] = None) -> list[str]:
                        if not (a.replace("-", "_") == cmd.name.replace("-", "_") and a != cmd.name)]
         alias_note = t("slash.shared.alias_note", aliases=", ".join(alias_parts)) if alias_parts else ""
         lines.append(f"`/{cmd.name}{args}` -- {cmd.describe()}{alias_note}")
+    for name, description, hint in _iter_plugin_command_entries():
+        if allowed_set is None or name in allowed_set:
+            args = f" {hint}" if hint else ""
+            lines.append(f"`/{name}{args}` -- {description}")
     return lines
 
 
-def _iter_plugin_command_entries() -> list[tuple[str, str, str]]:
-    """(name, description, args_hint) for ``PluginContext.register_command`` slash commands.
-    Lazy so importing this module never forces plugin discovery."""
+def _plugin_command_records() -> dict[str, dict]:
+    """Read valid command metadata lazily in the current profile's plugin scope."""
     try:
         from hermes_cli.plugins import get_plugin_commands
         commands = get_plugin_commands() or {}
     except Exception:
-        return []
+        logger.exception("Plugin command metadata lookup failed")
+        return {}
+    return {name: meta for name, meta in commands.items()
+            if isinstance(name, str) and isinstance(meta, dict)}
+
+
+def _iter_plugin_command_entries(*, gateway_menu: bool = False) -> list[tuple[str, str, str]]:
+    """(name, description, args_hint) for registered plugin slash commands.
+
+    Menu advertisement is independent of typed dispatch and textual help.
+    """
     return [(name, str(meta.get("description") or t("slash.shared.plugin_default_desc", name=name)),
              str(meta.get("args_hint") or "").strip())
-            for name, meta in commands.items() if isinstance(name, str) and isinstance(meta, dict)]
+            for name, meta in _plugin_command_records().items()
+            if not gateway_menu or meta.get("advertise_in_gateway_menu", True)]
 
 
 def __getattr__(name):  # PEP 562 — COMMANDS / COMMANDS_BY_CATEGORY are built per call so labels follow the active language

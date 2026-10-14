@@ -92,8 +92,7 @@ _HOST_MANDATED_API_MODES = {
 }
 
 # codex_app_server is opt-in: hand the whole turn to a `codex app-server` subprocess (Codex's own
-# tool runtime). Built-in OpenAI providers are eligible directly; named custom providers opt in at
-# their resolver only after proving that they speak the Responses wire protocol.
+# tool runtime), gated on `model.openai_runtime == "codex_app_server"` AND provider in {openai, openai-codex}.
 _VALID_API_MODES = {"chat_completions", "codex_responses", "anthropic_messages", "bedrock_converse", "codex_app_server"}
 
 
@@ -287,20 +286,17 @@ def _api_key_provider_api_mode(provider: str, model_cfg: Dict[str, Any], api_key
     return _configured_or_fallback_api_mode(provider, model_cfg, base_url, effective_model, opencode_by_model=opencode_by_model)
 
 
-def _maybe_apply_codex_app_server_runtime(
-    *, provider: str, api_mode: str, model_cfg: Optional[Dict[str, Any]], allow_custom: bool = False, requested_provider: str = "",
-) -> str:
-    """Apply the explicit app-server opt-in to a compatible resolved runtime.
-
-    Named custom providers must opt in at their resolver and already speak Responses. Codex's
-    custom model-provider protocol does not support Hermes' Chat Completions or Anthropic wires.
-    """
-    requested = str((model_cfg or {}).get("openai_runtime") or "").strip().lower()
-    eligible = provider in {"openai", "openai-codex"} or requested_provider in {"openai", "openai-codex"} or (
-        (allow_custom or codex_model_provider_id(requested_provider))
-        and provider == "custom" and api_mode in {"codex_responses", "codex_app_server"}
-    )
-    if requested == "codex_app_server" and eligible:
+def _maybe_apply_codex_app_server_runtime(*, provider: str, api_mode: str, model_cfg: Optional[Dict[str, Any]],
+                                          requested_provider: str = "") -> str:
+    """Opt-in rewrite to "codex_app_server" via ``model.openai_runtime``. Eligible: ``openai`` /
+    ``openai-codex``, and a configured named custom provider (``providers.<name>``) whose id codex
+    looks up in its own ``[model_providers.<name>]`` table (#75186). Anonymous ``custom`` has no
+    stable id and stays ineligible. No-op when unset, "auto", or empty. Applied once, on the
+    runtime ``resolve_runtime_provider`` picked — never inside an individual ladder rung."""
+    if not model_cfg or str(model_cfg.get("openai_runtime") or "").strip().lower() != "codex_app_server":
+        return api_mode
+    if provider in {"openai", "openai-codex"} or requested_provider in {"openai", "openai-codex"} \
+            or (provider == "custom" and codex_model_provider_id(requested_provider)):
         return "codex_app_server"
     return api_mode
 

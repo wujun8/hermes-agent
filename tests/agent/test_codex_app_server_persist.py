@@ -50,10 +50,6 @@ def _make_agent(session_db=None, session_id="sess-codex"):
     agent._codex_session = MagicMock()
     agent._codex_session.run_turn.return_value = _make_turn()
     agent._codex_session_prompt = None  # seeded session: no recorded composition to compare
-    agent._codex_session_model_provider = None
-    agent.model = "gpt-5.5"
-    agent.reasoning_config = {}
-    agent.request_overrides = {}
     agent.tool_progress_callback = None
     agent._iters_since_skill = 0
     agent._skill_nudge_interval = 0
@@ -61,7 +57,6 @@ def _make_agent(session_db=None, session_id="sess-codex"):
     agent._session_db = session_db
     agent._session_db_created = True
     agent.session_id = session_id
-    agent.codex_app_server_turn_timeout_seconds = None
     return agent
 
 def test_codex_success_flushes_and_reports_persisted():
@@ -78,37 +73,6 @@ def test_codex_success_flushes_and_reports_persisted():
     assert isinstance(result["messages"][-1]["timestamp"], float)
     # With the agent as sole persister, the gateway must SKIP its DB write.
     assert result["agent_persisted"] is True
-
-def test_codex_turn_does_not_use_request_timeout_as_whole_turn_budget():
-    """A per-request timeout must not cap a multi-request app-server turn."""
-    agent = _make_agent(session_db=None)
-    agent._resolved_api_call_timeout.return_value = 1800.0
-
-    run_codex_app_server_turn(
-        agent,
-        user_message="long task",
-        original_user_message="long task",
-        messages=[{"role": "user", "content": "long task"}],
-        effective_task_id="task-long",
-    )
-
-    assert agent._codex_session.run_turn.call_args.kwargs["turn_timeout"] is None
-    agent._resolved_api_call_timeout.assert_not_called()
-
-
-def test_codex_turn_uses_dedicated_explicit_whole_turn_budget():
-    agent = _make_agent(session_db=None)
-    agent.codex_app_server_turn_timeout_seconds = 7200
-
-    run_codex_app_server_turn(
-        agent,
-        user_message="long task",
-        original_user_message="long task",
-        messages=[{"role": "user", "content": "long task"}],
-        effective_task_id="task-long",
-    )
-
-    assert agent._codex_session.run_turn.call_args.kwargs["turn_timeout"] == 7200.0
 
 def test_codex_user_interrupt_is_reported_and_cleared():
     agent = _make_agent(session_db=None)
