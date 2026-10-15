@@ -522,6 +522,7 @@ def test_tool_progress_mode_follows_profile_through_the_real_scoping_seam(monkey
         adapter = ProgressCaptureAdapter(platform=Platform.SLACK)
         runner = _make_runner(adapter)
         runner.config.multiplex_profiles = True
+        runner._served_profile_names = {"default", "beta"}
         source_a = SessionSource(
             platform=Platform.SLACK, chat_id="D1", chat_type="dm", thread_id=None, profile="default")
         source_b = SessionSource(

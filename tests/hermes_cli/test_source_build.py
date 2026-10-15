@@ -214,6 +214,7 @@ def test_preparation_reuses_only_the_exact_completed_workspace_union(source_chec
 
     root, acquired = source_checkout
     before = (root / "package-lock.json").read_bytes()
+    before_mtime = (root / "package-lock.json").stat().st_mtime_ns
     env = source_build_env()
     prepare_source_dependencies(root, ("ui-tui", "web"), env=env)
     first = _events(root)
@@ -234,6 +235,7 @@ def test_preparation_reuses_only_the_exact_completed_workspace_union(source_chec
     assert (root / "node_modules/apps-desktop").exists()
     assert not (root / "node_modules/unrelated").exists()
     assert (root / "package-lock.json").read_bytes() == before
+    assert (root / "package-lock.json").stat().st_mtime_ns == before_mtime
     assert acquired == ["npm"]
 
     # A lock failure must not fall back to npm install and rewrite the lock.
@@ -250,6 +252,57 @@ def test_preparation_reuses_only_the_exact_completed_workspace_union(source_chec
         with pytest.raises(pm.InstallError, match="unavailable"):
             source_build_env()
     assert len(_events(root)) == 2
+
+
+def _configure_lock_mutating_postinstall(root, *, mutation, exit_code):
+    lock = root / "package-lock.json"
+    user_bytes = lock.read_bytes().replace(b"\n", b"\r\n") + b"\r\n  "
+    lock.write_bytes(user_bytes)
+    lock.chmod(0o640)
+    log = root / "log.mjs"
+    action = (
+        "rmSync('package-lock.json');"
+        if mutation == "delete"
+        else "writeFileSync('package-lock.json', '{}\\n'); chmodSync('package-lock.json', 0o440);"
+    )
+    log.write_text(
+        log.read_text()
+        + "\nimport { chmodSync, rmSync, writeFileSync } from 'node:fs';\n"
+        + action
+        + f"\nprocess.exit({exit_code});\n",
+        encoding="utf-8",
+    )
+    return lock, user_bytes
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("mutation", ["rewrite", "delete"])
+def test_successful_preparation_restores_user_lock_after_postinstall(source_checkout, mutation):
+    from hermes_cli.source_build import prepare_source_dependencies, source_build_env
+
+    root, _ = source_checkout
+    lock, user_bytes = _configure_lock_mutating_postinstall(root, mutation=mutation, exit_code=0)
+    prepare_source_dependencies(root, ("ui-tui", "web"), env=source_build_env())
+
+    assert lock.read_bytes() == user_bytes
+    assert lock.stat().st_mode & 0o7777 == 0o640
+    assert [event["step"] for event in _events(root)] == ["deps"]
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("mutation", ["rewrite", "delete"])
+def test_failed_preparation_restores_user_lock_after_postinstall(source_checkout, mutation):
+    from hermes_cli.source_build import prepare_source_dependencies, source_build_env
+
+    root, _ = source_checkout
+    lock, user_bytes = _configure_lock_mutating_postinstall(root, mutation=mutation, exit_code=23)
+    with pytest.raises(subprocess.CalledProcessError) as failure:
+        prepare_source_dependencies(root, ("ui-tui", "web"), env=source_build_env())
+
+    assert failure.value.returncode != 0
+    assert lock.read_bytes() == user_bytes
+    assert lock.stat().st_mode & 0o7777 == 0o640
+    assert [event["step"] for event in _events(root)] == ["deps"]
 
 
 @pytest.mark.platforms("linux")

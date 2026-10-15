@@ -83,6 +83,14 @@ DEFAULT_CONFIG = {
         # elapsed; implicit provider stale timeouts capped to remaining budget. CLI equivalent:
         # `hermes chat --run-budget N`.
         "run_budget_seconds": None,
+        "api_outage_recovery": {
+            "enabled": False,
+            "probe_command": "",
+            "probe_interval_seconds": 600,
+            "probe_timeout_seconds": 60,
+        },
+        "show_retry_status": False,
+
         # Gateway inactivity timeout (seconds). Only fires when the agent is completely idle — not
         # while calling tools or receiving API responses. 0 = unlimited.
         "gateway_timeout": 1800,
@@ -996,8 +1004,8 @@ DEFAULT_CONFIG = {
             "unicode_cols": 0,  # Hard override for terminal column width; 0 = derive from scale.
         },
     },
-
     "dashboard": {
+        "files_allowed_roots": [],  # Extra hosted workspace roots; explicit FILES_ROOT stays strict.
         # Visual theme: "default" | "midnight" | "ember" | "mono" | "cyberpunk" | "rose"
         "theme": "default",
         # Process-isolation rollout controls. Read via the raw config loader, so tui_gateway.server
@@ -1681,6 +1689,11 @@ DEFAULT_CONFIG = {
         "cron_mode": "deny",
         "single_query_mode": "deny",
         "unattended_mode": "deny",
+        # Opt in to skipping normal approval prompts when Docker has host
+        # paths mounted into the container. This is deliberately strict: only
+        # the literal YAML boolean true enables it, and the approval layer
+        # still enforces its unconditional hardline and user-deny rules.
+        "trust_mounted_docker": False,
         # Extra rules appended to the smart-approval guardian's SYSTEM prompt, e.g. "Always ESCALATE
         # commands touching /etc".
         "smart_policy": "",

@@ -538,7 +538,13 @@ class GatewayStartupMixin:
                 )
         return await self._redeliver_claimed_obligations(sendable)
 
-    def _resume_pending_candidates(self, platform=None) -> Optional[list]:
+    def _resume_pending_candidates(
+        self,
+        platform=None,
+        *,
+        session_key: Optional[str] = None,
+        record_restart_guard: bool = True,
+    ) -> Optional[list]:
         """Snapshot resume-pending entries (optionally scoped to ``platform``); None when
         enumeration failed or the restart-loop breaker tripped for this boot."""
         try:
@@ -551,13 +557,14 @@ class GatewayStartupMixin:
                     and entry.origin is not None
                     and entry.resume_reason in self._AUTO_RESUME_REASONS
                     and (platform is None or entry.origin.platform == platform)
+                    and (session_key is None or entry.session_key == session_key)
                 ]
         except Exception as exc:
             logger.warning("Failed to enumerate resume-pending sessions: %s", exc)
             return None
         # Restart-loop breaker: only boots WITH restart-interrupted sessions count; when tripped, skip
         # auto-resume for THIS boot only (inbound still served; sessions stay resume_pending).
-        if candidates:
+        if candidates and record_restart_guard:
             try:
                 from gateway import restart_loop_guard as _rlg
                 _max_restarts, _window, _max_gap = self._restart_loop_guard_config()
@@ -582,7 +589,13 @@ class GatewayStartupMixin:
             logger.warning("Skipping auto-resume for %s: authorization check failed: %s", session_key, exc)
         return False
 
-    def _schedule_resume_pending_sessions(self, platform=None) -> int:
+    def _schedule_resume_pending_sessions(
+        self,
+        platform=None,
+        *,
+        session_key: Optional[str] = None,
+        record_restart_guard: bool = True,
+    ) -> int:
         """Auto-continue fresh restart-interrupted sessions: synthesize an empty-text turn (the
         ``_is_resume_pending`` injection path owns the wording). Sessions whose adapter is offline stay
         ``resume_pending`` for the reconnect watcher, which re-calls this scoped to that ``platform``;
@@ -591,7 +604,11 @@ class GatewayStartupMixin:
             _AGENT_PENDING_SENTINEL, _auto_continue_freshness_window, _is_fresh_gateway_interruption,
         )
         window = _auto_continue_freshness_window()
-        candidates = self._resume_pending_candidates(platform)
+        candidates = self._resume_pending_candidates(
+            platform,
+            session_key=session_key,
+            record_restart_guard=record_restart_guard,
+        )
         if candidates is None:
             return 0
         scheduled = 0

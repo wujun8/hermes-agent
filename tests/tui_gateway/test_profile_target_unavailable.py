@@ -26,17 +26,22 @@ def test_explicit_profile_target_never_falls_back(tmp_path, monkeypatch):
     before = (home / "config.yaml").read_bytes()
     worker.rename(worker.with_name("gone"))
     for name in ("worker", "unknown"):
-        with pytest.raises(FileNotFoundError):
+        with pytest.raises(server.ProfileUnavailableError):
             with server._profile_db({"profile": name}):
                 pytest.fail("unavailable profile reached a database")
-        with pytest.raises(FileNotFoundError):
-            server._methods["config.set"](2, {"profile": name, "key": "busy", "value": "steer"})
+        response = server._methods["config.set"](
+            2, {"profile": name, "key": "busy", "value": "steer"}
+        )
+        assert response["error"] == {
+            "code": 4064,
+            "message": f"Profile '{name}' does not exist.",
+        }
         assert (home / "config.yaml").read_bytes() == before
     # A real resolution I/O failure must propagate, too (no predicate patch).
     profiles = home / "profiles"
     profiles.rename(home / "saved-profiles")
     profiles.symlink_to("profiles")
-    with pytest.raises((OSError, RuntimeError)):
+    with pytest.raises(server.ProfileUnavailableError):
         server._profile_home("worker")
 
 
@@ -51,10 +56,10 @@ def test_custom_root_basename_target_fails_closed_when_unavailable(tmp_path, mon
     monkeypatch.setenv("HERMES_HOME", str(custom_home))
     monkeypatch.setattr(server, "_hermes_home", custom_home)
 
-    with pytest.raises(FileNotFoundError):
+    with pytest.raises(server.TUIProfileSelectionError):
         server._profile_home("customer-data")
 
-    with pytest.raises(FileNotFoundError):
+    with pytest.raises(server.TUIProfileSelectionError):
         with server._profile_db({"profile": "customer-data"}):
             pass
 

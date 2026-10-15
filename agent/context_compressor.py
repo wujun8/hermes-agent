@@ -2895,6 +2895,13 @@ class ContextCompressor(
         # must ABORT and preserve the session regardless of abort_on_summary_failure (see _TERMINAL_SUMMARY_FAILURES).
         self._clear_terminal_summary_failures()
 
+    def set_session_option(self, name: str, value: bool) -> bool:
+        """Apply a supported runtime option without resetting rolling state."""
+        if name != "micro_compact_enabled":
+            return False
+        self._micro_compact_enabled = value is True
+        return True
+
     def update_from_response(self, usage: dict[str, Any]):
         """Update tracked token usage from API response."""
         self.last_prompt_tokens = usage.get("prompt_tokens", 0)

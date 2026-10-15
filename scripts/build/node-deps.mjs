@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { execFileSync, spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { existsSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { delimiter, dirname, join, resolve } from 'node:path'
@@ -149,7 +149,19 @@ export function prepareNodeDependencies({ source, workspaces, env = process.env,
   rmSync(receipt, { force: true })
   rmSync(nativeReceipt, { force: true })
   console.log(`node-deps: installing workspace dependencies with npm ci (${selected.join(', ')})...`)
-  runNpmCi(node, npm, args, { source, env })
+  // Lifecycle scripts may rewrite the user's lock even though npm ci itself does not.
+  const lockPath = join(source, 'package-lock.json')
+  const lockBytes = readFileSync(lockPath)
+  const lockMode = statSync(lockPath).mode & 0o7777
+  try {
+    runNpmCi(node, npm, args, { source, env })
+  } finally {
+    if (!existsSync(lockPath) || !readFileSync(lockPath).equals(lockBytes)) {
+      if (existsSync(lockPath)) chmodSync(lockPath, lockMode | 0o200)
+      writeFileSync(lockPath, lockBytes, { mode: lockMode })
+    }
+    if ((statSync(lockPath).mode & 0o7777) !== lockMode) chmodSync(lockPath, lockMode)
+  }
   if (reuse) {
     const completed = `${key}\n${createHash('sha256').update(readFileSync(hiddenLock)).digest('hex')}\n`
     writeFileSync(receipt, completed)

@@ -22,9 +22,18 @@ def _critical_module_import_failures(
     from hermes_cli.update_cmd import _UPDATE_CRITICAL_MODULES
     from hermes_constants import FIRST_PARTY_MODULE_ROOTS
     import secrets
+    try:
+        checkout_root = Path(root).resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        return _probe_failure("CheckoutRoot", f"updated checkout root is not accessible: {exc}")
+    if not checkout_root.is_dir():
+        return _probe_failure("CheckoutRoot", "updated checkout root is not a directory")
     marker = f"__HERMES_IMPORT_HEALTH_{secrets.token_hex(16)}__"
     probe = (
         "import importlib, json, sys\n"
+        "from pathlib import Path\n"
+        f"_root = Path({str(checkout_root)!r}).resolve(strict=True)\n"
+        "sys.path.insert(0, str(_root))\n"
         # Importing hermes_cli.main runs the startup dotenv load, which pulls external secret
         # sources (op/bws/command helpers, up to 120s each) unless argv says ``update``. The
         # probe only checks importability, so it inherits the updater's own argv contract.
@@ -32,7 +41,23 @@ def _critical_module_import_failures(
         "failures = []\n"
         f"for name in {_UPDATE_CRITICAL_MODULES!r}:\n"
         "    try:\n"
-        "        importlib.import_module(name)\n"
+        "        module = importlib.import_module(name)\n"
+        "        origin = getattr(module, '__file__', None)\n"
+        "        if not origin:\n"
+        "            failures.append((name, 'ModuleOriginError', 'critical module has no real __file__'))\n"
+        "            continue\n"
+        "        try:\n"
+        "            resolved_origin = Path(origin).resolve(strict=True)\n"
+        "        except (OSError, RuntimeError, TypeError, ValueError) as exc:\n"
+        "            failures.append((name, 'ModuleOriginError', f'critical module origin is not a real file: {exc}'))\n"
+        "            continue\n"
+        "        if not resolved_origin.is_file():\n"
+        "            failures.append((name, 'ModuleOriginError', f'critical module __file__ is not a regular file: {resolved_origin}'))\n"
+        "            continue\n"
+        "        try:\n"
+        "            resolved_origin.relative_to(_root)\n"
+        "        except ValueError:\n"
+        "            failures.append((name, 'ModuleOriginError', f'critical module imported from outside updated checkout: {resolved_origin}'))\n"
         "    except ModuleNotFoundError as exc:\n"
         # A missing *third-party* module means deps aren't installed, not a skewed checkout;
         # only our own packages count. Roots come from hermes_constants so the user hint can't drift.
@@ -49,7 +74,7 @@ def _critical_module_import_failures(
         f"sys.stdout.write('\\n{marker}' + json.dumps(failures))\n")
     try:
         result = subprocess.run(
-            runtime_command(Path(root), code=probe), cwd=str(root), capture_output=True, text=True,
+            runtime_command(checkout_root, code=probe), cwd=str(checkout_root), capture_output=True, text=True,
             encoding="utf-8", errors="replace", timeout=120, check=False)
     except subprocess.TimeoutExpired:
         return _probe_failure("TimeoutExpired", "timed out before reporting import health")

@@ -236,7 +236,7 @@ Commands support prefix matching: typing `/h` resolves to `/help`, `/mod` resolv
 ## Messaging slash commands
 
 > **Slack thread commands (`!` prefix):**
-> Slack itself blocks native slash commands inside message threads ("/queue is not supported in threads. Sorry!") and never delivers them to Hermes. Inside a Slack thread, use the `!` prefix instead — `!stop`, `!new`, `!status` — and the gateway dispatches it exactly like the slash form. `@Hermes !stop` and `@Hermes /stop` work in threads too. Only the first token is checked against the known command list, so messages like `!nice work` pass through to the agent unchanged. See [Using commands inside threads](../user-guide/messaging/slack.md#using-commands-inside-threads-the-cmd-prefix) for details.
+> Slack itself blocks native slash commands inside message threads ("/queue is not supported in threads. Sorry!") and never delivers them to Hermes. Inside a Slack thread, use the `!` prefix instead — `!stop`, `!new`, `!status`, or `!micro on` — and the gateway dispatches it exactly like the slash form. `@Hermes !stop` and `@Hermes /stop` work in threads too. Only the first token is checked against the known command list, so messages like `!nice work` pass through to the agent unchanged. See [Using commands inside threads](../user-guide/messaging/slack.md#using-commands-inside-threads-the-cmd-prefix) for details.
 
 The messaging gateway supports the following built-in commands inside Telegram, Discord, Slack, WhatsApp, Signal, Email, Home Assistant, and Teams chats:
 
@@ -317,6 +317,7 @@ The messaging gateway supports the following built-in commands inside Telegram, 
 - `/focus` and `/verbose` share one suppression path (`display.tool_progress`), so they can never contradict each other: `/focus on` pins tool progress to `off` and stashes your mode under `display.focus_saved_tool_progress`; `/focus off` restores it; cycling `/verbose` while focus is on takes the mode back and clears the focus badge. Focus view is display-only — it never changes conversation history, the system prompt, or anything sent to the model, so it has zero prompt-cache impact.
 - `/sethome`, `/restart`, `/approve`, `/deny`, `/topic`, `/platform`, `/pause`, and `/commands` are **messaging-only** commands.
 - `/status`, `/egress`, `/version`, `/whoami`, `/bg`, `/btw`, `/queue`, `/steer`, `/voice`, `/reload-mcp`, `/reload-skills`, `/rollback`, `/diff`, `/debug`, `/fast`, `/approvals`, `/busy`, `/footer`, `/curator`, `/kanban`, `/topup`, `/login`, `/suggestions`, `/blueprint`, `/learn`, `/init`, `/sessions`, `/loop`, and `/yolo` work in **both** the CLI and the messaging gateway.
+- `/micro` is executable and help-visible in the typed gateway surface, but is intentionally hidden from registered platform command menus to preserve their capped slots (for example, Slack's `/platform` menu). Type `/micro ...` directly; in Slack threads use `!micro ...` because native Slack slash commands do not reach threads.
 - `/voice join`, `/voice channel`, and `/voice leave` are only meaningful on Discord.
 - `/connectors` is **TUI-only**.
 - In the TUI, `/sessions` shows live sessions in the current TUI process. Use `/resume [name]` or `hermes --tui --resume <id-or-title>` for saved or closed transcripts.

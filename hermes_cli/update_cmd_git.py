@@ -639,86 +639,8 @@ def _no_move(*_targets, **_bound):
 
 
 def _discard_lockfile_churn(git_cmd, repo_root, *, checkout_move=None):
-    """Restore ``package-lock.json`` files npm rewrote non-deterministically, so the update sees a clean tree
-    instead of autostashing every run. A lockfile is kept when a manifest it records is dirty: for the root
-    lock that is the root or ANY workspace ``package.json`` (reverting it under a dirty ``apps/desktop``
-    manifest desyncs spec and lock and every later ``npm ci`` fails, #112378); a nested lock is kept only
-    with its sibling manifest. Best-effort."""
-    from hermes_cli.update_cmd_git import _git_run
-    with suppress(Exception):
-        diff = _git_run(git_cmd, ["diff", "--name-only"], repo_root)
-        if diff.returncode != 0:
-            return
-        changed = [line.strip() for line in diff.stdout.splitlines()]
-        dirty_manifests = {Path(p).parent for p in changed if p.endswith("package.json")}
-        root_owners = _npm_lockfile_owners(Path(repo_root))
-        dirty = []
-        for path in changed:
-            if not path.endswith("package-lock.json"):
-                continue
-            lock_dir = Path(path).parent
-            protected = (lock_dir == Path(".") and bool(dirty_manifests & root_owners)) or (
-                lock_dir != Path(".") and lock_dir in dirty_manifests
-            )
-            if not protected:
-                dirty.append(path)
-        if not dirty:
-            return
-        with (checkout_move or _no_move)(paths=dirty):
-            _git_run(git_cmd, ["checkout", "--", *dirty], repo_root)
-        print(f"→ Discarded npm lockfile churn ({len(dirty)} file(s))")
+    """Compatibility hook that deliberately never discards user lockfile edits."""
 
 
 def _normalize_managed_eol(git_cmd, repo_root, *, checkout_move=None):
-    """Take a managed checkout off ``core.autocrlf=true`` without leaving it dirty.
-
-    Git for Windows sets ``autocrlf=true`` system-wide, turning LF files CRLF and breaking ``git checkout``
-    on update; install.ps1 pins ``false`` but older checkouts never got it and only ``hermes update`` can
-    fix them. Pin and cleanup are one operation: under ``autocrlf=true`` a CRLF tree reads clean, so pinning
-    alone would expose every file as modified (whole-tree autostash). Pin only after the tree verifies clean
-    under it; a checkout we can't fully normalize is left as-is. Only ``true`` rewrites LF->CRLF
-    (unset/false/input leave the tree alone). Best-effort.
-
-    Checkouts created before that landed never got the pin and cannot receive it — the bootstrap installer
-    reuses its build-pinned ``install.ps1`` forever — so ``hermes update``, which ships with the checkout
-    itself, is the only path left that can fix them. See #67730.
-    """
-    from hermes_cli.update_cmd_git import _git_run
-    from hermes_cli.update_custody import run_git
-    # -c, not config: evaluate the tree as it WOULD look pinned, persisting nothing.
-    probe = git_cmd + ["-c", "core.autocrlf=false"]
-
-    def _probe_run(*args, **kw):
-        return run_git(probe, list(args), cwd=repo_root, **_GIT_TEXT_KW, **kw)
-
-    def _eol_only():
-        """Dirty paths whose ONLY change is CRLF; None when either probe fails."""
-        all_dirty = _probe_run("diff", "-z", "--name-only")
-        # Files with a *content* change ignoring CRLF. ``--name-only --ignore-cr-at-eol`` still LISTS
-        # CR-only files; ``--numstat`` honors the filter (no record for them). Records are
-        # "<added>\\t<deleted>\\t<path>"; rename detection is off, so exactly one path.
-        real_dirty = _probe_run("-c", "core.quotepath=false", "diff", "--numstat", "--ignore-cr-at-eol")
-        if all_dirty.returncode != 0 or real_dirty.returncode != 0:
-            return None
-        return {p for p in all_dirty.stdout.split("\0") if p} - {
-            parts[2]
-            for parts in (line.split("\t", 2) for line in real_dirty.stdout.splitlines() if line.strip())
-            if len(parts) == 3 and parts[2]
-        }
-
-    with suppress(Exception):
-        if _git_run(git_cmd, ["config", "--get", "core.autocrlf"], repo_root).stdout.strip().lower() != "true":
-            return
-        eol_only = _eol_only()
-        if eol_only is None:
-            return
-        if eol_only:
-            # Pathspec via stdin: thousands of paths exceed the Windows argv limit.
-            with (checkout_move or _no_move)(paths=sorted(eol_only)):
-                _probe_run("checkout", "--pathspec-from-file=-", "--pathspec-file-nul", "--",
-                           input="\0".join(sorted(eol_only)), check=False)
-            if _eol_only():  # still dirty: pinning would only surface churn we failed to clear
-                return
-            print(f"→ Normalized line-ending churn ({len(eol_only)} file(s))")
-        run_git(git_cmd, ["config", "core.autocrlf", "false"], cwd=repo_root, capture_output=True, check=False,
-                creationflags=windows_hide_flags())
+    """Compatibility no-op: never rewrite user bytes before autostash."""

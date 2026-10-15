@@ -526,18 +526,33 @@ def test_nondefault_policy_rejects_stale_or_legacy_results(monkeypatch, tmp_path
 def _profile_dir(tmp_path: Path, name: str) -> Path:
     home = tmp_path / "homes" / name
     home.mkdir(parents=True, exist_ok=True)
+    (home / "config.yaml").write_text("{}\n", encoding="utf-8")
     return home
 
 
 def _bind_profiles(monkeypatch, tmp_path: Path, homes: dict[str, Path]) -> None:
-    """Resolve profile names to this test's throwaway homes.
+    """Bind strict profile resolution to canonical, served test homes."""
+    from hermes_cli import profiles as profiles_mod
 
-    Unmapped names resolve to a path that does not exist, which is how the
-    gateway detects "not a real profile on this host" and stays on launch.
-    """
+    default_home = homes["default"]
+    profiles_root = tmp_path / "homes"
+    served = [("default", default_home), ("coder", homes["coder"])]
+
+    monkeypatch.setattr(server, "_hermes_home", default_home)
+    monkeypatch.setattr(server, "_current_profile_name", lambda: "default")
     monkeypatch.setattr(
-        "hermes_cli.profiles.get_profile_dir",
-        lambda name: homes.get(name, tmp_path / "homes" / "missing" / name),
+        profiles_mod, "_get_default_hermes_home", lambda: default_home
+    )
+    monkeypatch.setattr(profiles_mod, "_get_profiles_root", lambda: profiles_root)
+    monkeypatch.setattr(
+        profiles_mod,
+        "profiles_to_serve",
+        lambda multiplex, profile_allowlist=None: served,
+    )
+    monkeypatch.setattr(
+        profiles_mod,
+        "get_profile_dir",
+        lambda name: homes.get(name, profiles_root / "missing" / name),
     )
 
 
@@ -729,7 +744,7 @@ def test_record_repos_writes_to_the_requested_profiles_projects_db(monkeypatch, 
 
 
 def test_projects_without_a_profile_stay_on_the_launch_home(monkeypatch, tmp_path):
-    """Only omitted/blank profiles use launch data; unknown targets fail closed."""
+    """Omitted/blank profiles stay on launch; unavailable names fail closed."""
     launch_home = _profile_dir(tmp_path, "launch")
     coder_home = _profile_dir(tmp_path, "coder")
     repo = tmp_path / "repos" / "launch-only"
@@ -744,18 +759,18 @@ def test_projects_without_a_profile_stay_on_the_launch_home(monkeypatch, tmp_pat
 
         omitted = _call("projects.list")
         blank = _call("projects.list", {"profile": ""})
-        with pytest.raises(FileNotFoundError, match="not-a-profile"):
-            _call("projects.list", {"profile": "not-a-profile"})
-        with pytest.raises(FileNotFoundError, match="not-a-profile"):
-            _call("projects.create", {"profile": "not-a-profile", "name": "Wrong target"})
-        assert _call("projects.list") == omitted
+        unknown = server._methods["projects.list"](
+            1, {"profile": "not-a-profile"}
+        )
 
     assert [p["name"] for p in omitted["projects"]] == ["Launch only"]
     assert blank == omitted
+    assert unknown["error"] == {
+        "code": 4064,
+        "message": "Profile 'not-a-profile' does not exist.",
+    }
     assert omitted["active_id"] == created["id"]
 
     assert _cached_repo_labels(launch_home) == ["only"]
     assert not (coder_home / "projects.db").exists()
     assert not (Path(os.environ["HERMES_HOME"]) / "projects.db").exists()
-
-

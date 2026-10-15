@@ -21,6 +21,7 @@ def watcher_home(tmp_path, monkeypatch):
     (tmp_path / "config.yaml").write_text("display: {}\n")
     (tmp_path / "cron").mkdir()
 
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(server, "_hermes_home", str(tmp_path))
     monkeypatch.setattr(server, "_cfg_cache", None)
     monkeypatch.setattr(server, "_change_sigs", {})
@@ -175,7 +176,8 @@ def test_served_profile_projects_db_move_broadcasts_projects_changed(watcher_hom
     coder_home = home / "profiles" / "coder"
     coder_home.mkdir(parents=True)
     monkeypatch.setattr(server, "_served_profile_homes", set())
-    monkeypatch.setattr("hermes_cli.profiles.get_profile_dir", lambda name: home / "profiles" / name)
+    monkeypatch.setattr("hermes_cli.profiles.resolve_profile_home", lambda name, *, require_exists: coder_home)
+    monkeypatch.setattr("hermes_cli.profiles.profiles_to_serve", lambda **kwargs: [("coder", coder_home)])
     assert server._profile_home("coder") == coder_home
     server._broadcast_watched_changes(now=0.0)
 
@@ -203,6 +205,7 @@ def test_served_profile_store_move_broadcasts_sessions_changed(watcher_home, mon
     home, events = watcher_home
     bot_home = home / "profiles" / "bot"
     bot_home.mkdir(parents=True)
+    (bot_home / "config.yaml").write_text("{}\n")
     monkeypatch.setattr(server, "_served_profile_homes", set())
     monkeypatch.setattr("hermes_cli.profiles.get_profile_dir", lambda name: home / "profiles" / name)
     assert server._profile_home("bot") == bot_home

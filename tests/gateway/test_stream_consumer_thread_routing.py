@@ -128,6 +128,9 @@ class TestFeishuFallbackThreadRouting:
 
         # Use the real implementation path
         adapter._client = mock_client
+        async def no_thread_message(_thread_id):
+            return None
+        adapter._fetch_last_message_in_thread = no_thread_message
         adapter._build_create_message_body = FeishuAdapter._build_create_message_body
         adapter._build_create_message_request = FeishuAdapter._build_create_message_request
         # _send_raw_message routes blocking SDK calls through _run_blocking
@@ -139,7 +142,7 @@ class TestFeishuFallbackThreadRouting:
 
         # Call _send_raw_message with reply_to=None and thread_id in metadata
         import json
-        await FeishuAdapter._send_raw_message(
+        result = await FeishuAdapter._send_raw_message(
             adapter,
             chat_id="oc_main_chat",
             msg_type="text",
@@ -150,6 +153,7 @@ class TestFeishuFallbackThreadRouting:
 
         # Verify message.create was called (not message.reply)
         mock_client.im.v1.message.create.assert_called_once()
+        assert result is mock_client.im.v1.message.create.return_value
 
         # The request should have receive_id_type="thread_id"
         call_args = mock_client.im.v1.message.create.call_args[0][0]
@@ -171,6 +175,86 @@ class TestFeishuFallbackThreadRouting:
         assert receive_id_type == "thread_id", (
             f"Expected receive_id_type='thread_id', got '{receive_id_type}'"
         )
+
+
+    @staticmethod
+    def _make_adapter():
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = MagicMock(spec=FeishuAdapter)
+        adapter._client = MagicMock()
+        adapter._build_create_message_body = FeishuAdapter._build_create_message_body
+        adapter._build_create_message_request = FeishuAdapter._build_create_message_request
+        adapter._build_reply_message_body = FeishuAdapter._build_reply_message_body
+        adapter._build_reply_message_request = FeishuAdapter._build_reply_message_request
+
+        async def _run_blocking_passthrough(func, *args):
+            return func(*args)
+
+        adapter._run_blocking = _run_blocking_passthrough
+        return adapter
+
+    @staticmethod
+    async def _send(adapter, *, reply_to=None, metadata=None):
+        import json
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        return await FeishuAdapter._send_raw_message(
+            adapter,
+            chat_id="oc_main_chat",
+            msg_type="text",
+            payload=json.dumps({"text": "hello"}),
+            reply_to=reply_to,
+            metadata=metadata,
+        )
+
+    @pytest.mark.asyncio
+    async def test_missing_reply_anchor_uses_last_thread_message(self):
+        adapter = self._make_adapter()
+        adapter._fetch_last_message_in_thread = AsyncMock(return_value="om_last_message")
+
+        await self._send(adapter, metadata={"thread_id": "omt_topic_abc"})
+
+        adapter._fetch_last_message_in_thread.assert_awaited_once_with("omt_topic_abc")
+        adapter._client.im.v1.message.create.assert_not_called()
+        adapter._client.im.v1.message.reply.assert_called_once()
+        request = adapter._client.im.v1.message.reply.call_args.args[0]
+        assert request.message_id == "om_last_message"
+        body = getattr(request, "body", None) or request.request_body
+        assert body.reply_in_thread is True
+
+    @pytest.mark.asyncio
+    async def test_missing_thread_message_creates_in_thread(self):
+        adapter = self._make_adapter()
+        adapter._fetch_last_message_in_thread = AsyncMock(return_value=None)
+
+        await self._send(adapter, metadata={"thread_id": "omt_topic_abc"})
+
+        adapter._client.im.v1.message.reply.assert_not_called()
+        adapter._client.im.v1.message.create.assert_called_once()
+        request = adapter._client.im.v1.message.create.call_args.args[0]
+        assert request.receive_id_type == "thread_id"
+        body = getattr(request, "body", None) or request.request_body
+        assert body.receive_id == "omt_topic_abc"
+
+    @pytest.mark.asyncio
+    async def test_explicit_reply_anchor_still_replies(self):
+        adapter = self._make_adapter()
+        adapter._fetch_last_message_in_thread = AsyncMock()
+
+        await self._send(
+            adapter,
+            reply_to="om_explicit_message",
+            metadata={"thread_id": "omt_topic_abc"},
+        )
+
+        adapter._fetch_last_message_in_thread.assert_not_awaited()
+        adapter._client.im.v1.message.create.assert_not_called()
+        adapter._client.im.v1.message.reply.assert_called_once()
+        request = adapter._client.im.v1.message.reply.call_args.args[0]
+        assert request.message_id == "om_explicit_message"
+        body = getattr(request, "body", None) or request.request_body
+        assert body.reply_in_thread is True
 
 
 class TestFallbackResendThreading:

@@ -204,6 +204,16 @@ async def test_auto_registers_plugin_commands_for_discord(adapter):
 
 
 @pytest.mark.asyncio
+async def test_auto_registration_omits_non_advertised_registry_commands(adapter):
+    """Typed gateway commands hidden from menus must not enter Discord's picker."""
+    adapter._run_simple_slash = AsyncMock()
+
+    adapter._register_slash_commands()
+
+    assert "micro" not in adapter._client.tree.commands
+
+
+@pytest.mark.asyncio
 async def test_plugin_command_name_conflict_skipped(adapter):
     """A plugin command that collides with a built-in must not override it."""
     adapter._run_simple_slash = AsyncMock()

@@ -361,6 +361,11 @@ def test_notifier_subscription_survives_done_reopen_until_archive(
     """Done is reversible; archive alone ends notification ownership."""
     db_path = tmp_path / "done-reopen-archive.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    hermes_home = tmp_path / "hermes"
+    reviewer_home = hermes_home / "profiles" / "reviewer"
+    reviewer_home.mkdir(parents=True)
+    (reviewer_home / "config.yaml").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
     kb.init_db()
 
     conn = kbc.connect()
@@ -388,6 +393,7 @@ def test_notifier_subscription_survives_done_reopen_until_archive(
 
     adapter = RecordingAdapter()
     runner = _make_runner(adapter)
+    runner._served_profile_names = {"default", "reviewer"}
     runner._active_profile_name = lambda: "reviewer"
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
@@ -409,6 +415,7 @@ def test_notifier_subscription_survives_done_reopen_until_archive(
     # A quiet tick proves the completed event cannot replay after its cursor
     # was advanced, even though the subscription now remains present.
     runner = _make_runner(adapter)
+    runner._served_profile_names = {"default", "reviewer"}
     runner._active_profile_name = lambda: "reviewer"
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
     assert len(adapter.sent) == 1
@@ -424,6 +431,7 @@ def test_notifier_subscription_survives_done_reopen_until_archive(
         conn.close()
 
     runner = _make_runner(adapter)
+    runner._served_profile_names = {"default", "reviewer"}
     runner._active_profile_name = lambda: "reviewer"
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
@@ -445,6 +453,7 @@ def test_notifier_subscription_survives_done_reopen_until_archive(
         conn.close()
 
     runner = _make_runner(adapter)
+    runner._served_profile_names = {"default", "reviewer"}
     runner._active_profile_name = lambda: "reviewer"
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 

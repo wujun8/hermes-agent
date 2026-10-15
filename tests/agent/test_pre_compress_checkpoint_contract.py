@@ -77,6 +77,9 @@ class _FailingLegacyProvider(_BaseStubProvider):
         raise RuntimeError("legacy best-effort failure")
 
 
+def test_provider_base_class_defaults_to_implicit_historical_api_version_one():
+    assert MemoryProvider.pre_compress_checkpoint_api_version == 1
+    assert PRE_COMPRESS_CHECKPOINT_API_VERSION == 2
 
 
 def test_v1_providers_receive_raw_messages_and_v2_receive_evidence():
@@ -538,6 +541,22 @@ def test_turn_finalizer_never_micro_compacts_while_checkpoint_gate_armed(
     assert _run(checkpoint_required=False) == 1
 
 
+def test_session_policy_cannot_enable_lossy_micro_compaction_under_checkpoint_gate():
+    from agent.session_policies import SessionPolicyRuntime
+
+    class Engine:
+        def __init__(self):
+            self.calls = []
+
+        def set_session_option(self, name, enabled):
+            self.calls.append((name, enabled))
+            return True
+
+    engine = Engine()
+    runtime = SessionPolicyRuntime(SimpleNamespace(
+        compression_checkpoint_required=True, context_compressor=engine))
+    assert runtime.set_context_option("micro_compact_enabled", True) is True
+    assert engine.calls == [("micro_compact_enabled", False)]
 
 
 def _warn_text(caplog) -> str:

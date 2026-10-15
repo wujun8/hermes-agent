@@ -97,14 +97,15 @@ def _foreign_profile_home(profile: str):
     return home
 
 
-def _requested_profile(params: dict) -> str:
+def _group_requested_profile(params: dict) -> str:
     requested = str(params.get("profile") or "").strip()
     if not requested:
         return _profile_name()
     if _bound_server is None:
         raise ValueError("profile routing is unavailable")
-    if requested == _current_profile():
-        return requested
+    current = _current_profile()
+    if requested.casefold() == current.casefold():
+        return current
     _foreign_profile_home(requested)
     return str(_bound_server._response_profile_name(requested) or requested)
 
@@ -221,7 +222,7 @@ def _(rid, params: dict, _catalog=_local_catalog, _methods=_METHODS) -> dict:
     driver_ready = bool(service and service.runtime.status()["running"])
     try:
         from gateway.hosted_room_peer import gateway_room_grant_secret
-        profile = _requested_profile(params)
+        profile = _group_requested_profile(params)
         if not _room_link_run_storage_durable():
             raise ValueError("durable run idempotency storage is required")
         gateway_room_grant_secret()
@@ -254,7 +255,7 @@ def _(rid, params: dict, db_path, _catalog=_local_catalog, _expiry=_grant_expiry
     if not _room_link_run_storage_durable():
         raise ValueError("durable run idempotency storage is required")
     installation_id = local_authority_gateway_id()
-    profile = _requested_profile(params)
+    profile = _group_requested_profile(params)
     ttl = float(params.get("ttl_seconds", 3600))
     if not 60 <= ttl <= 24 * 60 * 60:
         raise ValueError("ttl_seconds must be between 60 and 86400")
@@ -282,7 +283,7 @@ def _(rid, params: dict, db_path, _expiry=_grant_expiry) -> dict:
     """Revoke one target-issued grant using its exact profile scope."""
     from gateway.hosted_room_peer import decode_room_grant, gateway_room_grant_secret
     from gateway.hosted_rooms import local_authority_gateway_id, revoke_room_grant_scope
-    profile = _requested_profile(params)
+    profile = _group_requested_profile(params)
     claims = decode_room_grant(
         gateway_room_grant_secret(), str(params.get("grant") or ""), permission="status")
     if (claims["target_profile"] != profile

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
 import time
 
 import pytest
@@ -20,6 +21,7 @@ def _stub_session(monkeypatch, *, title, profile_home=None):
                 "id": "session-1",
                 "title": title,
                 "source": "bot_room",
+                "history_lock": threading.RLock(),
                 "profile_home": str(profile_home) if profile_home else None,
             },
             None,
@@ -59,8 +61,8 @@ def test_direct_prompt_to_non_hosted_group_reaches_normal_admission(
     _stub_session(monkeypatch, title="Group: local-only")
     monkeypatch.setattr(
         server,
-        "_ensure_active_session_slot",
-        lambda _sid, _session: "normal admission reached",
+        "_claim_active_session_slot_for_prompt",
+        lambda _sid, _session: ("normal admission reached", None),
     )
 
     result = server._methods["prompt.submit"](
@@ -89,8 +91,8 @@ def test_direct_prompt_to_legacy_named_group_reaches_normal_admission(
     _stub_session(monkeypatch, title=f"Group: {legacy_name}")
     monkeypatch.setattr(
         server,
-        "_ensure_active_session_slot",
-        lambda _sid, _session: "normal admission reached",
+        "_claim_active_session_slot_for_prompt",
+        lambda _sid, _session: ("normal admission reached", None),
     )
     result = server._methods["prompt.submit"](
         "request-legacy", {"session_id": "session-1", "text": "continue"}
@@ -145,8 +147,8 @@ def test_direct_prompt_to_peer_reserved_group_is_rejected_until_revoke(
     )
     monkeypatch.setattr(
         server,
-        "_ensure_active_session_slot",
-        lambda _sid, _session: "normal admission reached",
+        "_claim_active_session_slot_for_prompt",
+        lambda _sid, _session: ("normal admission reached", None),
     )
     admitted = server._methods["prompt.submit"](
         "request-peer-after-revoke",

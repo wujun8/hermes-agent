@@ -218,6 +218,66 @@ def test_start_server_runs_on_uvicorns_loop_factory(monkeypatch):
     )
 
 
+@pytest.mark.platforms("macos")
+def test_start_server_keeps_bare_asyncio_run_on_macos(monkeypatch):
+    """macOS retains its existing plain ``asyncio.run(_serve())`` path.
+
+    Linux now uses Uvicorn's loop factory, so this checks the remaining native
+    POSIX path on a real macOS host.
+    """
+    _stub_uvicorn(monkeypatch)
+
+    # If the Windows branch were taken, the loop-factory runner would fire.
+    runner_called = {"hit": False}
+
+    def _fake_runner(coro, *, loop_factory=None):
+        runner_called["hit"] = True
+        coro.close()
+
+    monkeypatch.setattr("uvicorn._compat.asyncio_run", _fake_runner, raising=False)
+
+    bare_called = {"hit": False}
+
+    def _fake_asyncio_run(coro):
+        bare_called["hit"] = True
+        coro.close()
+
+    monkeypatch.setattr(asyncio, "run", _fake_asyncio_run)
+
+    web_server.start_server(host="127.0.0.1", port=0, open_browser=False)
+
+    assert bare_called["hit"] is True, "macOS must serve via bare asyncio.run"
+    assert runner_called["hit"] is False, (
+        "macOS must not take the loop-factory branch"
+    )
+
+
+@pytest.mark.platforms("macos")
+def test_start_server_treats_macos_keyboardinterrupt_as_clean_shutdown(monkeypatch):
+    """Ctrl+C is the normal foreground-dashboard shutdown path.
+
+    Uvicorn re-raises captured SIGINT as ``KeyboardInterrupt`` after it has
+    restored the original signal handlers.  The dashboard should treat that as a
+    clean user-requested shutdown instead of leaking a traceback to the terminal.
+    """
+    _stub_uvicorn(monkeypatch)
+
+    def _raise_keyboard_interrupt(coro):
+        coro.close()
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(asyncio, "run", _raise_keyboard_interrupt)
+
+    # Catch rather than let it escape: pytest treats a propagating
+    # KeyboardInterrupt as a session abort, not a test failure, so a
+    # regression here would kill the run instead of reporting red.
+    try:
+        web_server.start_server(host="127.0.0.1", port=0, open_browser=False)
+    except KeyboardInterrupt:
+        pytest.fail(
+            "start_server must treat serve-time KeyboardInterrupt as a clean "
+            "shutdown, not propagate it"
+        )
 
 
 def test_start_server_treats_posix_keyboardinterrupt_as_clean_shutdown(monkeypatch):

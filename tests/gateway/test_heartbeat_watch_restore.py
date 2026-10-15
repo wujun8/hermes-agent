@@ -47,6 +47,7 @@ async def test_restore_retries_persisted_routes_in_their_own_profiles(tmp_path, 
         store.close_all_db_handles()
         runner = GatewayRunner.__new__(GatewayRunner)
         runner.config = config
+        runner._served_profile_names = {'default', 'work'}
         runner.session_store = SessionStore(home / 'sessions', config)
         runner._heartbeat_watch = {}
         runner._start_heartbeat_poller = lambda: None
@@ -203,6 +204,7 @@ async def test_restore_enters_each_profile_scope_once_per_scan(tmp_path, monkeyp
         store.close_all_db_handles()
         runner = GatewayRunner.__new__(GatewayRunner)
         runner.config = config
+        runner._served_profile_names = {'default', 'work'}
         runner.session_store = SessionStore(home / 'sessions', config)
         runner._heartbeat_watch = {}
         runner._start_heartbeat_poller = lambda: None

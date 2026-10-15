@@ -364,3 +364,35 @@ def test_hint_fires_for_each_first_party_root(modname):
     exc = ImportError("cannot import name 'X'")
     exc.name = modname
     assert partial_update_hint(exc), f"expected guidance for {modname}"
+
+
+def test_import_guard_isolated_probe_injects_root_and_rejects_escape(
+    monkeypatch, probe_root
+):
+    """The ``-I`` probe imports the candidate root and contains origins."""
+    source = probe_root / "consumer.py"
+    source.write_text("VALUE = 'in-root'\n")
+    monkeypatch.setattr(update_cmd, "_UPDATE_CRITICAL_MODULES", ("consumer",))
+    monkeypatch.setattr(update_cmd_validation, "_UPDATE_CRITICAL_MODULES", ("consumer",))
+    observed = []
+    real_run = update_cmd_validation.subprocess.run
+
+    def observe_run(command, **kwargs):
+        observed.append((command, kwargs["cwd"]))
+        return real_run(command, **kwargs)
+
+    monkeypatch.setattr(update_cmd_validation.subprocess, "run", observe_run)
+    assert update_cmd._validate_critical_modules_import(probe_root) == (True, None, None)
+    assert "-I" in observed[0][0]
+    assert observed[0][1] == str(probe_root.resolve())
+
+    outside = probe_root.parent / "outside-origin.py"
+    outside.write_text("VALUE = 'outside'\n")
+    source.write_text(f"__file__ = {str(outside)!r}\n")
+    ok, module, error = update_cmd._validate_critical_modules_import(probe_root)
+    assert ok is False
+    assert module == "consumer"
+    assert error and "outside updated checkout" in error
+    assert str(outside) in error
+    assert len(observed) == 2
+    assert "-I" in observed[1][0]

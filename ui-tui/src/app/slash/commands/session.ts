@@ -806,6 +806,10 @@ export const sessionCommands: SlashCommand[] = [
           sections.push({ text: t('slashCmd.session.usage.compressions', String(r.compressions)) })
         }
 
+        if (r.account_lines?.length) {
+          sections.push({ text: r.account_lines.join('\n') })
+        }
+
         ctx.transcript.panel(t('slashCmd.session.usage.usageTitle'), sections)
 
         sys(t('slashCmd.session.usage.cta'))

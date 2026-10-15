@@ -38,6 +38,7 @@ from tui_gateway.turn_marker import (
     read_turn_marker,
     record_turn_start,
 )
+from agent.api_outage_recovery import should_auto_resume_api_outage_result
 
 
 class _InlineThread:
@@ -623,3 +624,277 @@ def test_second_backend_defers_to_a_live_marker_writer(emits, schedule_env, mark
         if child.poll() is None:
             child.kill()
         child.wait(timeout=10)
+
+
+def test_busy_interrupt_attributes_the_new_message_as_user_owned(
+    monkeypatch, marker_home
+):
+    """A busy prompt's interrupt must never look like an auto-resumable outage wait."""
+    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "interrupt")
+    interrupted = []
+
+    class _Agent:
+        def interrupt(self, message=None):
+            interrupted.append(message)
+
+    session = _session(
+        agent=_Agent(),
+        running=True,
+        inflight_turn={"user": "original request", "assistant": "partial reply"},
+    )
+
+    response = server._handle_busy_submit(
+        "rid", "sid", session, "new request", "transport"
+    )
+
+    assert response["result"]["status"] == "queued"
+    deadline = time.time() + 1
+    while not interrupted and time.time() < deadline:
+        time.sleep(0.01)
+    assert interrupted == ["new request"]
+    assert not should_auto_resume_api_outage_result(
+        {
+            "interrupted": True,
+            "resume_reason": "api_outage_recovery",
+            "interrupt_message": interrupted[0],
+        }
+    )
+
+@pytest.mark.parametrize("interrupt_message", ["Stop requested", "/stop", "/new", "/reset", "new request"])
+def test_user_owned_interrupt_controls_are_never_auto_resumed(interrupt_message):
+    result = {
+        "interrupted": True,
+        "resume_reason": "api_outage_recovery",
+        "interrupt_message": interrupt_message,
+    }
+
+    assert should_auto_resume_api_outage_result(result) is False
+
+def test_unattributed_api_outage_wait_is_the_only_auto_resume_case():
+    assert should_auto_resume_api_outage_result(
+        {"interrupted": True, "resume_reason": "api_outage_recovery"}
+    ) is True
+
+def test_api_recovery_interrupt_schedules_runtime_continuation(
+    emits, turn_env, marker_home, monkeypatch
+):
+    scheduled: list[tuple[str, str]] = []
+
+    def _run(message, **kwargs):
+        return {
+            "final_response": "Operation interrupted while waiting for API outage recovery.",
+            "interrupted": True,
+            "completed": False,
+            "resume_reason": "api_outage_recovery",
+        }
+
+    monkeypatch.setattr(
+        server,
+        "_maybe_schedule_auto_continue",
+        lambda sid, session, key: scheduled.append((sid, key)) or {"attempt": 1},
+    )
+    agent = types.SimpleNamespace(
+        session_id="session-key", run_conversation=_run, clear_interrupt=lambda: None
+    )
+    session = _session(agent=agent, running=True)
+
+    server._run_prompt_submit("rid", "sid", session, "do the thing")
+
+    assert scheduled == [("sid", "session-key")]
+    marker = read_turn_marker(marker_home, "session-key")
+    assert marker is not None
+    assert marker["resume_reason"] == "api_outage_recovery"
+
+def test_explicit_interrupt_does_not_schedule_runtime_continuation(
+    emits, turn_env, marker_home, monkeypatch
+):
+    scheduled: list = []
+
+    def _run(message, **kwargs):
+        return {
+            "final_response": "Operation interrupted while waiting for API outage recovery.",
+            "interrupted": True,
+            "completed": False,
+            "resume_reason": "api_outage_recovery",
+            "interrupt_message": "Stop requested",
+        }
+
+    monkeypatch.setattr(
+        server,
+        "_maybe_schedule_auto_continue",
+        lambda *args, **kwargs: scheduled.append((args, kwargs)),
+    )
+    agent = types.SimpleNamespace(
+        session_id="session-key", run_conversation=_run, clear_interrupt=lambda: None
+    )
+    session = _session(agent=agent, running=True)
+
+    server._run_prompt_submit("rid", "sid", session, "do the thing")
+
+    assert scheduled == []
+    assert read_turn_marker(marker_home, "session-key") is None
+
+def test_api_recovery_hosted_receipt_preserves_both_owners_and_schedules(
+    emits, turn_env, marker_home, monkeypatch
+):
+    scheduled: list[tuple[str, str]] = []
+    receipts: list[tuple[dict, dict | None]] = []
+    hosted_task = {
+        "room_id": "room",
+        "task_id": "task",
+        "thread_id": "thread",
+        "turn_id": "turn",
+        "execution_generation": 1,
+    }
+
+    def _run(message, **kwargs):
+        return {
+            "final_response": "Operation interrupted while waiting for API outage recovery.",
+            "interrupted": True,
+            "completed": False,
+            "resume_reason": "api_outage_recovery",
+        }
+
+    def _terminal(receipt):
+        receipts.append((dict(receipt), read_turn_marker(marker_home, "session-key")))
+
+    monkeypatch.setattr(
+        server,
+        "_maybe_schedule_auto_continue",
+        lambda sid, session, key: scheduled.append((sid, key)) or {"attempt": 1},
+    )
+    agent = types.SimpleNamespace(
+        session_id="session-key", run_conversation=_run, clear_interrupt=lambda: None
+    )
+    session = _session(
+        agent=agent,
+        running=True,
+        source="bot_room",
+        _hosted_room_task=dict(hosted_task),
+    )
+
+    server._run_prompt_submit(
+        "rid",
+        "sid",
+        session,
+        "do the thing",
+        terminal_callback=_terminal,
+    )
+
+    assert len(receipts) == 1
+    receipt, marker_at_callback = receipts[0]
+    assert receipt["status"] == "cancelled"
+    assert marker_at_callback is not None
+    assert marker_at_callback["resume_reason"] == "api_outage_recovery"
+    assert read_turn_marker(marker_home, "session-key") is not None
+    assert session["_hosted_room_task"] == hosted_task
+    assert scheduled == [("sid", "session-key")]
+
+def test_hosted_terminal_receipt_failure_preserves_marker_and_task(
+    emits, turn_env, marker_home
+):
+    hosted_task = {
+        "room_id": "room",
+        "task_id": "task",
+        "thread_id": "thread",
+        "turn_id": "turn",
+        "execution_generation": 1,
+    }
+    attempted: list[dict] = []
+
+    def _run(message, **kwargs):
+        return {"final_response": "done"}
+
+    def _terminal(receipt):
+        attempted.append(dict(receipt))
+        raise RuntimeError("state store unavailable")
+
+    agent = types.SimpleNamespace(
+        session_id="session-key", run_conversation=_run, clear_interrupt=lambda: None
+    )
+    session = _session(
+        agent=agent,
+        running=True,
+        source="bot_room",
+        _hosted_room_task=dict(hosted_task),
+    )
+
+    server._run_prompt_submit(
+        "rid",
+        "sid",
+        session,
+        "do the thing",
+        terminal_callback=_terminal,
+    )
+
+    assert len(attempted) == 1
+    assert read_turn_marker(marker_home, "session-key") is not None
+    assert session["_hosted_room_task"] == hosted_task
+
+def test_stale_hosted_callback_cannot_clear_newer_task(
+    emits, turn_env, marker_home
+):
+    old_task = {
+        "room_id": "room",
+        "task_id": "old-task",
+        "thread_id": "thread",
+        "turn_id": "old-turn",
+        "execution_generation": 1,
+    }
+    new_task = {
+        "room_id": "room",
+        "task_id": "new-task",
+        "thread_id": "thread",
+        "turn_id": "new-turn",
+        "execution_generation": 2,
+    }
+    callback_calls: list[dict] = []
+    session: dict
+
+    def _run(message, **kwargs):
+        with session["history_lock"]:
+            session["_turn_generation"] += 1
+            session["_hosted_room_task"] = dict(new_task)
+        return {"final_response": "old task finished"}
+
+    def _terminal(receipt):
+        callback_calls.append(dict(receipt))
+
+    agent = types.SimpleNamespace(
+        session_id="session-key", run_conversation=_run, clear_interrupt=lambda: None
+    )
+    session = _session(
+        agent=agent,
+        running=True,
+        source="bot_room",
+        _hosted_room_task=dict(old_task),
+    )
+
+    server._run_prompt_submit(
+        "rid",
+        "sid",
+        session,
+        "old task",
+        terminal_callback=_terminal,
+    )
+
+    assert callback_calls == []
+    assert session["_turn_generation"] == 2
+    assert session["_hosted_room_task"] == new_task
+    assert read_turn_marker(marker_home, "session-key") is not None
+
+def test_api_recovery_marker_uses_continue_note(emits, schedule_env, marker_home):
+    record_turn_start(
+        marker_home,
+        "session-key",
+        "fix the flaky test",
+        resume_reason="api_outage_recovery",
+    )
+
+    result = server._maybe_schedule_auto_continue("sid", _session(), "session-key")
+
+    assert result is not None
+    (text, kwargs), = schedule_env
+    assert text == server._api_outage_recovery_note()
+    assert "CONTINUE the interrupted task" in text
+    assert kwargs["display_kind"] == "auto_continue"

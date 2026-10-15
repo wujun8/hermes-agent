@@ -119,6 +119,7 @@ def test_primary_handler_enters_routed_profile_scope_before_dispatch(multiplex_h
 
     runner = object.__new__(GatewayRunner)
     runner.config = GatewayConfig(multiplex_profiles=True)
+    runner._served_profile_names = {"default", "fitness"}
     seen = []
 
     async def capture_scope(event):
@@ -205,6 +206,7 @@ def test_primary_route_keeps_transport_authorization_scope(multiplex_homes):
 
     runner = object.__new__(GatewayRunner)
     runner.config = GatewayConfig(multiplex_profiles=True)
+    runner._served_profile_names = {"default", "fitness"}
     runner.adapters = {}
     runner._profile_adapters = {}
     runner.pairing_store = MagicMock()
@@ -264,6 +266,7 @@ def test_two_primary_routed_turns_reload_profile_transcript(multiplex_homes):
             )
         ],
     )
+    runner._served_profile_names = {"default", "fitness"}
     observed_histories = []
     session_id = "routed-two-turn-session"
 

@@ -1067,7 +1067,7 @@ def _recover_via_lost_and_found(
         refusal = find_sqlite3_cli_refusal()
         if refusal.get("reason") == "wal_reset_vulnerable":
             raise SessionRecoverySourceError(
-                "Partial recovery requires a page-level salvage shell, but "
+                "Partial recovery requires SQLite's .recover page-level salvage shell, but "
                 "the only sqlite3 CLI on PATH is not safe to use for it: it "
                 + refusal["detail"]
                 + ". The readable table schemas for: "
@@ -1075,7 +1075,8 @@ def _recover_via_lost_and_found(
                 + " are still required."
             )
         raise SessionRecoverySourceError(
-            f"Partial recovery still requires readable table schemas for: {missing}. {SQLITE3_CLI_GUIDANCE}"
+            f"Partial recovery via SQLite's .recover still requires readable table schemas for: {missing}. "
+            f"{SQLITE3_CLI_GUIDANCE}"
         )
     lf_path = snapshot_dir / "lost_and_found.db"
     try:

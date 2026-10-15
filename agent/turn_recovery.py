@@ -1118,6 +1118,24 @@ _STREAM_DROP_MARKERS = (
     "network error", "terminated",
 )
 
+_CODEX_TRANSIENT_TERMINAL_ERROR_CODES = frozenset({
+    "upstream_error",
+    "overloaded",
+    "server_error",
+})
+
+
+def is_codex_transient_terminal_failure(agent: Any, response: Any) -> bool:
+    """Whether a failed Responses result should exhaust primary retries first."""
+    if agent.api_mode != "codex_responses":
+        return False
+    status = str(getattr(response, "status", "") or "").strip().lower()
+    if status != "failed":
+        return False
+    error_obj = getattr(response, "error", None)
+    code = error_obj.get("code") if isinstance(error_obj, dict) else getattr(error_obj, "code", None)
+    return str(code or "").strip().lower() in _CODEX_TRANSIENT_TERMINAL_ERROR_CODES
+
 
 def max_retries_exhausted_result(
     agent: Any, api_error: Exception, classified: Any, *, attempts: int, is_rate_limited: bool,
@@ -1533,13 +1551,18 @@ def validate_response_shape(agent: Any, response: Any) -> tuple[bool, list[str]]
     if agent.api_mode == "codex_responses":
         _codex_resp_status = str(getattr(response, "status", "") or "").strip().lower()
         if _codex_resp_status in {"failed", "cancelled"}:
+            _codex_error_obj = getattr(response, "error", None)
+            _transient_terminal = is_codex_transient_terminal_failure(agent, response)
             _codex_error_msg = (
                 _codex_soft_failure_error(response).get("message")
                 or f"Responses API returned status '{_codex_resp_status}'"
             )
             logger.warning(
-                "Codex response status='%s' (error=%s). Routing to fallback. %s",
-                _codex_resp_status, _codex_error_msg, agent._client_log_context(),
+                "Codex response status='%s' (error=%s). %s %s",
+                _codex_resp_status,
+                _codex_error_msg,
+                "Retrying primary before fallback." if _transient_terminal else "Routing to fallback.",
+                agent._client_log_context(),
             )
             return True, [f"response.status={_codex_resp_status}: {_codex_error_msg}"]
         # Stream backfill may have failed but normalize can still recover from output_text.
@@ -1775,7 +1798,7 @@ def route_classified_error(
     """Ordered (load-bearing) recovery steps between classification and overflow handling:
     compaction-disabled overflow → terminal error (output-cap errors exempt); Anthropic
     long-context tier 429 → cap at 200k and compress; eager fallback for rate-limit/billing
-    (immediately) and transport failures (after 1 retry) unless credential-pool rotation may
+    (immediately) and transport failures (after primary retries) unless credential-pool rotation may
     still recover (upstream-aggregator 429s always fall back); persistent 401/403 → fallback
     chain once; genuine Nous 429 → cross-session breaker + re-enter the loop exactly once."""
     from agent.conversation_compression import conversation_history_after_compression
@@ -1868,7 +1891,7 @@ def route_classified_error(
         # Compression exhausted or didn't help: fall through to normal error handling.
 
     # Eager fallback: rate-limit/billing switch immediately (primary won't recover in
-    # the retry window); transport errors get 1 retry first.
+    # the retry window); transport errors exhaust the configured primary retries first.
     is_rate_limited = classified.reason in _RATE_LIMIT_REASONS
     # Some relays wrap upstream output-cap 400s as 429 (rate_limit). Only the max_tokens
     # clamp fixes it. Parsed once; gates the eager-fallback exemption and overflow entry.
@@ -1890,7 +1913,7 @@ def route_classified_error(
         max_retries = max(max_retries, zai_coding_overload_retry_ceiling())
     _should_fallback = (
         (is_rate_limited and _wrapped_output_cap_budget is None)
-        or (_is_transport_failure and retry_count >= 2)
+        or (_is_transport_failure and retry_count >= max_retries)
     )
     if _should_fallback and agent._fallback_index < len(agent._fallback_chain):
         # No eager fallback while credential pool rotation may recover. Exception: an

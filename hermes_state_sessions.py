@@ -24,7 +24,7 @@ from hermes_state_common import (
     escape_like as _escape_like, _SQL_IN_CHUNK, _id_chunks, _placeholders as _session_ids_placeholders,
 )
 from hermes_state_compression import _CHAIN_CAP
-
+from hermes_state_session_policies import SessionPolicyMixin
 # caplog tests pin the "hermes_state" logger name.
 logger = logging.getLogger("hermes_state")
 
@@ -324,7 +324,7 @@ _INHERIT_PARENT_ROUTING_SQL = (
 )
 
 
-class SessionSessionsMixin:
+class SessionSessionsMixin(SessionPolicyMixin):
     """Session rows: create/inherit, lifecycle flags, model_config, listing, deletion."""
 
     def _own_profile_name(self) -> Optional[str]:

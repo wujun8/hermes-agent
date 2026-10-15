@@ -439,6 +439,7 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
         )
     return _runtime_provider_credentials(values, explicit_request_overrides)
 
+
 def _load_config() -> dict:
     """The ``delegation`` config section (read-only — do NOT mutate). Prefers the shared ``load_config_readonly()``
     (follows HERMES_HOME/profile; no deepcopy, since this runs on every get_definitions() rebuild) over the legacy

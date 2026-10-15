@@ -195,6 +195,9 @@ class StatusOutputMixin:
         ``kind`` is ``"status"`` (replays via ``_emit_status``), ``"vprint"`` (``_vprint(force=True)``) or
         ``"warn"`` (``_emit_warning``).
         """
+        if getattr(self, "_show_retry_status", False):
+            self._emit_status(message)
+            return
         buf = getattr(self, "_retry_status_buffer", None)
         if buf is None:
             buf = self._retry_status_buffer = []
@@ -225,6 +228,10 @@ class StatusOutputMixin:
             return
         # Clear before emitting so a (swallowed) callback error can't leave a stale re-emit.
         self._pending_fallback_notice = None
+        # Live retry status already surfaced each fallback switch through the common
+        # status channel, so the success notice would be a duplicate.
+        if getattr(self, "_show_retry_status", False):
+            return
         for item in notice if isinstance(notice, list) else [notice]:
             try:
                 self._emit_diagnostic_status(item)

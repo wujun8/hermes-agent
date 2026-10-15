@@ -10,8 +10,10 @@ from contextlib import suppress
 import os
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
+import tempfile
 import time as _time
 from dataclasses import dataclass
 from pathlib import Path
@@ -349,33 +351,69 @@ def _validate_python_files_syntax(
 
 
 def _validate_critical_files_syntax(root) -> tuple[bool, str | None, str | None]:
-    """Compile each file in ``_UPDATE_CRITICAL_FILES`` to catch SyntaxErrors.
+    """Backwards-compatible ordinary-update syntax guard."""
+    return _validate_post_pull_critical_files_syntax(root)
 
-    These are the files imported on every ``hermes`` startup; if any of them
-    has a syntax error (orphan merge-conflict markers, bad ref to a name
-    that no longer exists, etc.) the CLI can't bootstrap at all. We validate
-    them after a successful ``git pull`` so we can auto-roll-back instead of
-    leaving the user with a bricked install.
 
-    The compiled ``.pyc`` is written to a temp directory rather than the
-    source tree's ``__pycache__/`` so we don't race with concurrent test
-    workers that walk the same dir, and so we don't leave a stale pyc
-    behind in production if the next interpreter run picks a different
-    Python version. The pyc is discarded on function return either way —
-    we only care about the compile-or-not signal.
+def _validate_post_pull_critical_files_syntax(
+    root,
+) -> tuple[bool, str | None, str | None]:
+    """Compile existing critical files after an ordinary post-pull update.
 
-    Returns ``(ok, failing_path, error_message)``. ``ok=True`` means every
-    file parsed cleanly.
+    Older installations can legitimately predate one of the current critical
+    paths. Missing files are tolerated, but every existing path still
+    receives regular-file, containment, and syntax checks.
     """
-    return _validate_python_files_syntax(root, _UPDATE_CRITICAL_FILES)
+    return _validate_critical_files_syntax_impl(root, allow_missing=True)
 
+def _validate_critical_files_syntax_impl(
+    root, *, allow_missing: bool
+) -> tuple[bool, str | None, str | None]:
+    """Shared syntax guard implementation with an explicit missing-file mode."""
+    import py_compile
 
-# Modules imported on every agent startup. Unlike _UPDATE_CRITICAL_FILES (which
-# is only parsed), these are actually *imported* so that cross-module breakage
-# is caught — a file can be syntactically perfect and still fail to import
-# because a name it pulls from a sibling module no longer exists.
+    root = Path(root)
+    try:
+        checkout_root = root.resolve(strict=True)
+    except OSError as exc:
+        return False, str(root), f"updated checkout root is not accessible: {exc}"
 
+    with tempfile.TemporaryDirectory(prefix="hermes-syntax-check-") as tmpdir:
+        for relpath in _UPDATE_CRITICAL_FILES:
+            relative = Path(relpath)
+            path = root / relative
+            if relative.is_absolute() or ".." in relative.parts:
+                return False, str(path), "critical path escapes updated checkout root"
+            try:
+                info = path.lstat()
+            except FileNotFoundError:
+                if allow_missing:
+                    continue
+                return False, str(path), "required critical file is missing"
+            except OSError as exc:
+                return False, str(path), f"could not inspect required file: {exc}"
+            if stat.S_ISLNK(info.st_mode):
+                return False, str(path), "required critical file is a symlink"
+            if not stat.S_ISREG(info.st_mode):
+                return False, str(path), "required critical file is not a regular file"
+            try:
+                resolved = path.resolve(strict=True)
+                resolved.relative_to(checkout_root)
+            except ValueError:
+                return False, str(path), "required critical file resolves outside updated checkout root"
+            except OSError as exc:
+                return False, str(path), f"could not resolve required file: {exc}"
 
+            # Mirror the relative path under the temp directory so different
+            # source files cannot collide in the compile output.
+            cfile = Path(tmpdir) / (str(relative).replace("/", "__") + "c")
+            try:
+                py_compile.compile(str(path), cfile=str(cfile), doraise=True)
+            except py_compile.PyCompileError as exc:
+                return False, str(path), str(exc)
+            except OSError as exc:
+                return False, str(path), f"could not compile: {exc}"
+    return True, None, None
 def _gateway_prompt(prompt_text: str, default: str = "", timeout: float = 300.0) -> str:
     """File-based IPC prompt for gateway mode.
 
@@ -1679,12 +1717,12 @@ def _current_branch_name(git_cmd, *, check: bool = False) -> str:
 
 def _handle_update_called_process_error(
     e, args, gateway_mode: bool, had_desktop_app_before_update: bool,
-    *, target_sha: str | None = None, target_repository: str | None = None, completion_request=None) -> None:
+    *, target_sha: str | None = None, target_repository: str | None = None, completion_request=None, update_succeeded: bool = False) -> None:
     """Git/installer failure: ZIP-fallback when safe, else report and ``sys.exit(1)``."""
     if unrestored := _unrestored_autostash_notice():
         print(unrestored)  # a stash taken this run that no settle step reported (#122557)
     stage = _format_update_failure_stage(e)
-    if _should_zip_fallback_on_update_error(e):
+    if not update_succeeded and _should_zip_fallback_on_update_error(e):
         print(f"⚠ {stage}: {e}")
         print("→ Falling back to ZIP download...")
         print()
@@ -1870,6 +1908,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
         return
 
+    update_succeeded = False
     try:
         _check.report_pack_tidy(_m().PROJECT_ROOT)
         # Shallow installer checkouts collect one `.git/shallow` graft per past depth-1 fetch
@@ -1951,6 +1990,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             sync_upstream=is_fork and branch == "main" and not release_sha, assume_yes=assume_yes,
             in_place_update=_plan.in_place_update, _windows_gateway_resume=_windows_gateway_resume,
             expected_sha=completion_request.get("expected_sha"))
+        update_succeeded = True
         _apply_pulled_update(
             git_cmd, branch, movement_baseline, _plan,
             _windows_gateway_resume=_windows_gateway_resume, completion_request=completion_request)
@@ -1958,6 +1998,6 @@ def _cmd_update_impl(args, gateway_mode: bool):
         try:
             _handle_update_called_process_error(
                 e, args, gateway_mode, had_desktop_app_before_update, target_sha=release_sha,
-                target_repository=target_repository, completion_request=completion_request)
+                target_repository=target_repository, completion_request=completion_request, update_succeeded=update_succeeded)
         finally:
             _resume_paused_gateways_at_exit(_windows_gateway_resume, completion_request)

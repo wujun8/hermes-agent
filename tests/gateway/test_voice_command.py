@@ -551,10 +551,17 @@ class TestVoiceChannelCommands:
         assert (event.source.chat_type, event.source.guild_id) == ("group", "111")
 
     @pytest.mark.asyncio
-    async def test_input_reroutes_speaker_without_changing_transport_owner(self, runner, monkeypatch):
+    async def test_input_reroutes_speaker_without_changing_transport_owner(self, runner, monkeypatch, tmp_path):
         from gateway.config import Platform
         from gateway.profile_routing import parse_profile_routes
 
+        profile_root = tmp_path / "hermes"
+        for name in ("team-bot", "first", "second"):
+            profile_home = profile_root / "profiles" / name
+            profile_home.mkdir(parents=True)
+            (profile_home / "config.yaml").write_text("{}\n")
+        monkeypatch.setenv("HERMES_HOME", str(profile_root))
+        runner._served_profile_names = {"default", "team-bot", "first", "second"}
         runner.config = SimpleNamespace(
             multiplex_profiles=True,
             profile_routes=parse_profile_routes([

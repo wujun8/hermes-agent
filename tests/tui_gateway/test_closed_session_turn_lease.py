@@ -132,6 +132,7 @@ def test_closing_refusal_keeps_a_lease_the_session_already_held(turn_env):
     own to hand off (an isolated compute-host turn defers it in _settle_isolated_turn_before_close)."""
     session = _session()
     turn_env.append(session)
+    server._sessions[SID] = session
     assert server._ensure_active_session_slot(SID, session) is None
     held = session["active_session_lease"]
     session["_closing"] = True

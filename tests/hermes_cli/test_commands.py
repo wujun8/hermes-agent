@@ -71,6 +71,35 @@ class TestCommandRegistry:
         assert infer_argument_mode(CommandDef("note", "Note", "Session", args_hint="[message]")) == "text"
 
 
+    def test_save_command_supports_formats(self):
+        cmd = resolve_command("save")
+        assert cmd is not None
+        assert cmd.name == "save"
+        # /save is a cross-platform session export: json (default), md, html
+        assert not cmd.cli_only
+        for token in ("json", "md", "html"):
+            assert token in (cmd.args_hint or "")
+
+    def test_desktop_meta_lives_on_the_command_def(self):
+        review = resolve_command("review")
+        assert review is not None
+        assert review.argument_mode is None
+        assert infer_argument_mode(review) == "text"
+        assert command_desktop_meta(review) == {"argument_mode": "text", "desktop": None}
+
+        clear = resolve_command("clear")
+        assert clear is not None
+        assert clear.desktop == "terminal"
+
+        model = resolve_command("model")
+        assert model is not None
+        assert model.desktop == "hidden"
+
+        goal = resolve_command("goal")
+        assert goal is not None
+        assert goal.argument_mode == "mixed"
+
+
 # ---------------------------------------------------------------------------
 # resolve_command tests
 # ---------------------------------------------------------------------------
@@ -108,6 +137,15 @@ class TestDerivedDicts:
         assert set(COMMANDS_BY_CATEGORY.keys()) == registry_categories
 
 
+    def test_commands_dict_includes_aliases(self):
+        assert "/bg" in COMMANDS
+        assert "/reset" in COMMANDS
+        assert "/q" in COMMANDS
+        assert "/exit" in COMMANDS
+        assert "/reload_mcp" in COMMANDS
+        assert "/gateway" in COMMANDS
+
+
 # ---------------------------------------------------------------------------
 # Gateway helpers
 # ---------------------------------------------------------------------------
@@ -122,6 +160,8 @@ class TestGatewayKnownCommands:
                     f"config-gated command '{cmd.name}' should be in GATEWAY_KNOWN_COMMANDS"
 
 
+    def test_is_frozenset(self):
+        assert isinstance(GATEWAY_KNOWN_COMMANDS, frozenset)
 
 
 class TestGatewayHelpLines:
@@ -136,6 +176,16 @@ class TestGatewayHelpLines:
                 pattern = rf'`/{re.escape(cmd.name)}(?![-_\w])'
                 assert not re.search(pattern, joined), \
                     f"cli_only command /{cmd.name} should not be in gateway help"
+
+
+    def test_bg_and_btw_are_separate_commands(self):
+        lines = gateway_help_lines()
+        joined = "\n".join(lines)
+        assert "`/bg" in joined
+        assert "`/btw" in joined
+        # The retired /background canonical name must be gone.
+        bg_line = [l for l in lines if "/background" in l]
+        assert not bg_line
 
 
 
@@ -174,6 +224,14 @@ class TestTelegramBotCommands:
         assert "steer" in names
 
 
+    def test_returns_list_of_tuples(self):
+        cmds = telegram_bot_commands()
+        assert len(cmds) > 10
+        for name, desc in cmds:
+            assert isinstance(name, str)
+            assert isinstance(desc, str)
+
+
 
 class TestSlackSubcommandMap:
 
@@ -187,6 +245,12 @@ class TestSlackSubcommandMap:
         for cmd in COMMAND_REGISTRY:
             if cmd.cli_only and not cmd.gateway_config_gate:
                 assert cmd.name not in mapping
+
+
+    def test_returns_dict(self):
+        mapping = slack_subcommand_map()
+        assert isinstance(mapping, dict)
+        assert len(mapping) > 10
 
 
 class TestSlackNativeSlashes:
@@ -250,6 +314,14 @@ class TestSlackAppManifest:
             assert "should_escape" in entry
 
 
+    def test_btw_is_in_manifest(self):
+        """Regression: /btw must be a native Slack slash, not just a
+        /hermes subcommand."""
+        m = slack_app_manifest()
+        commands = [c["command"] for c in m["features"]["slash_commands"]]
+        assert "/btw" in commands
+
+
 
 # ---------------------------------------------------------------------------
 # Config-gated gateway commands
@@ -279,6 +351,11 @@ class TestGatewayConfigGate:
 
         mapping = slack_subcommand_map()
         assert "verbose" in mapping
+
+
+    def test_verbose_in_gateway_known_commands(self):
+        """Config-gated commands are always recognized by the gateway."""
+        assert "verbose" in GATEWAY_KNOWN_COMMANDS
 
 
 # ---------------------------------------------------------------------------
@@ -933,6 +1010,9 @@ class TestTelegramMenuCommands:
 # ---------------------------------------------------------------------------
 
 from hermes_cli.commands_platforms import discord_skill_commands_by_category
+from hermes_cli.commands import COMMANDS
+from hermes_cli.commands import SUBCOMMANDS
+from hermes_cli.commands import is_gateway_known_command
 
 
 class TestDiscordSkillCommandsByCategory:
@@ -1100,3 +1180,36 @@ class TestPluginCommandEnumeration:
         slack_names = set(slack_subcommand_map())
         assert "status" in tg_names
         assert "status" in slack_names
+
+
+class TestResolveCommand:
+
+
+    def test_topic_is_gateway_command(self):
+        topic = resolve_command("topic")
+        assert topic is not None
+        assert topic.name == "topic"
+        assert "topic" in GATEWAY_KNOWN_COMMANDS
+
+    def test_context_command_registered_with_ctx_alias(self):
+        ctx = resolve_command("context")
+        assert ctx is not None
+        assert ctx.name == "context"
+        assert resolve_command("ctx").name == "context"
+        assert "all" in (ctx.subcommands or ())
+        # Available on both CLI and gateway surfaces
+        assert not ctx.cli_only and not ctx.gateway_only
+        assert "context" in GATEWAY_KNOWN_COMMANDS
+
+class TestSubcommands:
+    def test_explicit_subcommands_extracted(self):
+        """Commands with explicit subcommands on CommandDef are extracted."""
+        assert "/skills" in SUBCOMMANDS
+        assert "install" in SUBCOMMANDS["/skills"]
+
+
+    def test_commands_without_subcommands_not_in_dict(self):
+        """Plain commands should not appear in SUBCOMMANDS."""
+        assert "/help" not in SUBCOMMANDS
+        assert "/quit" not in SUBCOMMANDS
+        assert "/clear" not in SUBCOMMANDS

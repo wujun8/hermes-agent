@@ -230,20 +230,20 @@ class TestRunSingleChildSchemaValidation:
         assert entry.get("schema_valid") is False
 
     def test_schema_failure_returns_raw_text_with_schema_valid_false(self):
-        """A final answer that still violates the contract after the bounded retry is NOT discarded: the
-        child did the work (audits of 400-4100 s were written off over a stray fence or one missing
-        field). The parent gets the raw text as ``summary`` with status "completed", ``schema_valid``
-        false, ``schema_errors`` populated and a ``schema_note`` saying the text is unvalidated."""
+        """A schema-invalid response remains available as raw evidence while its declared
+        contract failure is reported truthfully after the bounded retry."""
         prose = 'Findings:\n```json\n{"town": "Oslo"}\n```\nlet me know.'
         child = _StubChild([prose, prose])
         child._delegate_output_schema = ADDRESS_SCHEMA
         entry = _run(child)
-        assert entry["status"] == "completed"
+        assert entry["status"] == "failed"
+        assert entry["exit_reason"] == "error"
+        assert entry["truncated"] is False
         assert entry["summary"] == prose
         assert entry["schema_valid"] is False
         assert entry["schema_errors"] and entry["schema_retries"] == 1
         assert "UNVALIDATED" in entry["schema_note"]
-        assert "error" not in entry
+        assert "output_schema" in entry["error"]
         assert len(child.calls) == 2  # exactly one bounded retry
 
     def test_prose_wrapped_array_answer_validates(self):

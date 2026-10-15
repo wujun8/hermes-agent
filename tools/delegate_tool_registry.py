@@ -89,17 +89,27 @@ def _close_subagent_steering(subagent_id: str, agent: Any) -> Optional[str]:
             return None
         return pending if isinstance(pending, str) and pending.strip() else None
 
-def interrupt_subagent(subagent_id: str) -> bool:
+def interrupt_subagent(subagent_id: str, *, reason: Optional[str] = None) -> bool:
     """Request that one running subagent stop at its next iteration boundary
     (cooperative: the flag propagates to in-flight tools and recurses into
-    grandchildren via AIAgent.interrupt()). True iff a matching subagent was found."""
+    grandchildren via AIAgent.interrupt()). True iff a matching subagent was found.
+
+    The default reason preserves the legacy TUI contract. Model-facing
+    parent-control stops pass an explicit marker so the child result can expose
+    ``exit_reason=parent_stop``.
+    """
     with _active_subagents_lock:
         record = _active_subagents.get(subagent_id)
     agent = record.get("agent") if record else None
     if agent is None:
         return False
+    interrupt_reason = (
+        reason
+        if reason is not None
+        else f"Interrupted via TUI ({subagent_id})"
+    )
     try:
-        return bool(request_hard_interrupt(agent, f"Interrupted via TUI ({subagent_id})"))
+        return bool(request_hard_interrupt(agent, interrupt_reason))
     except Exception as exc:
         logger.debug("interrupt_subagent(%s) failed: %s", subagent_id, exc)
         return False
@@ -285,7 +295,14 @@ def _handle_control_action(action: str, subagent_id: Optional[str], message: Opt
     if outcome is None:
         return tool_error(f"Unknown action '{action}'. Use spawn, list, steer, or stop.")
     status, note, failure = outcome
-    ok = interrupt_subagent(sid) if action == "stop" else steer_subagent(sid, message.strip())
+    ok = (
+        interrupt_subagent(
+            sid,
+            reason=f"[delegate_task parent-control] stop requested ({sid})",
+        )
+        if action == "stop"
+        else steer_subagent(sid, message.strip())
+    )
     if ok:
         return json.dumps({"action": action, "subagent_id": sid, "status": status, "note": note}, ensure_ascii=False)
     return tool_error(failure.format(sid=sid))
@@ -294,8 +311,9 @@ def _handle_control_action(action: str, subagent_id: Optional[str], message: Opt
 _CONTROL_OUTCOMES = {
     "stop": (
         "interrupt_requested",
-        "The subagent stops at its next iteration boundary (in-flight tool calls are asked to cancel). Its "
-        "partial result still re-enters the conversation as a completion message — do not wait or poll.",
+        "Hard stop requested. Prefer action='steer' before stop when the child can still converge. The child "
+        "halts at its next iteration boundary; the result re-enters as status=interrupted with "
+        "exit_reason=parent_stop — do not treat it as completed, and do not wait or poll.",
         "Could not interrupt '{sid}' — it likely finished in the last "
         "moment. Its result arrives as a normal completion message.",
     ),

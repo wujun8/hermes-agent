@@ -174,8 +174,9 @@ def _admit_prompt_turn(
     return images, agent
 
 
-def _record_turn_marker(session: dict, text: Any, *, auto_continue: bool = True,
-                        notification_category: str | None = None) -> str:
+def _record_turn_marker(
+    session: dict, text: Any, *, auto_continue: bool = True, notification_category: str | None = None
+) -> tuple[str, Path, int, Any]:
     """Write the durable crash marker; returns the session key it was written under (compression
     can rotate session_key mid-turn).  A surviving marker means the process died mid-turn.
     The key is published before the disk write so an interrupt racing startup can retire
@@ -195,7 +196,7 @@ def _record_turn_marker(session: dict, text: Any, *, auto_continue: bool = True,
             marker_cancelled = bool(session.get("_turn_cancel_requested"))
         if marker_cancelled:
             clear_turn_marker(marker_home, marker_key)
-    return marker_key
+    return marker_key, marker_home, marker_attempt, marker_text
 
 
 @dataclasses.dataclass(slots=True)
@@ -436,7 +437,14 @@ def _dispatch_followup_turn(rid, sid: str, session: dict, prompt: Any, what: str
 
 
 def _run_post_turn_followups(
-    rid, sid: str, session: dict, result: Any, goal_followup: str | None) -> None:
+    rid,
+    sid: str,
+    session: dict,
+    result: Any,
+    goal_followup: str | None,
+    *,
+    api_recovery_marker_key: str = "",
+) -> None:
     """Chain whatever should run after ``running`` was released.  Order: a mid-turn user
     prompt wins over every auto follow-up (drain it, skip the rest); a leftover /steer is
     requeued first so it isn't dropped; then goal continuation, then completion
@@ -446,6 +454,9 @@ def _run_post_turn_followups(
         with session["history_lock"]:
             _enqueue_prompt(session, steer, session.get("transport"))
     if _drain_queued_prompt(rid, sid, session):
+        return
+    if api_recovery_marker_key:
+        _maybe_schedule_auto_continue(sid, session, api_recovery_marker_key)
         return
     if goal_followup:
         with _session_turn_admission(session) as admitted:
@@ -501,9 +512,199 @@ class _TurnRun:
     error_detail: str = ""
     prompt_text: str = ""
     marker_key: str = ""
+    marker_home: Path | None = None
+    marker_attempt: int = 0
+    marker_text: Any = None
+    turn_generation: int = 0
+    hosted_task_identity: tuple[Any, ...] | None = None
+    api_recovery_auto_continue: bool = False
+    api_recovery_marker_key: str = ""
     receipt_attempted: bool = False
 
 
+_HOSTED_TASK_IDENTITY_FIELDS = (
+    "room_id",
+    "task_id",
+    "thread_id",
+    "turn_id",
+    "execution_generation",
+)
+
+
+def _hosted_task_identity(session: dict) -> tuple[Any, ...] | None:
+    task = session.get("_hosted_room_task")
+    if not isinstance(task, dict):
+        return None
+    return tuple(task.get(field) for field in _HOSTED_TASK_IDENTITY_FIELDS)
+
+
+def _begin_turn_ownership(session: dict, st: _TurnRun) -> None:
+    with session["history_lock"]:
+        st.turn_generation = int(session.get("_turn_generation", 0) or 0) + 1
+        session["_turn_generation"] = st.turn_generation
+        session.pop("_api_recovery_marker", None)
+        st.hosted_task_identity = _hosted_task_identity(session)
+
+
+def _hosted_task_still_owned(session: dict, st: _TurnRun) -> bool:
+    try:
+        with session["history_lock"]:
+            return (
+                int(session.get("_turn_generation", 0) or 0) == st.turn_generation
+                and _hosted_task_identity(session) == st.hosted_task_identity
+            )
+    except Exception:
+        return False
+
+
+def _api_outage_resume_reason() -> str:
+    from agent.api_outage_recovery import API_OUTAGE_RECOVERY_RESUME_REASON
+
+    return API_OUTAGE_RECOVERY_RESUME_REASON
+
+
+def _should_auto_resume_api_outage(result: Any) -> bool:
+    from agent.api_outage_recovery import should_auto_resume_api_outage_result
+
+    return should_auto_resume_api_outage_result(result)
+
+
+def _marker_belongs_to_turn(session: dict, st: _TurnRun) -> bool:
+    if st.marker_home is None:
+        return True
+    expected_reason = _api_outage_resume_reason() if st.api_recovery_auto_continue else None
+    keys = dict.fromkeys(
+        (
+            st.marker_key,
+            st.api_recovery_marker_key,
+            str(session.get("session_key") or ""),
+        )
+    )
+    for key in keys:
+        if not key:
+            continue
+        marker = read_turn_marker(st.marker_home, key)
+        if marker is None:
+            continue
+        if marker.get("attempts") != st.marker_attempt:
+            return False
+        if (marker.get("resume_reason") or None) != expected_reason:
+            return False
+    return True
+
+
+def _api_recovery_marker_is_current(session: dict, st: _TurnRun) -> bool:
+    if (
+        not st.api_recovery_auto_continue
+        or not st.api_recovery_marker_key
+        or st.marker_home is None
+    ):
+        return False
+    with session["history_lock"]:
+        state = session.get("_api_recovery_marker")
+        if not isinstance(state, dict) or state != {
+            "turn_generation": st.turn_generation,
+            "marker_key": st.api_recovery_marker_key,
+            "attempts": st.marker_attempt,
+        }:
+            return False
+    marker = read_turn_marker(st.marker_home, st.api_recovery_marker_key)
+    return bool(
+        marker is not None
+        and marker.get("attempts") == st.marker_attempt
+        and marker.get("resume_reason") == _api_outage_resume_reason()
+    )
+
+
+def _record_api_recovery_marker(session: dict, st: _TurnRun) -> bool:
+    if st.marker_home is None:
+        return False
+    marker_key = str(session.get("session_key") or st.marker_key)
+    if not marker_key or not isinstance(st.marker_text, str) or not st.marker_text.strip():
+        return False
+    with session["history_lock"]:
+        session["_active_turn_marker_key"] = marker_key
+    record_turn_start(
+        st.marker_home,
+        marker_key,
+        st.marker_text,
+        attempts=st.marker_attempt,
+        resume_reason=_api_outage_resume_reason(),
+    )
+    if st.marker_key and st.marker_key != marker_key:
+        clear_turn_marker(st.marker_home, st.marker_key)
+    with session["history_lock"]:
+        if session.get("_turn_cancel_requested"):
+            clear_turn_marker(st.marker_home, marker_key)
+            return False
+        st.api_recovery_marker_key = marker_key
+        session["_api_recovery_marker"] = {
+            "turn_generation": st.turn_generation,
+            "marker_key": marker_key,
+            "attempts": st.marker_attempt,
+        }
+    return True
+
+
+def _terminal_state_can_retire(session: dict, st: _TurnRun) -> bool:
+    return bool(
+        st.receipt_committed
+        and _hosted_task_still_owned(session, st)
+        and not _api_recovery_marker_is_current(session, st)
+        and _marker_belongs_to_turn(session, st)
+    )
+
+
+def _retire_terminal_state(session: dict, st: _TurnRun) -> bool:
+    if not _terminal_state_can_retire(session, st):
+        return False
+    _retire_turn_marker(session, st.marker_key, st.api_recovery_marker_key)
+    with session["history_lock"]:
+        if int(session.get("_turn_generation", 0) or 0) != st.turn_generation:
+            return False
+        if (
+            st.terminal_callback is not None
+            and st.hosted_task_identity is not None
+            and _hosted_task_identity(session) == st.hosted_task_identity
+        ):
+            session.pop("_hosted_room_task", None)
+        state = session.get("_api_recovery_marker")
+        if isinstance(state, dict) and state.get("turn_generation") == st.turn_generation:
+            session.pop("_api_recovery_marker", None)
+        active_key = session.get("_active_turn_marker_key")
+        if active_key in {st.marker_key, st.api_recovery_marker_key}:
+            session.pop("_active_turn_marker_key", None)
+    return True
+
+
+def _attempt_terminal_receipt(
+    session: dict,
+    st: _TurnRun,
+    status: str,
+    text_value: Any,
+    error: Any = None,
+) -> bool:
+    if st.terminal_callback is None:
+        st.receipt_committed = True
+        return True
+    if st.receipt_attempted:
+        return st.receipt_committed
+    st.receipt_attempted = True
+    if not _hosted_task_still_owned(session, st):
+        return False
+    receipt = {
+        "status": status,
+        "text": text_value if isinstance(text_value, str) else str(text_value),
+    }
+    if error is not None:
+        receipt["error"] = str(error)
+    try:
+        st.terminal_callback(receipt)
+    except Exception:
+        logger.exception("hosted room terminal receipt commit failed")
+        return False
+    st.receipt_committed = True
+    return True
 def _adopt_out_of_band_turns(session: dict) -> None:
     """Fold turns another surface appended to this session (Telegram reply, cron run) into the model-facing
     history before the turn snapshots it. The desktop already repaints them from the DB (#86588); without
@@ -993,15 +1194,16 @@ def _complete_turn_payload(session: dict, st: _TurnRun, status_note: str | None,
             payload["partial"] = True
         if _error_surface:
             payload["error_surface"] = _error_surface
-    if st.terminal_callback is not None:
-        st.receipt_attempted = True
-        st.terminal_callback({
-            "status": {"interrupted": "cancelled", "error": "failed"}.get(status, "settled"),
-            "text": raw if isinstance(raw, str) else str(raw),
-            **({"error": str(error_value or raw)} if status == "error" else {})})
-        st.receipt_committed = True
-    if st.receipt_committed:
-        _retire_turn_marker(session, st.marker_key)
+    if _should_auto_resume_api_outage(result):
+        st.api_recovery_auto_continue = _record_api_recovery_marker(session, st)
+    _attempt_terminal_receipt(
+        session,
+        st,
+        {"interrupted": "cancelled", "error": "failed"}.get(status, "settled"),
+        raw,
+        error_value if status == "error" else None,
+    )
+    _retire_terminal_state(session, st)
     return payload, raw, status
 
 
@@ -1018,16 +1220,11 @@ def _recover_turn_exception(sid: str, session: dict, st: _TurnRun, e: BaseExcept
     print(f"[gateway-turn] {type(e).__name__}: {e}", file=sys.stderr, flush=True)
     # A finalizer exception can leave in-memory history at the turn-start snapshot.
     _restore_agent_history_after_turn_error(session, st.agent)
-    if st.terminal_callback is not None and not st.receipt_attempted:
-        st.receipt_attempted = True
-        try:
-            st.terminal_callback({"status": "failed", "text": "", "error": str(e)})
-            st.receipt_committed = True
-        except Exception:
-            logger.exception("hosted room terminal receipt commit failed")
+    _attempt_terminal_receipt(session, st, "failed", "", e)
     try:
         # Same terminal error frame shape as the returned-error path.
-        _emit_terminal_turn_error(sid, session, e, retire_marker=st.receipt_committed)
+        _emit_terminal_turn_error(sid, session, e, retire_marker=False)
+        _retire_terminal_state(session, st)
         st.error_retained = True
         st.error_detail = _turn_failure_detail(e, type(e).__name__, st.prompt_text)
     except Exception as emit_exc:
@@ -1167,8 +1364,24 @@ def _run_prompt_submit(
         st = _TurnRun(
             session["agent"], session.pop("one_turn_model_restore", None), terminal_callback,
             receipt_committed=terminal_callback is None)
-        st.marker_key = _record_turn_marker(session, text, auto_continue=terminal_callback is None,
-            notification_category=(display_metadata or {}).get("notification_category"))
+        # Keep the minimal rebind seam used by imported-turn tests compatible with the
+        # ownership-aware production path; the helper is present in normal module globals.
+        if (begin_turn_ownership := globals().get("_begin_turn_ownership")) is not None:
+            begin_turn_ownership(session, st)
+        marker_record = _record_turn_marker(
+            session, text, auto_continue=terminal_callback is None,
+            notification_category=(display_metadata or {}).get("notification_category")
+        )
+        if isinstance(marker_record, tuple):
+            (
+                st.marker_key,
+                st.marker_home,
+                st.marker_attempt,
+                st.marker_text,
+            ) = marker_record
+        else:
+            # Keep the legacy string return usable for narrow imported-turn seams.
+            st.marker_key = marker_record
         goal_followup = None
         try:
             prepared = _prepare_turn_input(sid, session, st, text, images)
@@ -1228,16 +1441,19 @@ def _run_prompt_submit(
                     st.error_detail)
                 # Backstop for turns that never reached a terminal frame.
                 if st.receipt_committed:
-                    _retire_turn_marker(session, st.marker_key)
-                    with session["history_lock"]:
-                        if session.get("_active_turn_marker_key") == st.marker_key:
-                            session.pop("_active_turn_marker_key", None)
-                        session.pop("_hosted_room_task", None)
+                    retire_terminal_state = globals().get("_retire_terminal_state")
+                    if retire_terminal_state is not None:
+                        retire_terminal_state(session, st)
+                    else:
+                        # Keep the minimal imported-turn seam usable when only the marker helper is rebound.
+                        retire_turn_marker = globals().get("_retire_turn_marker")
+                        if retire_turn_marker is not None:
+                            retire_turn_marker(session, st.marker_key, st.api_recovery_marker_key)
                 session.pop("_auto_continue_scheduled", None)
                 _emit_settled_session_info(sid, session, st.agent)
             finally:
                 _post_turn_housekeeping(sid, session, st)
-        return st.result, goal_followup
+        return st.result, goal_followup, (st.api_recovery_marker_key if st.api_recovery_auto_continue else "")
     def run():
         from agent.notification_presentation import notification_turn
         # _prepare_turn_input owns profile binding for the worker. The context
@@ -1246,7 +1462,8 @@ def _run_prompt_submit(
         with notification_policy_snapshot(agent, "tui", notification_config), notification_turn(agent, muted=muted, session_id=sid):
             followup = run_body()
         if followup is not None:
-            _run_post_turn_followups(rid, sid, session, *followup)
+            _run_post_turn_followups(rid, sid, session, followup[0], followup[1],
+                                     api_recovery_marker_key=followup[2])
     # The handle is resolved BEFORE _sessions_lock: a profile session opens its own SessionDB through the
     # state registry, and _sessions_lock gates every create/close/prompt on this backend.
     with _routing_provenance_db(session) as routing_db, _sessions_lock:

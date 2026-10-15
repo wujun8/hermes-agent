@@ -334,9 +334,12 @@ _BACKGROUND_NOTES = {
         "poll transcripts or artifacts to wait for them."
     ),
     "control_hint": (
-        "While a child runs you can orchestrate it live with this same tool: delegate_task(action='list') to see live "
-        "children, action='steer' with subagent_id + message to redirect one, action='stop' with subagent_id to end "
-        "one early."
+        "While a child runs, prefer action='steer' (subagent_id + message) "
+        "to redirect and close out; use action='list' to see live children; "
+        "reserve action='stop' for unsafe work, explicit cancel, unresponsive "
+        "children, or after one steer still not converging. Stop returns "
+        "status=interrupted (with a parent_stop marker when applicable), never "
+        "completed."
     ),
     "live_transcripts_hint": (
         "Each subagent streams a human-readable transcript of its operations to the file listed above (append-only, "

@@ -430,8 +430,16 @@ def _existing_profile_dir(name: str) -> tuple[str, Path]:
 
 
 def get_profile_dir(name: str) -> Path:
-    """Resolve a profile name to its HERMES_HOME directory."""
+    """Resolve a profile name to its HERMES_HOME directory.
+
+    This is the non-existence-checking resolver used by profile creation and
+    other APIs that need the destination path before the directory exists.  It
+    still validates the *canonical* single-component profile id before joining
+    it to the profiles root; callers handling ingress for an existing profile
+    must use :func:`resolve_profile_home` instead.
+    """
     canon = normalize_profile_name(name)
+    validate_profile_name(canon)
     if canon == "default":
         return _get_default_hermes_home()
     # The name becomes a path component under profiles/; refuse anything that
@@ -444,16 +452,75 @@ def get_profile_dir(name: str) -> Path:
     return _get_profiles_root() / canon
 
 
-def profile_exists(name: str) -> bool:
-    """Check whether a live (non-tombstoned) profile directory exists."""
-    try:
-        canon = normalize_profile_name(name)
-        profile_dir = get_profile_dir(canon)
-    except ValueError:
-        return False
+def resolve_profile_home(name: str, *, require_exists: bool = True) -> Path:
+    """Return a safe profile home for runtime/ingress use.
+
+    ``get_profile_dir`` intentionally supports creation of a not-yet-existing
+    profile.  This resolver is the stricter counterpart for code that is about
+    to bind ``HERMES_HOME`` or open profile state: it validates the canonical
+    id, resolves the profiles root and candidate, rejects symlink escapes, and
+    requires a real directory by default.  The built-in ``default`` profile is
+    always anchored to the authoritative default home and is never interpreted
+    relative to the named-profile root.
+
+    The returned path is resolved for existing named profiles so subsequent
+    consumers cannot accidentally re-enter a symlink that was validated only
+    lexically.  ``require_exists=False`` preserves the creation-friendly
+    behavior for callers that need a validated destination without opening it.
+    """
+    canon = normalize_profile_name(name)
+    validate_profile_name(canon)
+
     if canon == "default":
-        return True
-    return named_profile_is_live(profile_dir)
+        home = _get_default_hermes_home()
+        if not require_exists:
+            return home
+        try:
+            resolved_home = home.resolve(strict=True)
+        except FileNotFoundError as exc:
+            raise FileNotFoundError("default profile home does not exist") from exc
+        if not resolved_home.is_dir():
+            raise NotADirectoryError("default profile home is not a directory")
+        return resolved_home
+
+    profiles_root = _get_profiles_root()
+    candidate = profiles_root / canon
+    if named_profile_is_deleted(candidate):
+        raise FileNotFoundError("profile home is tombstoned")
+    if not require_exists:
+        return candidate
+
+    try:
+        resolved_root = profiles_root.resolve(strict=True)
+        resolved_candidate = candidate.resolve(strict=True)
+    except FileNotFoundError as exc:
+        raise FileNotFoundError("profile home does not exist") from exc
+
+    try:
+        resolved_candidate.relative_to(resolved_root)
+    except ValueError as exc:
+        # A valid lexical id can still name a symlink whose target is outside
+        # the profiles root.  Treat that exactly like an invalid runtime home.
+        raise ValueError("profile home is outside the profiles root") from exc
+    if not resolved_candidate.is_dir():
+        raise NotADirectoryError("profile home is not a directory")
+    if not named_profile_is_live(resolved_candidate):
+        raise FileNotFoundError("profile home has no live identity")
+    return resolved_candidate
+
+
+def profile_exists(name: str) -> bool:
+    """Return whether *name* resolves to a safe, existing profile directory.
+
+    This helper is deliberately fail-closed because many compatibility callers
+    use it as a boolean gate.  Invalid names, missing homes, filesystem errors,
+    and symlink escapes all return ``False`` rather than leaking an exception.
+    """
+    try:
+        resolve_profile_home(name, require_exists=True)
+    except (Exception, OSError):
+        return False
+    return True
 
 
 def profile_matches_home(name: str, home: Path | None = None) -> bool:
@@ -1167,11 +1234,31 @@ def profiles_to_serve(multiplex: bool, *, include_standalone: bool = False,
         logger.warning("Ignoring gateway.parked for the default profile; stop the host gateway instead")
         _parked_default_warned.add(default)
     if not multiplex:
-        return [(active, get_profile_dir(active))]
+        # ``custom`` means the process was launched with an authoritative
+        # HERMES_HOME outside the standard profile layout.  Keep the historical
+        # single-profile behavior rather than interpreting it as a named
+        # profile under ``profiles/custom``.
+        if active == "custom":
+            from hermes_constants import get_hermes_home
+
+            return [(active, Path(get_hermes_home()))]
+        return [(active, resolve_profile_home(active, require_exists=False))]
     serve: list[tuple[str, Path]] = [("default", default)]
-    serve.extend((entry.name, entry) for entry in _iter_named_profile_dirs()
-                 if (include_standalone or not profile_is_standalone(entry))
-                 and (include_parked or not profile_is_parked(entry)))
+    # ``gateway.multiplex_profile_allowlist`` was retired upstream (config v43), so the gate is
+    # gone; the local containment check stays: every served entry must resolve through the same
+    # runtime ingress resolver, which drops symlinked profile dirs pointing outside the root.
+    for entry in _iter_named_profile_dirs():
+        try:
+            canon = normalize_profile_name(entry.name)
+            validate_profile_name(canon)
+            home = resolve_profile_home(canon, require_exists=True)
+        except Exception:
+            continue
+        if not include_standalone and profile_is_standalone(home):
+            continue
+        if not include_parked and profile_is_parked(home):
+            continue
+        serve.append((canon, home))
     return serve
 
 

@@ -328,10 +328,13 @@ def _seed_row(record: dict) -> None:
 
 
 def _create_session(rid, params: dict, *, copy_parent_history: bool = False) -> dict:
-    """``session.create``; ``copy_parent_history`` (``session.branch_stored``) reads the parent's
-    transcript server-side and omits it from the reply."""
-    # ``profile`` (app-global remote mode): stored so the build and every turn re-bind HERMES_HOME.
-    profile_home = _profile_home(profile := (params.get("profile") or "").strip() or None)
+    """Create a draft or branch, resolving profile ownership before any state is written."""
+    profile = _requested_profile(params)
+    try:
+        profile_home = _profile_home(profile)
+    except ProfileUnavailableError as exc:
+        return _profile_unavailable_rpc_error(rid, exc)
+
     # Reject an incoherent model×provider pair BEFORE any state exists: minting it only defers the
     # failure to the first turn's provider 404 (#96817). Custom/unknown providers stay permissive.
     from .methods_session_model_guard import model_override_conflict
@@ -620,8 +623,13 @@ class _Resume:
         self.db, self.owns_db, self.found, self.profile_resume_cwd = None, False, None, ""
         self.cols = _int_param(params, "cols", 80)
         # ``profile`` (app-global remote mode): resume from another local profile's state.db.
-        self.profile = (params.get("profile") or "").strip() or None
-        self.profile_home = _profile_home(self.profile)
+        requested_profile = _requested_profile(params)
+        self.profile = (
+            requested_profile.strip()
+            if isinstance(requested_profile, str) and requested_profile.strip()
+            else None
+        )
+        self.profile_home = _profile_home(requested_profile)
         self.lazy, self.defer_history = _flag(params, "lazy"), _flag(params, "defer_history")
         # Desktop hydrates over REST; suppress the duplicate WS copy only when asked.
         self.omit_messages, self.eager_build = _flag(params, "omit_messages"), _flag(params, "eager_build")
@@ -654,9 +662,11 @@ class _Resume:
         return record
 
     def claim(self, sid: str, record: dict) -> dict | None:
-        """Register ``record`` live under the resume lock, or reuse a concurrent winner's session; then repair a
-        named profile's ROW like the eager build's ``_init_session`` (#87584) — listings and later resumes read it."""
-        if (live := _claim_or_reuse_live(sid, self.target, record, None)) is None and self.profile_home and not self.lazy:
+        """Register ``record`` live under the resume lock, or reuse a concurrent winner's session."""
+        live = _claim_or_reuse_live(sid, self.target, record, None)
+        if live is _SESSION_CONTROL_BUSY:
+            return _err(self.rid, 4009, _PLUGIN_SESSION_CONTROL_BUSY_MESSAGE)
+        if live is None and self.profile_home and not self.lazy:
             _hydrate_session_cwd(sid, self.target, self.db, self.profile_home)
         return None if live is None else _resume_reuse_live(self, *live)
 
@@ -866,21 +876,50 @@ def _resume_guard(ctx: _Resume) -> dict | None:
 
 
 def _resume_reuse_live(ctx: _Resume, sid: str, session: dict) -> dict:
-    """Reattach an already-live session under the resume lock (held across the client-gone check,
-    transport attach and reap cancel so grace expiry is atomic). _live_session_payload ATTACHES this
-    caller alongside the client(s) already streaming instead of taking the slot from them."""
+    """Reattach an already-live session under the resume lock, then build its DB-backed payload outside it.
+
+    The client-gone check, transport attach, and orphan-reap cancel are kept atomic; the payload attaches this
+    caller alongside clients already streaming instead of taking the session slot from them.
+    """
     with _session_resume_lock:
-        return _resume_reuse_live_locked(ctx, sid, session)
+        if (refusal := _resume_prepare_live_locked(ctx, sid, session)) is not None:
+            return refusal
+    return _resume_live_payload(ctx, sid, session)
 
 
-def _resume_reuse_live_locked(ctx: _Resume, sid: str, session: dict) -> dict:
-    """Reuse with _session_resume_lock already held (including the eager double-check)."""
+def _resume_prepare_live_locked(ctx: _Resume, sid: str, session: dict) -> dict | None:
+    """Validate and rebind a live session while ``_session_resume_lock`` is held."""
     if (refusal := _reattach_refusal(ctx.rid, sid, session)) is not None:
         return refusal
     _cancel_ws_orphan_reap(sid)  # unconditionally: the fast path must never race the reap Timer
-    payload = _live_session_payload(sid, session, cols=ctx.cols, touch=True, omit_messages=ctx.omit_messages,
-                                    transport=current_transport() or _stdio_transport,
-                                    inline_images=ctx.inline_images)
+    rebound = _live_session_payload(
+        sid,
+        session,
+        cols=ctx.cols,
+        touch=True,
+        omit_messages=True,
+        transport=current_transport() or _stdio_transport,
+        reject_session_control=True,
+        inline_images=ctx.inline_images,
+    )
+    if rebound is None:
+        return _err(ctx.rid, 4009, _PLUGIN_SESSION_CONTROL_BUSY_MESSAGE)
+    return None
+
+
+def _resume_live_payload(ctx: _Resume, sid: str, session: dict) -> dict:
+    """Build the possibly DB-backed response after releasing the global resume lock."""
+    payload = _live_session_payload(
+        sid,
+        session,
+        cols=ctx.cols,
+        touch=True,
+        omit_messages=ctx.omit_messages,
+        reject_session_control=True,
+        inline_images=ctx.inline_images,
+    )
+    if payload is None:
+        return _err(ctx.rid, 4009, _PLUGIN_SESSION_CONTROL_BUSY_MESSAGE)
     payload["resumed"] = ctx.target
     if ctx.defer_history:
         payload.update(messages=[], hydrating=bool(session.get("resume_hydrating")),
@@ -1007,39 +1046,43 @@ def _resume_eager(ctx: _Resume) -> dict:
         if live is not None:
             with contextlib.suppress(Exception):
                 agent.close()
-            return _resume_reuse_live_locked(ctx, *live)
-        try:
-            with _profile_build_scope(ctx.profile_home):
-                _init_session(sid, ctx.target, agent, history, cols=ctx.cols, cwd=ctx.profile_resume_cwd, session_db=ctx.db,
-                              source=source, profile_home=ctx.profile_home, explicit_cwd=bool(ctx.profile_resume_cwd))
-                # Ownership TRANSFER: the agent holds the handle for life (AIAgent.close() releases it). The
-                # owns_db drop is UNCONDITIONAL — the session is registered against the handle, so the finally
-                # must not close it even if the transfer was refused (a leak beats "closed database" every
-                # turn). Gated on owns_db: the SHARED launch handle must never move onto one session.
+            prepared = _resume_prepare_live_locked(ctx, *live)
+        else:
+            try:
+                with _profile_build_scope(ctx.profile_home):
+                    _init_session(sid, ctx.target, agent, history, cols=ctx.cols, cwd=ctx.profile_resume_cwd,
+                                  session_db=ctx.db, source=source, profile_home=ctx.profile_home,
+                                  explicit_cwd=bool(ctx.profile_resume_cwd))
+                    # Ownership TRANSFER: the agent holds the handle for life (AIAgent.close() releases it). The
+                    # owns_db drop is UNCONDITIONAL — the session is registered against the handle, so the finally
+                    # must not close it even if the transfer was refused (a leak beats "closed database" every
+                    # turn). Gated on owns_db: the SHARED launch handle must never move onto one session.
+                    if ctx.owns_db:
+                        _transfer_db_to_agent(agent, ctx.db)
+                    ctx.owns_db = False
+                if (session := _sessions.get(sid)) is not None:
+                    if stored_runtime_overrides.get("model_override") is not None:
+                        session["model_override"] = stored_runtime_overrides["model_override"]
+                    model_config = _parse_model_config(ctx.found.get("model_config"), quiet=True)
+                    if _row_follows_profile(ctx.found):
+                        session["follow_profile_config"] = True
+                        session["composer_override_profile"] = (
+                            model_config.get("composer_override_profile")
+                            if stored_runtime_overrides.get("model_override") else None)
+                    # Each turn re-binds HERMES_HOME (mid-turn memory/skills reads); lease claimed lazily on turn 1.
+                    if ctx.profile_home is not None:
+                        session["profile_home"] = str(ctx.profile_home)
+                    session.update(display_history_prefix=display_history_prefix, active_session_lease=None)
+            except Exception as e:
+                # _init_session registers _sessions[sid] BEFORE its first db read; left in place the fast path
+                # would serve that dead session forever.
                 if ctx.owns_db:
-                    _transfer_db_to_agent(agent, ctx.db)
-                ctx.owns_db = False
-            if (session := _sessions.get(sid)) is not None:
-                if stored_runtime_overrides.get("model_override") is not None:
-                    session["model_override"] = stored_runtime_overrides["model_override"]
-                model_config = _parse_model_config(ctx.found.get("model_config"), quiet=True)
-                if _row_follows_profile(ctx.found):
-                    session["follow_profile_config"] = True
-                    session["composer_override_profile"] = (
-                        model_config.get("composer_override_profile")
-                        if stored_runtime_overrides.get("model_override") else None)
-                # Each turn re-binds HERMES_HOME (mid-turn memory/skills reads); lease claimed lazily on turn 1.
-                if ctx.profile_home is not None:
-                    session["profile_home"] = str(ctx.profile_home)
-                session.update(display_history_prefix=display_history_prefix, active_session_lease=None)
-        except Exception as e:
-            # _init_session registers _sessions[sid] BEFORE its first db read; left in place the fast path
-            # would serve that dead session forever.
-            if ctx.owns_db:
-                with _sessions_lock:
-                    _sessions.pop(sid, None)
-            return _err(ctx.rid, 5000, resume_failed_message(e))
-        session = _sessions.get(sid) or {}
+                    with _sessions_lock:
+                        _sessions.pop(sid, None)
+                return _err(ctx.rid, 5000, resume_failed_message(e))
+            session = _sessions.get(sid) or {}
+    if live is not None:
+        return prepared if prepared is not None else _resume_live_payload(ctx, *live)
     return _resume_response(
         ctx, sid, session, info=_session_info(agent, session), display=display_history, count_source=raw_history,
         started_at=float(session.get("created_at") or time.time()),
@@ -1048,6 +1091,12 @@ def _resume_eager(ctx: _Resume) -> dict:
 
 @method("session.resume")
 def _(rid, params: dict) -> dict:
+    profile = _requested_profile(params)
+    try:
+        _profile_home(profile)
+    except ProfileUnavailableError as exc:
+        return _profile_unavailable_rpc_error(rid, exc)
+
     if not (target := params.get("session_id", "")):
         return _err(rid, 4006, "session_id required")
     ctx = _Resume(rid, params, target)
@@ -1172,6 +1221,11 @@ def _(rid, params: dict, session: dict) -> dict:
 @method("session.delete")
 def _(rid, params: dict) -> dict:
     """Delete a stored session + transcripts; refused while live here (FK trips on the agent's next flush)."""
+    profile = _requested_profile(params)
+    try:
+        profile_home = _profile_home(profile)
+    except ProfileUnavailableError as exc:
+        return _profile_unavailable_rpc_error(rid, exc)
     from agent.onboarding_record import delete_chat
     from hermes_state_errors import SessionActiveWriteGuardError  # body runs on server.py globals
 
@@ -1182,7 +1236,6 @@ def _(rid, params: dict) -> dict:
         return err
     if any(s.get("session_key") == target for _sid, s in snapshot):
         return _err(rid, 4023, "cannot delete an active session")
-    profile_home = _profile_home((params.get("profile") or "").strip() or None)
     with _profile_db(params, writer=True) as db:
         if db is None:
             return _db_unavailable_error(rid, code=5036)
@@ -2051,88 +2104,6 @@ def _save_via_compute_host(rid, params: dict) -> dict:
     return _ok(rid, result)
 
 
-def _compress_via_compute_host(rid, params: dict, session: dict) -> dict:
-    """``session.compress`` for a turn-isolated session: forward ``/compress`` to the host."""
-    sid = str(params.get("session_id") or "")
-    focus_topic = _str_param(params, "focus_topic")
-
-    def _on_late_ack(late: dict, _sid=sid) -> None:
-        _adopt_late_compute_host_compress_ack(_sid, session, late, route_name="session.compress")
-    try:
-        ack = _send_compute_host_control(
-            sid, route_name="session.compress", command="/compress" + (f" {focus_topic}" if focus_topic else ""),
-            # compression.context_total_ceiling_seconds: the host legitimately runs that long.
-            wait=True, timeout=_compute_host_compress_wait_seconds(), on_late_ack=_on_late_ack)
-    except queue.Empty:
-        # Waiter gave up, host still compressing; the late-ack handler adopts the rotated session when it
-        # lands. Not an error (a 5019 here reported timeouts that later succeeded).
-        return _ok(rid, {"status": "pending", "turn_isolation": True,
-                         "message": ("compression still running in the background; "
-                                     "the transcript will refresh when it finishes")})
-    except Exception as exc:
-        return _err(rid, 5019, f"compute-host compress failed: {exc}")
-    if (resp := _compute_host_ack_error(rid, ack, 4009, "compute-host compress failed")) is not None:
-        return resp
-    _apply_compute_host_metadata_mirror(session, ack)
-    if isinstance(host_result := ack.get("result"), dict):
-        # Host-owned result verbatim (carries `status: aborted` / `summary.aborted`).
-        return _ok(rid, {**host_result, "turn_isolation": True})
-    host_info = ack.get("session_info") if isinstance(ack.get("session_info"), dict) else {}
-    return _ok(rid, {
-        "status": "compressed", "turn_isolation": True,
-        # `messages` goes top-level for the transcript replacement; don't duplicate it in the ack.
-        "host_ack": {key: value for key, value in ack.items() if key != "messages"}, "info": host_info,
-        "messages": _history_to_messages(ack.get("messages"), profile_home=session.get("profile_home")) if isinstance(ack.get("messages"), list) else [],
-        "usage": host_info.get("usage") if isinstance(host_info.get("usage"), dict) else {}})
-
-
-def _compress_live(rid, sid: str, session: dict, focus_topic: str) -> dict:
-    """In-process ``session.compress``: status pinned "compressing", then the before/after summary + messages."""
-    from agent.conversation_compression import finalize_context_engine_compression_notification
-    from agent.manual_compression_feedback import summarize_manual_compression
-    from agent.model_metadata import estimate_request_tokens_rough
-    with session["history_lock"]:
-        before_messages = list(session.get("history", []))
-        history_version = int(session.get("history_version", 0))
-    before_count = len(before_messages)
-    _agent = session["agent"]
-    _sys_prompt = getattr(_agent, "_cached_system_prompt", "") or ""
-    _tools = getattr(_agent, "tools", None) or None
-
-    def _tokens(msgs) -> int:
-        # Re-reads prompt + tools each call: _compress_context may have rebuilt the system prompt.
-        sys_prompt = getattr(_agent, "_cached_system_prompt", "") or _sys_prompt
-        tools = getattr(_agent, "tools", None) or _tools
-        return estimate_request_tokens_rough(msgs, system_prompt=sys_prompt, tools=tools) if msgs else 0
-    before_tokens = _tokens(before_messages)
-    if before_count >= 4:
-        focus_suffix = f', focus: "{focus_topic}"' if focus_topic else ""
-        _status_update(sid, "compressing",
-                       f"⠋ compressing {before_count} messages (~{before_tokens:,} tok){focus_suffix}…")
-    try:
-        removed, usage = _compress_session_history(
-            session, focus_topic, approx_tokens=before_tokens, before_messages=before_messages,
-            history_version=history_version)
-        with session["history_lock"]:
-            messages = list(session.get("history", []))
-        after_tokens = _tokens(messages)
-        agent = session["agent"]
-        _sync_session_key_after_compress(sid, session)
-        summary = summarize_manual_compression(before_messages, messages, before_tokens, after_tokens,
-                                               compression_state=getattr(agent, "context_compressor", None))
-        info = _session_info(agent, session)
-        _emit("session.info", sid, info)
-        finalize_context_engine_compression_notification(agent, committed=True)
-        return _ok(rid, {
-            "status": "aborted" if summary["aborted"] else "compressed", "removed": removed,
-            "before_messages": before_count, "after_messages": len(messages),
-            "before_tokens": before_tokens, "after_tokens": after_tokens, "summary": summary,
-            "usage": usage, "info": info, "messages": _history_to_messages(messages, profile_home=session.get("profile_home"))})
-    finally:
-        # Always clear the pinned compressing status (success, no-op, or raise).
-        _status_update(sid, "ready")
-
-
 @method("session.compress")
 @_profile_scoped
 def _(rid, params: dict) -> dict:
@@ -2141,23 +2112,14 @@ def _(rid, params: dict) -> dict:
         return err
     if _session_uses_compute_host(session):
         return _compress_via_compute_host(rid, params, session)
-    session, err = _sess(params, rid)
-    if err:
-        return err
-    sid = params.get("session_id", "")
+    assert session is not None
+    control_token, claim_error = _claim_manual_compression_control(session)
+    if claim_error is not None:
+        return _err(rid, 4009, _manual_compression_busy_text(claim_error))
     try:
-        with _manual_compress_turn(sid, session):
-            return _compress_live(rid, sid, session, _str_param(params, "focus_topic"))
-    except CompressionBusy as e:
-        return _err(rid, 4009, str(e))
-    except CompressionLockHeld as e:
-        _status_update(sid, "ready")
-        from agent.manual_compression_feedback import describe_compression_lock_skip
-        return _ok(rid, {"compressed": False, "lock_held": True, "message": describe_compression_lock_skip(e.holder)})
-    except Exception as e:
-        from agent.conversation_compression import finalize_context_engine_compression_notification
-        finalize_context_engine_compression_notification(session["agent"], committed=False)
-        return _err(rid, 5005, str(e))
+        return _run_session_compression(rid, params, session, control_token)
+    finally:
+        _release_session_control(session, control_token)
 
 
 @_session_method("session.save", live=True)
@@ -2196,6 +2158,8 @@ def _(rid, params: dict, session: dict) -> dict:
 def _(rid, params: dict) -> dict:
     with _session_resume_lock:  # lock only the ownership claim; finalization must not block resumes
         session = _pop_session_by_id(params.get("session_id", ""))
+    if session is _SESSION_CONTROL_BUSY:
+        return _err(rid, 4009, _PLUGIN_SESSION_CONTROL_BUSY_MESSAGE)
     return _ok(rid, {"closed": _teardown_popped_session(session, end_reason="tui_close"), "messages": list((session or {}).get("_end_msgs") or [])})
 
 

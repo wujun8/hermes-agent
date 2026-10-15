@@ -167,6 +167,65 @@ You can also set `providers.<id>.stale_timeout_seconds` for the non-streaming st
 
 Leaving these unset keeps the legacy defaults (`HERMES_API_TIMEOUT=1800`s, `HERMES_API_CALL_STALE_TIMEOUT=90`s, native Anthropic 900s). The non-streaming stale detector is auto-disabled for local endpoints when left implicit and can scale upward for very large contexts. Not currently wired for AWS Bedrock (both `bedrock_converse` and AnthropicBedrock SDK paths use boto3 with its own timeout configuration). See the commented example in [`cli-config.yaml.example`](https://github.com/NousResearch/hermes-agent/blob/main/cli-config.yaml.example).
 
+### API Retry Status
+
+Hermes retries transient API failures according to `agent.api_max_retries` and normally buffers retry/fallback status messages unless all recovery attempts fail. To display every retry status immediately while the request is still running, enable:
+
+```yaml
+agent:
+  show_retry_status: true   # default: false
+```
+
+You can also run `hermes config set agent.show_retry_status true`. Live messages are not buffered, so a final failure does not display the same retry status twice.
+
+### Active-turn API outage recovery
+
+Hermes can optionally keep an active turn parked in memory when transient
+provider failures (`server_error`, overload, or timeout) exhaust retries and
+all configured fallbacks. It periodically runs an external readiness command;
+after that command exits successfully, Hermes retries the same model boundary
+without adding a synthetic message or replaying completed tool calls.
+
+```yaml
+agent:
+  api_outage_recovery:
+    enabled: true                 # default: false
+    probe_command: /path/to/check-provider --ready
+    probe_interval_seconds: 600   # minimum: 10
+    probe_timeout_seconds: 60     # minimum: 1
+```
+
+`enabled: true` requires a nonempty `probe_command`. If the command is empty or
+only whitespace, outage recovery is effectively disabled and exhausted API
+failures keep their existing terminal behavior.
+
+The probe command is executed directly with `shell=False`; shell syntax is not
+interpreted, so pipes, redirection, globbing, and operators such as `&&` do not
+work. Put multi-step logic in an executable script. To supply environment
+variables without a shell, use a command such as
+`/usr/bin/env FOO=bar /path/to/check-provider --ready`. Probe stdout and stderr
+are discarded and never added to the conversation or normal logs.
+
+The probe must test the endpoint for the provider/runtime that is active when
+Hermes parks. After a fallback chain is exhausted, that is currently the last
+active fallback, not automatically the primary provider. A single probe command
+may therefore be unable to represent every endpoint in a heterogeneous fallback
+chain; use a script that checks the relevant routes or leave this feature
+disabled for that chain.
+
+Parked turns and probe-throttle timestamps exist only in process memory and are
+**not durable**. Restarting the Hermes process, gateway, or machine discards the
+parked turn rather than resuming it.
+
+Probe throttling is per Agent instance, not process-global. Concurrent sessions
+and subagents each have an independent Agent and may therefore run the same
+read-only probe during the same interval; Hermes does not coordinate or dedupe
+probes across Agents.
+
+Authentication, billing, rate-limit, request-format, content-policy, and unknown
+failures keep their existing terminal behavior. Interrupting a parked turn
+cancels it as an interruption rather than an API failure.
+
 ## Update Behavior
 
 ### Background checks
@@ -740,6 +799,19 @@ Use the opt-in only when you intentionally want the container to work on live ho
 
 A host path in `terminal.cwd` (for example `C:\Users\me\project` on Windows, or a desktop/TUI session's workspace) never becomes the container's working directory: when it is the directory mounted at `/workspace`, file tools and terminal commands use `/workspace`; otherwise the container keeps its own working directory. If a file tool still cannot enter its working directory, the error names the invalid `terminal.cwd` for the active backend rather than the shell's raw `cd:` line.
 
+### Trust mounted Docker approvals
+
+Set this opt-in only when you accept that commands can modify live host files:
+
+```yaml
+approvals:
+  trust_mounted_docker: true
+```
+
+With the literal YAML value `true`, Hermes trusts **all detected Docker bind mounts**, including mounts configured through `docker_volumes`, not only the current-project mount from `docker_mount_cwd_to_workspace`. If you want current-project-only use, set `docker_volumes: []` and enable `docker_mount_cwd_to_workspace` explicitly.
+
+This trust removes normal interactive/gateway approval prompts for mounted Docker terminal commands and skips the whole-script prompt for trusted Docker `execute_code`. The `cron_mode`, `single_query_mode`, and `unattended_mode` approval policies still apply and can deny these actions. Trusted Docker `execute_code` can mutate any mounted files through Python APIs, including changes that are outside shell-string `approvals.deny` visibility; use this setting only for mounts you are willing to expose to arbitrary code. Hardline blocks, `approvals.deny`, and the unconditional `sudo -S` guard remain enforced.
+
 ### Persistent Shell
 
 Every terminal command on the **local** and **SSH** backends runs in a fresh `bash` process. Hermes captures your login shell's environment once (PATH, exports from your profile, functions, aliases) and starts the first command from that snapshot. With the setting off, every command starts from it. With the setting on, each command saves its exported variables for the next one, and that saved copy holds exported variables only, so profile functions and aliases are gone after the first command.
@@ -1139,7 +1211,7 @@ The gateway runs a notify-only stall watchdog (`agent.session_stall_timeout`, de
 
 Semantics:
 
-- **Notify-only.** The watchdog never kills the turn — contrast `agent.gateway_timeout`, which cancels a run after prolonged inactivity. The stall notice just tells you the agent looks wedged so you can decide (`/new`, `/stop`, or keep waiting).
+- **Notify-only.** The watchdog never kills the turn — contrast `agent.gateway_timeout`, an inactivity timeout that cancels a run only after prolonged inactivity. It is not a whole-turn wall-clock limit: active tool calls and API progress keep the run alive. The stall notice just tells you the agent looks wedged so you can decide (`/new`, `/stop`, or keep waiting).
 - **One notification per stall episode.** The latch clears when the pending inbound drains or activity resumes, so a session that recovers and stalls again notifies again.
 - Progress comes only from the shared activity snapshot (tool calls, API stream progress, compression heartbeats). Pending inbound is a notify gate, not a progress clock.
 
@@ -2886,6 +2958,23 @@ Smart mode is particularly useful for reducing approval fatigue — it lets the 
 Setting `approvals.mode: off` disables all safety checks for terminal commands. Only use this in trusted, sandboxed environments.
 :::
 
+### Trusting a mounted Docker workspace
+
+Docker normally keeps the approval gate enabled when a host path is mounted
+into the container, because commands in that workspace can change host files.
+If the mounted Docker environment is intentionally trusted, opt in explicitly:
+
+```yaml
+approvals:
+  trust_mounted_docker: true
+```
+
+This setting is disabled by default and is accepted only when the YAML value is
+the literal boolean `true`. It applies only to the Docker backend when Hermes
+has detected host-path access; it does not change approval behavior for other
+backends. The unconditional hardline blocklist and any `approvals.deny` rules
+still block matching commands.
+
 ### Denial circuit breaker
 
 `approvals.denial_breaker_threshold` (default `3`) guards against the agent retrying variations of a command the smart-approval reviewer keeps denying — each retry burns another guardian LLM call. After that many consecutive denials in a session, the deny message escalates to a hard-stop instruction telling the agent to stop, report the blocked operation, and ask you to run it manually or `/approve`. Any approval resets the count; set `0` to disable:
@@ -2954,7 +3043,7 @@ delegation:
   oneshot_max_children: 2                   # Total subagents a one-shot run (hermes chat -q / --oneshot) may spawn; 0 = unlimited. Interactive and gateway sessions are never capped by this.
 ```
 
-**Subagent provider:model override:** By default, subagents inherit the parent agent's provider and model. Set `delegation.provider` and `delegation.model` to route subagents to a different provider:model pair — e.g., use a cheap/fast model for narrowly-scoped subtasks while your primary agent runs an expensive reasoning model.
+**Subagent provider:model override:** Subagents inherit the parent agent's provider and model when no override is set. Set `delegation.provider` and `delegation.model` to route subagents to a different provider:model pair — e.g., use a cheap/fast model for narrowly-scoped subtasks while your primary agent runs an expensive reasoning model.
 
 **Subagent fallback chain:** Set `delegation.fallback_providers` to give workers their own chain (same entry shape as the top-level list). An explicitly pinned child (by provider, endpoint, or model) uses that chain only when it is declared; otherwise it fails loudly instead of borrowing the parent agent's route. For an unpinned child, an absent or `null` setting preserves parent-chain inheritance. Use `fallback_providers: []` under `delegation:` to disable child fallback entirely.
 

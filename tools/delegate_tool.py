@@ -25,9 +25,11 @@ logger = logging.getLogger(__name__)
 # The delegate_tool_* siblings hold the pieces split out of this module; every name callers or patching tests reach as
 # ``tools.delegate_tool.<name>`` is re-imported here. Mutable flag globals live only in their owning module.
 from tools.delegate_tool_child_run import (
-    _ChildRun, _attach_child, _build_child_goal_message, _build_result_entry, _dump_subagent_timeout_diagnostic, _fabricated_entry,
-    _lease_child_credential, _merge_late_steer, _register_child, _start_heartbeat, _validate_child_output_schema,
+    _ChildActiveTimeout, _ChildRun, _attach_child, _build_child_goal_message, _build_result_entry,
+    _dump_subagent_timeout_diagnostic, _fabricated_entry, _is_live_api_outage_wait, _lease_child_credential,
+    _merge_late_steer, _register_child, _start_heartbeat, _validate_child_output_schema, _wait_for_child_result,
 )
+from tools.delegate_tool_routes import resolve_delegation_route
 from tools.delegate_tool_config import (
     _DEFAULT_MAX_CONCURRENT_CHILDREN, _get_child_timeout, _get_max_async_children, _get_max_concurrent_children,
     _get_max_spawn_depth, _get_oneshot_max_children, _get_orchestrator_enabled, _get_subagent_approval_callback, _get_worktree_isolation,
@@ -104,6 +106,8 @@ def _normalize_role(r: Optional[str]) -> str:
 
 DEFAULT_MAX_ITERATIONS = 250
 _HEARTBEAT_INTERVAL = 30  # seconds between parent activity heartbeats during delegation
+_API_OUTAGE_ACTIVITY_FRESHNESS = 90.0
+_CHILD_RESULT_POLL_INTERVAL = 0.25
 # Stale-heartbeat thresholds (cycles of _HEARTBEAT_INTERVAL with no progress). Progress = iteration, current_tool OR
 # last_activity_ts advancing; an in-flight model wait refreshes last_activity_ts, so slow models are not "idle". Idle
 # stays tight so a truly wedged child doesn't mask the gateway timeout; in-tool is much higher so legitimately long
@@ -535,7 +539,9 @@ def delegate_task(
     # the route and its fallback policy together through child construction.
     routing_cfg = credentials_cfg if credentials_cfg is not None else cfg
     try:
-        creds = _resolve_delegation_credentials(routing_cfg, parent_agent)
+        routing_cfg, creds = resolve_delegation_route(
+            routing_cfg, parent_agent, allow_selectors=credentials_cfg is None,
+        )
     except ValueError as exc:
         # Explicit-pin preflight failures (e.g. pinned delegation.command missing from PATH) refuse the
         # spawn loudly (#80450).
@@ -619,32 +625,31 @@ def _build_top_level_description(*, independent_completions=None) -> str:
     return _DESCRIPTION_HEAD.format(delivery=delivery) + restrictions_rule + _DESCRIPTION_TAIL
 
 _DESCRIPTION_HEAD = (
-    "Spawn subagents in isolated contexts; each gets its own conversation, terminal session, and toolset, and only its "
-    "final summary returns to you. Pass every task in `tasks` — one entry spawns one subagent, several run in parallel "
-    "(limit in the tasks description).\n\n"
+    "Spawn subagents with isolated conversations, terminal sessions, and toolsets; only final summaries return. "
+    "Pass tasks in `tasks`: one entry per child, several run in parallel (limit in tasks description).\n\n"
     "Sessions without a later-result consumer (including one-shot CLI and cron) join parallel children "
     "and return results in this tool call. "
     "Otherwise runs in the background: dispatch returns live transcript paths and results re-enter "
     "as a new message when subagents finish ({delivery}). Background results are delivered only "
     "BETWEEN your turns: finish whatever does not depend on them, then give a one-line status and END YOUR TURN. Never "
     "wait or poll on transcripts, artifact files, or CI for a child. "
-    "While children run, `action` (list/steer/stop) controls them live.\n\n"
-    "USE FOR: reasoning-heavy subtasks, work that would flood your context, or independent parallel workstreams.\n"
+    "While children run, `action` (list/steer/stop) controls them live. Prefer steer first when a child drifts: use it "
+    "for narrowing scope, preserving artifacts, outdated work, or takeover, and require the next response to close. "
+    "After one steer still not converging, or for unsafe work, explicit cancel, or an unresponsive child, use stop. "
+    "Stop returns interrupted (with a parent_stop marker when applicable), never completed.\n\n"
+    "USE FOR: reasoning-heavy subtasks, context-heavy research, or independent parallel work.\n"
     "DO NOT USE FOR (use these instead):\n"
-    "- Mechanical multi-step work with no reasoning needed -> execute_code\n"
-    "- A single tool call -> call the tool directly\n"
-    "- Tasks needing user interaction -> subagents cannot ask questions\n"
-    "- Durable work that must survive this session -> cronjob or terminal(background=True, notify=True); /stop, /new, "
-    "or process exit halts running subagents (whole tree); each returns an 'interrupted' completion with partial output.\n\n"
+    "- Mechanical multi-step work -> execute_code\n"
+    "- A single tool call -> call it directly\n"
+    "- User interaction -> subagents cannot ask questions\n"
+    "- Durable work -> cronjob or terminal(background=True, notify=True); /stop, /new, or process exit discards "
+    "running subagents (whole tree), returning interrupted completions with partial output.\n\n"
     "RULES:\n"
-    "- Children know nothing of this conversation: pass everything needed via 'context', including any required "
-    "output language, tone, or style (e.g. \"respond in Chinese\").\n"
-    "- Child summaries are SELF-REPORTS, not verified facts: a child claiming \"uploaded successfully\" or "
-    "\"file written\" may be wrong. For external side effects (uploads, remote writes, publishing), require a "
-    "verifiable handle (URL, ID, absolute path) and verify it yourself before telling the user the operation "
-    "succeeded.\n"
-    "- Children cannot close tracked work: a child asked to close it returns findings instead; "
-    "the parent applies the transition.\n"
+    "- Children lack this conversation: pass everything needed via `context`, including language, tone, or "
+    "style (e.g. \"respond in Chinese\").\n"
+    "- Child summaries are SELF-REPORTS, not verified facts. For external side effects, require a verifiable handle "
+    "(URL, ID, absolute path) and verify it yourself before reporting success.\n"
+    "- Children cannot close tracked work: they return findings; the parent applies the transition.\n"
 )
 _DESCRIPTION_TAIL = (
     "- Children inherit the parent model unless pinned via delegation.provider / delegation.model in config.yaml."

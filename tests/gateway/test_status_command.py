@@ -617,6 +617,7 @@ async def test_profile_command_reports_source_stamped_profile(monkeypatch, tmp_p
     )
     runner = _make_runner(session_entry)
     runner.config.multiplex_profiles = True
+    runner._served_profile_names = {"default", "milo"}
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
 
     event = _make_event("/profile")

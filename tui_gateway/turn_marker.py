@@ -112,15 +112,30 @@ def _update(home: Path | str, session_key: str, mutate, what: str) -> None:
         logger.debug("failed to %s turn marker for %s", what, session_key, exc_info=True)
 
 
-def record_turn_start(home: Path | str, session_key: str, prompt: str, *, attempts: int = 0,
-                      auto_continue: bool = True, notification_category: str | None = None) -> None:
+def record_turn_start(
+    home: Path | str,
+    session_key: str,
+    prompt: str,
+    *,
+    attempts: int = 0,
+    resume_reason: str | None = None,
+    auto_continue: bool = True,
+    notification_category: str | None = None,
+) -> None:
     """Persist the marker for a turn that is about to run. ``attempts`` = how many auto-continues led to
     this run (0 for a user-initiated turn); the crash-loop breaker reads it back on the next resume."""
     if not session_key or not prompt:
         return
     now = time.time()
-    entry = {"attempts": max(0, int(attempts)), "prompt": prompt[:_MAX_PROMPT_CHARS], "started_at": now,
-             "auto_continue": bool(auto_continue), **_writer_identity()}
+    entry = {
+        "attempts": max(0, int(attempts)),
+        "prompt": prompt[:_MAX_PROMPT_CHARS],
+        "started_at": now,
+        "auto_continue": bool(auto_continue),
+        **_writer_identity(),
+    }
+    if resume_reason:
+        entry["resume_reason"] = str(resume_reason)
     if notification_category == "diagnostic":
         entry["notification_category"] = notification_category
     # Identity only — never the prompt: this log is read on crash triage and must not carry turn content.
@@ -144,11 +159,15 @@ def read_turn_marker(home: Path | str, session_key: str) -> dict[str, Any] | Non
         prompt = str(entry.get("prompt") or "") if isinstance(entry, dict) else ""
         if not prompt.strip():
             return None
-        return {"attempts": max(0, int(entry.get("attempts") or 0)), "prompt": prompt, "started_at": _started_at(entry),
-                "auto_continue": bool(entry.get("auto_continue", True)),
-                # Writer identity when present: extra keys only, so a marker written by an older build still reads.
-                **{k: entry[k] for k in ("writer_pid", "writer_start_time") if entry.get(k) is not None},
-                **({"notification_category": "diagnostic"}
-                   if entry.get("notification_category") == "diagnostic" else {})}
+        return {
+            "attempts": max(0, int(entry.get("attempts") or 0)),
+            "prompt": prompt,
+            "started_at": _started_at(entry),
+            "resume_reason": str(entry.get("resume_reason")) if entry.get("resume_reason") else None,
+            "auto_continue": bool(entry.get("auto_continue", True)),
+            **{k: entry[k] for k in ("writer_pid", "writer_start_time") if entry.get(k) is not None},
+            **({"notification_category": "diagnostic"}
+               if entry.get("notification_category") == "diagnostic" else {}),
+        }
     except Exception:
         return None

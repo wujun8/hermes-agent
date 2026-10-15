@@ -1535,6 +1535,9 @@ def register(ctx):
     ctx.register_command("check", handler=_handle_check, description="Run async check")
 ```
 
+For durable session policies and host-authorized state commands, see [Session command plugins](../session-command-plugin.md).
+For credential-free selection of newly dispatched subagents, see [Delegation route plugins](../delegation-route-plugin.md).
+
 ### Dispatch tools from slash commands
 
 Slash command handlers that need to orchestrate tools (spawn a subagent via `delegate_task`, call `file_edit`, etc.) should use `ctx.dispatch_tool()` instead of reaching into framework internals. The parent-agent context (workspace hints, spinner, model inheritance) is wired up automatically.
@@ -2088,6 +2091,8 @@ Rules:
   selected. For any other provider they report its `is_available()` and run its `doctor()` if it has one.
 - Providers return live driver sessions, so they load in-process only. Under
   `plugins.isolation: host`, a user provider is refused and the call reports that it could not be loaded.
+
+For durable session policies and host-authorized state commands, see [Session command plugins](../session-command-plugin.md).
 
 ## Non-Python extension surfaces
 

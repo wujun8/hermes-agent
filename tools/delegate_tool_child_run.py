@@ -218,6 +218,69 @@ def _dump_subagent_timeout_diagnostic(
         logger.warning("Subagent timeout diagnostic dump failed: %s", exc)
         return None
 
+
+def _is_live_api_outage_wait(child: Any, *, now: Optional[float] = None) -> bool:
+    """Return whether ``child`` is actively reporting an API recovery wait.
+
+    The flag alone is insufficient: a wedged child could leave it set forever.
+    A recent wall-clock activity touch is therefore required as a fail-closed
+    liveness signal.
+    """
+    if getattr(child, "_api_outage_waiting", False) is not True:
+        return False
+    last_activity = getattr(child, "_last_activity_ts", None)
+    if isinstance(last_activity, bool) or not isinstance(last_activity, (int, float)):
+        return False
+    from tools.delegate_tool import _API_OUTAGE_ACTIVITY_FRESHNESS
+    age = (time.time() if now is None else now) - float(last_activity)
+    return 0.0 <= age <= _API_OUTAGE_ACTIVITY_FRESHNESS
+
+
+class _ChildActiveTimeout(FuturesTimeoutError):
+    """The delegation active-time budget expired (not a child exception)."""
+
+
+def _wait_for_child_result(
+    future: Any,
+    child: Any,
+    timeout: Optional[float],
+    *,
+    poll_interval: Optional[float] = None,
+):
+    """Wait for a child while charging only active time to its timeout.
+
+    API-outage recovery waits pause the budget only while their activity touch
+    remains fresh. Polling also lets a cleared flag resume the existing budget
+    rather than granting a new timeout window.
+    """
+    if timeout is None:
+        return future.result()
+
+    if poll_interval is None:
+        from tools.delegate_tool import _CHILD_RESULT_POLL_INTERVAL
+        poll_interval = _CHILD_RESULT_POLL_INTERVAL
+    from tools.delegate_tool import _is_live_api_outage_wait as _live_api_outage_wait
+    remaining = float(timeout)
+    last_poll = time.monotonic()
+    while True:
+        live_outage_before = _live_api_outage_wait(child)
+        if not live_outage_before and remaining <= 0:
+            raise _ChildActiveTimeout()
+        wait_seconds = poll_interval if live_outage_before else min(poll_interval, max(remaining, 0.0))
+        try:
+            return future.result(timeout=wait_seconds)
+        except FuturesTimeoutError:
+            # ``TimeoutError`` may be the child's real exception. A completed
+            # future distinguishes that from our polling deadline.
+            if future.done():
+                return future.result()
+            now_mono = time.monotonic()
+            elapsed = now_mono - last_poll
+            if not (live_outage_before and _live_api_outage_wait(child)):
+                remaining -= elapsed
+            last_poll = now_mono
+
+
 # ── Per-run helpers ──────────────────────────────────────────────────────────
 
 # Granularity for re-checking a child's progress while a configured ``child_timeout_seconds`` budget runs.
@@ -302,22 +365,34 @@ class _Heartbeat:
             return None
         desc = f"delegate_task: subagent {task_index} working"
         try:
+            from tools.delegate_tool import _is_live_api_outage_wait as _live_api_outage_wait
+            live_outage_wait = _live_api_outage_wait(child)
+            if live_outage_wait:
+                desc = "delegate_task: subagent waiting for API recovery"
             child_summary = child.get_activity_summary()
             child_tool = child_summary.get("current_tool")
             child_iter = child_summary.get("api_call_count", 0)
             child_max = child_summary.get("max_iterations", 0)
             child_activity_ts = child_summary.get("last_activity_ts")
-            # A slow model wait refreshes last_activity_ts (direct_api_call
-            # heartbeat), so it never looks stale at the idle threshold.
-            activity_advanced = child_activity_ts is not None and (
-                last_seen["ts"] is None or child_activity_ts > last_seen["ts"]
-            )
-            if child_iter > last_seen["iter"] or child_tool != last_seen["tool"] or activity_advanced:
+            if live_outage_wait:
+                # API recovery is intentional idle time. Fresh activity
+                # touches prove liveness, so it must not accrue stale cycles.
                 last_seen.update(iter=child_iter, tool=child_tool, stale=0)
                 if child_activity_ts is not None:
                     last_seen["ts"] = child_activity_ts
+                desc += f" (iteration {child_iter}/{child_max})"
             else:
-                last_seen["stale"] += 1
+                # A slow model wait refreshes last_activity_ts (direct_api_call
+                # heartbeat), so it never looks stale at the idle threshold.
+                activity_advanced = child_activity_ts is not None and (
+                    last_seen["ts"] is None or child_activity_ts > last_seen["ts"]
+                )
+                if child_iter > last_seen["iter"] or child_tool != last_seen["tool"] or activity_advanced:
+                    last_seen.update(iter=child_iter, tool=child_tool, stale=0)
+                    if child_activity_ts is not None:
+                        last_seen["ts"] = child_activity_ts
+                else:
+                    last_seen["stale"] += 1
             stale_cycles = _HEARTBEAT_STALE_CYCLES_IN_TOOL if child_tool else _HEARTBEAT_STALE_CYCLES_IDLE
             if last_seen["stale"] >= stale_cycles:
                 logger.warning(
@@ -328,9 +403,9 @@ class _Heartbeat:
                 self.stale_threshold_seconds = stale_cycles * _HEARTBEAT_INTERVAL
                 self.settled.set()
                 return False
-            if child_tool:
+            if not live_outage_wait and child_tool:
                 desc = f"delegate_task: subagent running {child_tool} (iteration {child_iter}/{child_max})"
-            elif child_summary.get("last_activity_desc", ""):
+            elif not live_outage_wait and child_summary.get("last_activity_desc", ""):
                 desc = f"delegate_task: subagent {child_summary.get('last_activity_desc', '')} (iteration {child_iter}/{child_max})"
         except Exception:
             pass
@@ -554,14 +629,60 @@ def _build_result_entry(
 ) -> dict[str, Any]:
     """Parent-visible result entry (status, exit_reason, tool trace, tokens, cost).
     ``status``/``exit_reason``/``truncated`` follow the ``_run_single_child`` contract; a structured failure always
-    wins over the summary-presence heuristic (a fallback for legacy/mock results only)."""
+    wins over the summary-presence heuristic (a fallback for legacy/mock results only). Parent-control stops use
+    ``exit_reason=parent_stop`` while ordinary external interrupts remain ``interrupted``."""
     summary = result.get("final_response") or ""
     # "(empty)" is run_agent's give-up sentinel after repeated empty LLM
     # responses (usually a transport bug) — a failure, not a success.
     usable_summary = bool(summary) and summary.strip() != "(empty)"
     interrupt_note = ""
+    raw_turn_exit = result.get("turn_exit_reason")
+    turn_exit_reason = (
+        raw_turn_exit.strip()
+        if isinstance(raw_turn_exit, str) and raw_turn_exit.strip()
+        else ""
+    )
+    raw_interrupt_message = result.get("interrupt_message")
+    interrupt_message = (
+        raw_interrupt_message
+        if isinstance(raw_interrupt_message, str)
+        else str(raw_interrupt_message) if raw_interrupt_message is not None else ""
+    )
+    raw_error = result.get("error")
+    if raw_error is None:
+        error_text = ""
+    elif isinstance(raw_error, str):
+        error_text = raw_error
+    else:
+        try:
+            error_text = str(raw_error)
+        except Exception:
+            error_text = repr(raw_error)
+    has_error = bool(error_text.strip())
+    failed_flag = bool(result.get("failed"))
+    completed = bool(result.get("completed", False))
+
+    # The child loop records the budget boundary explicitly. Only these
+    # structured values may produce max_iterations/truncated; provider and
+    # transport failures must never be presented as budget exhaustion.
+    is_iter_exhaust = (
+        turn_exit_reason.startswith("max_iterations_reached(")
+        or turn_exit_reason == "budget_exhausted"
+    )
+    # Older child adapters omitted turn_exit_reason. Keep their established
+    # summary-compatible behavior, but only when no failure signal is present.
+    legacy_iter_exhaust = (
+        not completed and usable_summary and not turn_exit_reason and not failed_flag and not has_error
+    )
+
     if result.get("interrupted", False):
-        status, exit_reason = "interrupted", "interrupted"
+        status = "interrupted"
+        exit_reason = (
+            "parent_stop"
+            if interrupt_message.startswith("[delegate_task parent-control]")
+            else "interrupted"
+        )
+        truncated = False
         # The loop's final_response is a placeholder here ("Operation interrupted…", also appended as the closing
         # assistant row); the completion must carry what the child actually had so far — its last real assistant
         # text — and keep the placeholder as the error.
@@ -571,19 +692,21 @@ def _build_result_entry(
                         and (t := flatten_message_text(m.get("content")).strip()) not in placeholders), "")
         if partial:
             interrupt_note, summary = summary.strip(), partial
-    elif result.get("failed") or result.get("error"):
-        # The loop returns the error text as final_response, which would otherwise read as "completed". Never report a
-        # provider rejection as "max_iterations" — that is only truthful for real budget exhaustion.
-        status, exit_reason = "failed", "error"
-    else:
-        # exit_reason ("completed" vs "max_iterations") tells the parent HOW the task ended; completed=False with no
-        # failure = budget exhaustion. A declared schema still violated after the bounded retry does NOT fail the
-        # run: the child's raw final text is the deliverable (audits of up to 68 min were written off as "failed"
-        # over a stray code fence or one missing field); ``schema_valid: false`` + ``schema_errors`` carry the
-        # contract verdict, and the summary is prefixed with a notice so a status-only reader cannot mistake it
-        # for validated output.
-        exit_reason = "completed" if result.get("completed", False) else "max_iterations"
+    elif schema.valid is False:
+        status, exit_reason, truncated = "failed", "error", False
+    elif failed_flag or has_error:
+        # The loop may return provider error text as final_response. The
+        # structured failure flag/error wins over the summary heuristic.
+        status, exit_reason, truncated = "failed", "error", False
+    elif is_iter_exhaust or legacy_iter_exhaust:
+        exit_reason, truncated = "max_iterations", True
         status = "completed" if usable_summary else "failed"
+    elif completed and usable_summary:
+        status, exit_reason, truncated = "completed", "completed", False
+    else:
+        # An incomplete/blank result without a genuine budget signal is a
+        # failed child, while the raw turn reason remains available below.
+        status, exit_reason, truncated = "failed", "error", False
 
     _cost = getattr(child, "session_estimated_cost_usd", 0.0)
     _cost_status = getattr(child, "session_cost_status", None)
@@ -597,8 +720,9 @@ def _build_result_entry(
         "model": _str_or_none(getattr(child, "model", None)),
         "exit_reason": exit_reason,
         # A budget-exhausted child still returns a summary (status stays
-        # "completed"), so the parent needs this explicit flag.
-        "truncated": exit_reason == "max_iterations",
+        # "completed"), so the parent needs this explicit flag. All other
+        # terminal classes are explicitly non-truncated.
+        "truncated": truncated,
         "tokens": {
             "input": _num(getattr(child, "session_prompt_tokens", 0)),
             "output": _num(getattr(child, "session_completion_tokens", 0)),
@@ -614,14 +738,36 @@ def _build_result_entry(
     entry["cost_usd"] = round(entry["_child_cost_usd"], 6)
     entry["cost_status"] = _cost_status if isinstance(_cost_status, str) and _cost_status else "unknown"
     if status == "failed":
-        entry["error"] = result.get("error", "Subagent did not produce a response.")
+        if schema.valid is False and usable_summary:
+            # The child DID respond; name the contract violation instead of the generic "no response" error.
+            entry["error"] = (
+                "Final answer does not satisfy the declared output_schema" + (" (after 1 retry)." if schema.retries else ".")
+            )
+        else:
+            entry["error"] = error_text if has_error else "Subagent did not produce a response."
         # Classified reason from the child loop (e.g. "rate_limit", "billing")
         # lets the parent tell a quota wall from a task error without parsing prose.
         _failure_reason = result.get("failure_reason")
-        if isinstance(_failure_reason, str) and _failure_reason:
+        if isinstance(_failure_reason, str) and _failure_reason.strip():
             entry["failure_reason"] = _failure_reason
+        elif _failure_reason is not None and not isinstance(_failure_reason, str):
+            try:
+                _failure_reason_text = str(_failure_reason).strip()
+            except Exception:
+                _failure_reason_text = ""
+            if _failure_reason_text:
+                entry["failure_reason"] = _failure_reason_text
+
     elif interrupt_note:
         entry["error"] = interrupt_note
+
+    # Keep structured diagnostics alongside the normalized public contract.
+    # Keep the raw marker so callers can distinguish a parent control stop from
+    # an ordinary external interruption without parsing the summary.
+    if turn_exit_reason:
+        entry["turn_exit_reason"] = turn_exit_reason
+    if interrupt_message:
+        entry["interrupt_message"] = interrupt_message
 
     # Schema-validation outcome — emitted ONLY when a schema was requested, so
     # legacy (schema-less) payloads keep their exact shape.
@@ -815,7 +961,7 @@ class _ChildRun:
             if settled.is_set():
                 return  # the worker finished, or the heartbeat declared the child stale
             current = _child_activity_fingerprint(self.child)
-            if current != fingerprint:
+            if current != fingerprint or _is_live_api_outage_wait(self.child):
                 fingerprint = current
                 deadline = time.monotonic() + child_timeout
                 warn_at = deadline - child_timeout * (1.0 - _BUDGET_WARNING_FRACTION)
@@ -839,6 +985,7 @@ class _ChildRun:
         """
         from tools.delegate_tool import (
             _STALE_RESULT_GRACE_SECONDS, _get_child_timeout, _get_subagent_approval_callback, _set_subagent_approval_cb,
+            _ChildActiveTimeout, _wait_for_child_result,
         )
         from tools.daemon_pool import DaemonThreadPoolExecutor
         child, task_index = self.child, self.task_index
@@ -876,7 +1023,7 @@ class _ChildRun:
                 if stale_after is None:
                     # A configured inactivity cap elapsing keeps its teeth: the user armed a
                     # budget, the fingerprint never moved, abandon now (#116001 contract).
-                    raise FuturesTimeoutError()
+                    raise _ChildActiveTimeout()
                 # Grace collection (#113222): the heartbeat's stale verdict ended the wait
                 # while the worker was still pending — a child that already wrote its final
                 # answer often lands its result moments later, and that real result must be
@@ -892,7 +1039,7 @@ class _ChildRun:
                 grace_done = threading.Event()
                 future.add_done_callback(lambda _f: grace_done.set())
                 if not grace_done.wait(timeout=grace) or not future.done():
-                    raise FuturesTimeoutError()
+                    raise _ChildActiveTimeout()
                 logger.info(
                     "Subagent %d settled inside the %.1fs stale-result grace window — collecting its real result",
                     task_index, grace,
@@ -907,7 +1054,7 @@ class _ChildRun:
 
         _late_pending_steer = self.close_steering()
         _signal_child_stop(child)
-        is_timeout = isinstance(exc, (FuturesTimeoutError, TimeoutError))
+        is_timeout = isinstance(exc, _ChildActiveTimeout)
         # What actually ended the wait: the stale threshold pre-empts a longer configured cap.
         timeout_cause = stale_after if stale_after is not None else child_timeout
         duration = self.elapsed()

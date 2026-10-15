@@ -584,7 +584,7 @@ def classify(files: list[str], run_e2e: bool = False) -> dict[str, bool]:
     deps = any(f == "pyproject.toml" for f in files)
     npm_lock = any(f.split("/")[-1] == "package-lock.json" for f in files)
     docker_meta = any(f.startswith(_DOCKER_META) for f in files)
-    
+
     ret = {
         "python": python,
         "python_prod": python_prod,

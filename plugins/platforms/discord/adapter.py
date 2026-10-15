@@ -4662,14 +4662,18 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
                 # e.g. name conflict with a subcommand group.
                 pass
         try:
-            from hermes_cli.commands import COMMAND_REGISTRY, _is_gateway_available, _resolve_config_gates
+            from hermes_cli.commands import (
+                COMMAND_REGISTRY,
+                _is_gateway_menu_advertised,
+                _resolve_config_gates,
+            )
             try:
                 already_registered = {cmd.name for cmd in tree.get_commands()}
             except Exception:
                 pass
             config_overrides = _resolve_config_gates()
             for cmd_def in COMMAND_REGISTRY:
-                if _is_gateway_available(cmd_def, config_overrides):
+                if _is_gateway_menu_advertised(cmd_def, config_overrides):
                     _auto_register(cmd_def.name, cmd_def.description, cmd_def.args_hint)
             logger.debug("Discord auto-registered %d commands from COMMAND_REGISTRY", len(already_registered))
         except Exception as e:

@@ -101,7 +101,7 @@ def check_api_response(
     """Verify ``response`` in the original order. The retry buffer is NOT cleared on success
     (bytes back != usable content); ``_preflight_compression_blocked``/``_last_preflight_pressure``
     reset only when the usage fold re-arms the compression budget."""
-    from agent.turn_recovery import validate_response_shape
+    from agent.turn_recovery import is_codex_transient_terminal_failure, validate_response_shape
 
     def _verdict(action: str, result: Optional[dict[str, Any]] = None) -> ResponseCheckVerdict:
         return ResponseCheckVerdict(
@@ -128,6 +128,7 @@ def check_api_response(
         resp_model = getattr(response, 'model', 'N/A') if response else 'N/A'
         logging.debug(f"API Response received - Model: {resp_model}, Usage: {response.usage if hasattr(response, 'usage') else 'N/A'}")
 
+    codex_transient_terminal_failure = is_codex_transient_terminal_failure(agent, response)
     response_invalid, error_details = validate_response_shape(agent, response)
     if response_invalid:
         _iv = retry_invalid_response(
@@ -139,6 +140,7 @@ def check_api_response(
             api_call_count=api_call_count, api_request_id=api_request_id,
             api_start_time=api_start_time, api_duration=api_duration,
             effective_task_id=effective_task_id, turn_id=turn_id,
+            codex_transient_terminal_failure=codex_transient_terminal_failure,
         )
         thinking_spinner = _iv.thinking_spinner
         active_system_prompt = _iv.active_system_prompt
@@ -238,7 +240,7 @@ def retry_invalid_response(
     messages: Any, api_messages: Any, api_kwargs: Any, active_system_prompt: Any,
     conversation_history: Any, retry_count: Any, max_retries: Any, compression_attempts: Any,
     api_call_count: Any, api_request_id: Any, api_start_time: Any, api_duration: Any,
-    effective_task_id: Any, turn_id: Any,
+    effective_task_id: Any, turn_id: Any, codex_transient_terminal_failure: bool = False,
 ) -> InvalidResponseVerdict:
     """Malformed/empty provider response: fire the error hook, stop the spinner, eager
     fallback (empty responses often mean rate limiting), terminal result at max retries,
@@ -282,15 +284,17 @@ def retry_invalid_response(
             return _verdict("continue")
     retry_count += 1
 
-    # Eager fallback: empty/malformed responses often mean rate limiting.
-    if agent._fallback_index < len(agent._fallback_chain):
-        agent._buffer_diagnostic_status("⚠️ Empty/malformed response — switching to fallback...")
-    if agent._try_activate_fallback():
-        active_system_prompt = _arm_fallback_restart(
-            agent, api_messages, active_system_prompt, _retry)
-        retry_count = 0
-        compression_attempts = 0
-        return _verdict("break")
+    # Empty/malformed responses often mean rate limiting. Known transient Codex
+    # terminal failures instead exhaust primary retries before fallback.
+    if not codex_transient_terminal_failure:
+        if agent._fallback_index < len(agent._fallback_chain):
+            agent._buffer_diagnostic_status("⚠️ Empty/malformed response — switching to fallback...")
+        if agent._try_activate_fallback():
+            active_system_prompt = _arm_fallback_restart(
+                agent, api_messages, active_system_prompt, _retry)
+            retry_count = 0
+            compression_attempts = 0
+            return _verdict("break")
 
     error_msg, provider_name, _failure_hint = describe_invalid_response(
         agent, response, api_duration
@@ -309,6 +313,16 @@ def retry_invalid_response(
             retry_count = 0
             compression_attempts = 0
             return _verdict("break")
+        if codex_transient_terminal_failure and getattr(
+            getattr(agent, "_api_outage_recovery_config", None), "enabled", False
+        ):
+            from agent.api_outage_recovery import park_for_api_outage_recovery
+
+            parked = park_for_api_outage_recovery(agent, messages, conversation_history)
+            if parked is not None:
+                return _verdict("return", parked)
+            retry_count = 0
+            return _verdict("continue")
         # Terminal — flush buffered retry trace so user sees what happened.
         agent._flush_status_buffer()
         agent._emit_diagnostic_status(f"❌ Max retries ({max_retries}) exceeded for invalid responses. Giving up.")

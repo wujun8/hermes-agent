@@ -177,6 +177,25 @@ def _event_from_wire(raw: dict[str, Any]) -> MessageEvent:
     src = raw.get("source", {}) or {}
     from gateway.config import Platform
 
+    # The relay is an ingress boundary: validate the optional profile before
+    # constructing/publishing SessionSource, but do not touch the filesystem.
+    # Existence and served-profile authorization happen in GatewayRunner after
+    # the authenticated event reaches the runner.
+    raw_profile = src.get("profile")
+    if raw_profile is None:
+        wire_profile = None
+    elif not isinstance(raw_profile, str) or not raw_profile.strip():
+        raise ValueError("invalid profile")
+    else:
+        try:
+            from hermes_cli.profiles import normalize_profile_name, validate_profile_name
+
+            wire_profile = normalize_profile_name(raw_profile)
+            validate_profile_name(wire_profile)
+        except (TypeError, ValueError, AttributeError):
+            # Keep protocol errors stable and path-free; the remote peer does
+            # not need to know which local validation rule rejected the value.
+            raise ValueError("invalid profile") from None
     try:
         platform_enum = Platform(src.get("platform", "relay"))
     except ValueError:
@@ -200,7 +219,7 @@ def _event_from_wire(raw: dict[str, Any]) -> MessageEvent:
         message_id=src.get("message_id"),
         # Multiplex mode: the connector stamps the target Hermes profile; None on
         # a single-profile gateway keeps the legacy ``agent:main`` namespace.
-        profile=src.get("profile"),
+        profile=wire_profile,
         # Connector-stamped auto-thread markers light the same semantic-rename
         # lane native Discord uses.
         auto_thread_created=bool(src.get("auto_thread_created", False)),

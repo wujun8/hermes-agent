@@ -1602,6 +1602,40 @@ def test_tui_tool_output_risk_event_exposes_metadata_without_raw_output(monkeypa
     assert "result" not in events[0][2]
 
 
+def test_tui_session_usage_includes_account_limit_lines(monkeypatch):
+    class Agent:
+        model = "gpt-5.5"
+        provider = "openai-codex"
+        base_url = "https://chatgpt.com/backend-api/codex"
+        api_key = "unused"
+        session_input_tokens = 100
+        session_output_tokens = 20
+        session_prompt_tokens = 100
+        session_completion_tokens = 20
+        session_total_tokens = 120
+        session_api_calls = 1
+
+    monkeypatch.setattr(
+        "agent.account_usage.fetch_account_usage",
+        lambda provider, base_url=None, api_key=None: object(),
+    )
+    monkeypatch.setattr(
+        "agent.account_usage.render_account_usage_lines",
+        lambda snapshot, markdown=False: [
+            "📈 Account limits",
+            "Provider: openai-codex (Pro)",
+            "Session: 79% remaining (21% used)",
+        ],
+    )
+
+    usage = server._get_usage(Agent(), include_account=True)
+
+    assert usage["account_lines"] == [
+        "📈 Account limits",
+        "Provider: openai-codex (Pro)",
+        "Session: 79% remaining (21% used)",
+    ]
+
 def test_tui_clarify_lifecycle_events_emit_when_tool_progress_off(monkeypatch):
     events: list[tuple[str, str, dict]] = []
     monkeypatch.setattr(
@@ -15123,8 +15157,8 @@ def test_mirror_slash_compress_does_not_prelock_history(monkeypatch):
         session["history"] = [{"role": "user", "content": "summary"}]
         return (1, {"total": 0})
 
-    def _fake_sync(_sid, _session):
-        seen["sync"] = True
+    def _fake_sync(_sid, _session, *, control_token=None):
+        seen["sync"] = control_token is not None and _session.get("_session_control_inflight") is control_token
 
     monkeypatch.setattr(server, "_compress_session_history", _fake_compress)
     monkeypatch.setattr(server, "_sync_session_key_after_compress", _fake_sync)
@@ -17549,7 +17583,7 @@ def test_session_activate_returns_inflight_stream_before_completion(monkeypatch)
     monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
     monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
     monkeypatch.setattr(server, "_get_db", lambda: None)
-    monkeypatch.setattr(server, "_session_info", lambda agent: {"model": agent.model})
+    monkeypatch.setattr(server, "_session_info", lambda agent, session=None: {"model": agent.model})
 
     def _emit(event, sid, payload=None):
         if event == "message.complete":
@@ -17616,7 +17650,7 @@ def test_session_activate_returns_prompt_queued_during_busy_turn(monkeypatch):
     that copy without leaking the transport object.
     """
     monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "queue")
-    monkeypatch.setattr(server, "_session_info", lambda agent: {"model": agent.model})
+    monkeypatch.setattr(server, "_session_info", lambda agent, session=None: {"model": agent.model})
     agent = types.SimpleNamespace(model="model-live")
     session = _session(
         agent=agent,
@@ -17649,7 +17683,7 @@ def test_session_activate_returns_prompt_queued_during_busy_turn(monkeypatch):
 
 
 def test_session_activate_switches_live_session_without_closing_siblings(monkeypatch):
-    monkeypatch.setattr(server, "_session_info", lambda agent: {"model": agent.model})
+    monkeypatch.setattr(server, "_session_info", lambda agent, session=None: {"model": agent.model})
     server._sessions["sid-a"] = _session(
         agent=types.SimpleNamespace(model="model-a"),
         history=[{"role": "user", "content": "old"}],
@@ -17686,7 +17720,7 @@ def test_session_activate_switches_live_session_without_closing_siblings(monkeyp
 
 
 def test_session_activate_can_omit_duplicate_desktop_transcript(monkeypatch):
-    monkeypatch.setattr(server, "_session_info", lambda agent: {"model": agent.model})
+    monkeypatch.setattr(server, "_session_info", lambda agent, session=None: {"model": agent.model})
     server._sessions["sid-large"] = _session(
         agent=types.SimpleNamespace(model="model-large"),
         history=[

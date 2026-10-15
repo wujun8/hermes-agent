@@ -55,6 +55,16 @@ def _auto_continue_note(prompt: str) -> str:
             f"finish the task. The interrupted request was:]\n\n{prompt}")
 
 
+def _api_outage_recovery_note() -> str:
+    return (
+        "[System note: The previous turn was interrupted while waiting for "
+        "an API outage to recover. Review the conversation history and "
+        "current workspace state, then CONTINUE the interrupted task to "
+        "completion. Do not repeat tool calls whose results are already "
+        "recorded.]"
+    )
+
+
 def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> dict | None:
     """Kick off a continuation turn for a crash-interrupted session (session.resume cold paths). Returns a descriptor
     for the resume payload when scheduled, else None. The turn runs on a background thread after the deferred agent
@@ -85,7 +95,14 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
     if session.get("_auto_continue_scheduled"):
         return None
     session["_auto_continue_scheduled"] = True
-    attempt, text = marker["attempts"] + 1, _auto_continue_note(marker["prompt"])
+    from agent.api_outage_recovery import API_OUTAGE_RECOVERY_RESUME_REASON
+
+    attempt = marker["attempts"] + 1
+    text = (
+        _api_outage_recovery_note()
+        if marker.get("resume_reason") == API_OUTAGE_RECOVERY_RESUME_REASON
+        else _auto_continue_note(marker["prompt"])
+    )
 
     def kickoff() -> None:
         rid = f"__auto_continue__{int(time.time() * 1000)}"
@@ -221,13 +238,27 @@ def _ac_set_queue(session: dict, entries: list) -> None:
         session.pop("queued_prompts", None)
 
 
-def _interrupt_busy_session(sid: str, session: dict, agent: Any) -> None:
+_BUSY_INTERRUPT_MESSAGE = "A new message was received while the current turn was running."
+
+
+def _interrupt_busy_session(
+    sid: str, session: dict, agent: Any, message: str | None = None
+) -> None:
     """Interrupt a busy turn on a worker thread, never under ``history_lock`` (some providers can't apply ``interrupt()``
     until a blocking call returns; inline it stalled ``session.resume``). At most one interrupt worker per session so
-    repeated steering can't leak threads."""
+    repeated steering can't leak threads.
+
+    The message is deliberate: API outage recovery uses a missing ``interrupt_message`` to distinguish a
+    system-owned wait from a user-owned interruption.
+    """
     use_agent = agent is not None and hasattr(agent, "interrupt")
     if not use_agent and not _session_uses_compute_host(session):
         return
+    interrupt_message = (
+        message.strip()
+        if isinstance(message, str) and message.strip()
+        else _BUSY_INTERRUPT_MESSAGE
+    )
     with session["history_lock"]:
         if session.get("_busy_interrupt_pending"):
             return
@@ -236,7 +267,17 @@ def _interrupt_busy_session(sid: str, session: dict, agent: Any) -> None:
     def interrupt() -> None:
         try:
             with contextlib.suppress(Exception):
-                agent.interrupt() if use_agent else _get_compute_host_supervisor().interrupt(sid)
+                if use_agent:
+                    try:
+                        agent.interrupt(interrupt_message)
+                    except TypeError:
+                        # Third-party/legacy agents may expose only interrupt(). Keep the sideband
+                        # attribution for the outage-recovery classifier before using that ABI.
+                        with contextlib.suppress(Exception):
+                            agent._interrupt_message = interrupt_message
+                        agent.interrupt()
+                else:
+                    _get_compute_host_supervisor().interrupt(sid)
         finally:
             with session["history_lock"]:
                 session["_busy_interrupt_pending"] = False
@@ -450,7 +491,7 @@ def _handle_busy_submit(rid, sid: str, session: dict, text: Any, transport: Any,
     # rejected/raised). A hard interrupt here kills the live turn AND ``AIAgent.interrupt()`` drops the
     # pending steer buffer — silently destroying the earlier messages of the burst. See #86134.
     if mode == "interrupt" and not image_paths:
-        _interrupt_busy_session(sid, session, agent)
+        _interrupt_busy_session(sid, session, agent, plain_text)
     return _ok(rid, {"status": "queued"})
 
 

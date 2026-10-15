@@ -1032,6 +1032,29 @@ def _should_skip_container_guards(env_type: str, has_host_access: bool = False) 
         return False
 
 
+def _trust_mounted_docker_enabled(
+    env_type: str,
+    has_host_access: bool = False,
+) -> bool:
+    """Whether an interactive mounted-Docker session has the exact trust opt-in."""
+    if env_type != "docker" or has_host_access is not True:
+        return False
+    if (
+        _is_cron_approval_context()
+        or _is_single_query_approval_context()
+        or _is_unattended_platform_approval_context()
+    ):
+        return False
+    try:
+        approvals = approval_context._get_approval_config()
+    except Exception:
+        return False
+    return (
+        isinstance(approvals, dict)
+        and approvals.get("trust_mounted_docker") is True
+    )
+
+
 def _user_deny_block(command: str) -> dict | None:
     """The operator's ``approvals.deny`` rules are documented as never bypassable — not by yolo,
     not by mode=off, and not by an isolated container either: they express intent about what the
@@ -1077,9 +1100,11 @@ def check_dangerous_command(command: str, env_type: str,
     Returns ``{"approved": True/False, "message": str or None, ...}``."""
     if _should_skip_container_guards(env_type, has_host_access=has_host_access):
         return _user_deny_block(command) or _approved()
-    blocked = _floor_block(command)
+    blocked = _floor_block(command, sudo_guard=True)
     if blocked is not None:
         return blocked
+    if _trust_mounted_docker_enabled(env_type, has_host_access=has_host_access):
+        return _approved()
     if _yolo_active():
         return _approved()
     if _command_matches_permanent_allowlist(command):
@@ -1137,6 +1162,8 @@ def check_all_command_guards(command: str, env_type: str,
     blocked = _floor_block(command, sudo_guard=True)
     if blocked is not None:
         return blocked
+    if _trust_mounted_docker_enabled(env_type, has_host_access=has_host_access):
+        return _approved()
 
     from agent.terminal_approval_batch import consume_prepared_guard
     prepared = consume_prepared_guard(command, env_type, has_host_access)
@@ -1199,6 +1226,8 @@ def check_execute_code_guard(code: str, env_type: str, has_host_access: bool = F
     if env_type == "vercel_sandbox":
         return _approved()
     if _should_skip_container_guards(env_type, has_host_access=has_host_access):
+        return _approved()
+    if _trust_mounted_docker_enabled(env_type, has_host_access=has_host_access):
         return _approved()
     approval_mode = approval_context._get_approval_mode()
     if _yolo_active() or approval_mode == "off":

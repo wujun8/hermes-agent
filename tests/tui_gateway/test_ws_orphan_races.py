@@ -26,7 +26,7 @@ def test_obsolete_orphan_cannot_replace_new_detachment(monkeypatch, phase):
             pass  # A dispatched callback can still execute after cancel().
 
     sid = "generation-race"
-    session = dict(transport=server._detached_ws_transport, running=True,
+    session = dict(transport=server._detached_ws_transport, running=True, history_lock=threading.RLock(),
                    agent=SimpleNamespace(get_activity_summary=lambda: {"seconds_since_activity": 0}))
     monkeypatch.setattr(server, "_sessions", {sid: session})
     monkeypatch.setattr(server, "_pending_ws_reaps", {})

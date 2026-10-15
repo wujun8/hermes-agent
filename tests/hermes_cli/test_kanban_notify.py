@@ -385,6 +385,10 @@ async def test_notifier_wake_forwards_persisted_chat_type_and_user_id(kanban_hom
     fake_adapter.send = AsyncMock()
     runner.adapters = {Platform.TELEGRAM: fake_adapter}
     runner._profile_adapters = {"owner-profile": {Platform.TELEGRAM: fake_adapter}}
+    owner_home = kanban_home / "profiles" / "owner-profile"
+    owner_home.mkdir(parents=True)
+    (owner_home / "config.yaml").write_text("{}\n", encoding="utf-8")
+    runner._served_profile_names = {"default", "owner-profile"}
     runner._authorization_adapter = lambda platform, profile=None: fake_adapter
 
     _orig_sleep = asyncio.sleep

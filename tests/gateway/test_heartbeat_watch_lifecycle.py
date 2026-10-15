@@ -17,6 +17,7 @@ async def test_watches_read_and_admit_in_each_owner_profile(tmp_path, monkeypatc
     monkeypatch.setenv('HERMES_HOME', str(tmp_path / '.hermes'))
     runner = object.__new__(GatewayRunner)
     runner.config = SimpleNamespace(multiplex_profiles=True)
+    runner._served_profile_names = {'default', 'alpha', 'beta'}
     runner._run_in_executor_with_context = asyncio.to_thread
     runner._is_session_running = lambda key: False
     runner._queue_depth = lambda key, adapter: 0

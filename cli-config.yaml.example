@@ -1255,6 +1255,10 @@ agent:
   # underneath this wrapper — this is the Hermes-level loop.
   # api_max_retries: 3
 
+  # Show each API retry/fallback status immediately through the common status
+  # channel (CLI, TUI, Desktop, and Gateway). By default these messages are
+  # buffered and only displayed if every recovery attempt fails.
+  # show_retry_status: false
   # Once api_max_retries AND the fallback chain are spent on a transient outage
   # (5xx, overloaded/529, connect/read timeouts) and nothing has been delivered
   # yet, Hermes waits and retries this many more cycles (jittered 15/30/60/60/60s;

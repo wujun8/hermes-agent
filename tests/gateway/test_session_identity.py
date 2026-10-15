@@ -62,6 +62,7 @@ def mux(tmp_path, monkeypatch):
     home = tmp_path / "hh"
     for name in ("ops", "team_b"):
         (home / "profiles" / name).mkdir(parents=True)
+        (home / "profiles" / name / "config.yaml").write_text("{}\n")
     monkeypatch.setenv("HERMES_HOME", str(home))
     served = [("default", home), ("ops", home / "profiles" / "ops"), ("team_b", home / "profiles" / "team_b")]
     rig = _runner(home, multiplex=True, routes=[

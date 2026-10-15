@@ -10,6 +10,33 @@ from urllib.parse import urlsplit, urlunsplit
 
 logger = logging.getLogger("tools.delegate_tool")  # log-record parity with the origin module
 
+_PUBLIC_CHILD_STATUSES = frozenset({"completed", "interrupted", "failed"})
+_PUBLIC_CHILD_EXIT_REASONS = frozenset({"completed", "max_iterations", "interrupted", "parent_stop", "error"})
+
+
+def _normalize_child_result_entry(entry: dict[str, Any]) -> None:
+    """Normalize internal/fabricated child outcomes at the parent boundary.
+
+    Timeout and worker-exception paths historically use local status labels
+    while normal child results use the public completed/interrupted/failed
+    contract. Keep diagnostic fields, but never serialize an extra status or
+    exit reason to the parent.
+    """
+    if not isinstance(entry, dict):
+        return
+    status = entry.get("status")
+    if status not in _PUBLIC_CHILD_STATUSES:
+        entry["status"] = "interrupted" if status == "interrupted" else "failed"
+    status = entry["status"]
+
+    reason = entry.get("exit_reason")
+    if reason not in _PUBLIC_CHILD_EXIT_REASONS:
+        entry["exit_reason"] = "interrupted" if status == "interrupted" else "error"
+    if entry["exit_reason"] == "interrupted":
+        entry["truncated"] = False
+    else:
+        entry["truncated"] = entry["exit_reason"] == "max_iterations"
+
 def _stringify_tool_content(content: Any) -> str:
     """Stable text for tool-result content. Some OpenAI-compatible paths return
     content-block lists; observability must never crash on them."""
@@ -395,6 +422,8 @@ def _finalize_child_results(
 ) -> None:
     """Apply host-owned summary, memory, hook, and cost contracts once."""
     with _parent_finalization_lock(parent_agent):
+        for entry in results:
+            _normalize_child_result_entry(entry)
         _apply_summary_budget(results, parent_agent)
         child_by_index = {index: child for index, _task, child in children}
         _notify_memory_manager(results, task_list, child_by_index, parent_agent)

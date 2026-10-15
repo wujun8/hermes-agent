@@ -153,6 +153,38 @@ def test_deliver_validates_profile_and_runs_transport(home, monkeypatch):
     assert not calls
 
 
+
+def test_deliver_child_credentials_follow_target_profile_a_b_a(home, monkeypatch):
+    """Real child processes receive only their selected profile's credentials."""
+    (home / ".env").write_text("OPENAI_API_KEY=launch-test-key\n")
+    (home / "profiles" / "ops" / ".env").write_text("OPENAI_API_KEY=ops-test-key\n")
+    monkeypatch.setattr(srv, "_hermes_home", str(home))
+    monkeypatch.setattr(srv, "_served_profile_homes", set())
+    monkeypatch.setenv("OPENAI_API_KEY", "ambient-test-key")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "launch-only-test-key")
+
+    def run_child(_argv, **kwargs):
+        return subprocess.run(
+            [sys.executable, "-c", "import os,json; print(json.dumps({k: os.getenv(k) for k in "
+             "['HERMES_HOME','OPENAI_API_KEY','ANTHROPIC_API_KEY']}))"],
+            env=kwargs["env"], capture_output=True, text=True, check=True,
+        )
+
+    monkeypatch.setattr("hermes_cli.quiet_single_query.run_reported_turn", run_child)
+    replies = []
+    for profile in ("hermes", "ops", "hermes"):
+        reply = _result(srv._methods["bot_relay.deliver"](
+            1, {"profile": profile, "message": "scope probe"}))["reply"]
+        replies.append(json.loads(reply))
+    assert replies[0] == replies[2] == {
+        "HERMES_HOME": str(home), "OPENAI_API_KEY": "launch-test-key",
+        "ANTHROPIC_API_KEY": "launch-only-test-key",
+    }
+    assert replies[1] == {
+        "HERMES_HOME": str(home / "profiles" / "ops"),
+        "OPENAI_API_KEY": "ops-test-key", "ANTHROPIC_API_KEY": None,
+    }
+
 def test_deliver_requires_params(home):
     err = srv._methods["bot_relay.deliver"](1, {"profile": "", "message": ""})
     assert "error" in err

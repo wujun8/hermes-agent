@@ -15,6 +15,10 @@ import ssl
 import time
 from typing import Any, Dict, Optional
 
+from agent.api_outage_recovery import (
+    is_stale_circuit_breaker_error,
+    park_for_api_outage_recovery,
+)
 from agent.api_error_summary import is_provider_stream_parse_error
 from agent.error_classifier import RETRYABLE_CLIENT_REASONS, FailoverReason, classify_api_error
 from agent.turn_overflow import recover_from_overflow
@@ -344,6 +348,19 @@ def settle_unrecovered_error(
                 active_system_prompt = _arm_fallback_restart(agent, api_messages, active_system_prompt, _retry)
                 retry_count = compression_attempts = 0
                 return _verdict("break")
+        # Local maintenance (kept through upstream's fallback gating): a stale circuit breaker
+        # parks the turn for API-outage recovery instead of returning the non-retryable result.
+        if is_stale_circuit_breaker_error(api_error) and getattr(
+            getattr(agent, "_api_outage_recovery_config", None), "enabled", False
+        ):
+            parked = park_for_api_outage_recovery(agent, messages, conversation_history)
+            if parked is not None:
+                return _verdict("return", parked)
+            from agent.chat_completion_helpers import _reset_stale_streak
+
+            _reset_stale_streak(agent)
+            retry_count = 0
+            return _verdict("continue")
         # Terminal from here: collapse the continuation trail once, before the persist.
         _delivered = settle_delivered_partial(agent, messages, current_turn_user_idx)
         return _verdict("return", nonretryable_client_error_result(
@@ -383,6 +400,18 @@ def settle_unrecovered_error(
             active_system_prompt = _arm_fallback_restart(agent, api_messages, active_system_prompt, _retry)
             retry_count = compression_attempts = 0
             return _verdict("break")
+        if classified.reason in {
+            FailoverReason.server_error,
+            FailoverReason.overloaded,
+            FailoverReason.timeout,
+        } and getattr(
+            getattr(agent, "_api_outage_recovery_config", None), "enabled", False
+        ):
+            parked = park_for_api_outage_recovery(agent, messages, conversation_history)
+            if parked is not None:
+                return _verdict("return", parked)
+            retry_count = 0
+            return _verdict("continue")
         # Fallback first (above); only with nothing left to move to does the bounded auto-recovery
         # ladder park the turn on a transient outage instead of ending it (#85426, #107307).
         from agent.turn_recovery_autorecover import auto_recover_after_exhaustion

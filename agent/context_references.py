@@ -477,11 +477,13 @@ def _is_under(path: Path, root: Path) -> bool:
 # The chat's cwd is rarely an ancestor of it, so it is the one anchored root the
 # workspace guard admits besides `allowed_root` itself.
 COMPOSER_PASTES_DIRNAME = "composer-pastes"
+ATTACHMENTS_STAGING_DIRNAME = "attachments"
 
 
 def _composer_paste_roots() -> list[Path]:
     from agent.file_safety import _hermes_dirs
-    return [hermes_dir / COMPOSER_PASTES_DIRNAME for hermes_dir in _hermes_dirs()]
+    return [hermes_dir / dirname for hermes_dir in _hermes_dirs()
+            for dirname in (COMPOSER_PASTES_DIRNAME, ATTACHMENTS_STAGING_DIRNAME)]
 
 
 def _agent_staged_path(path: Path) -> bool:

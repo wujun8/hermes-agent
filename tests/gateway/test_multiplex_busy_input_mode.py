@@ -75,6 +75,14 @@ def _adapter() -> _ProfileAdapter:
     return adapter
 
 
+def _canonical_profile_home(tmp_path, monkeypatch) -> Path:
+    hermes_home = tmp_path / ".hermes"
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setattr("gateway.run._hermes_home", hermes_home)
+    return hermes_home / "profiles" / "research"
+
+
 async def _load_profile_snapshot(
     runner: GatewayRunner,
     profile_home,
@@ -87,7 +95,7 @@ async def _load_profile_snapshot(
         display += f"  busy_input_mode: {mode}\n"
     if legacy_text_mode is not None:
         display += f"  busy_text_mode: {legacy_text_mode}\n"
-    profile_home.mkdir()
+    profile_home.mkdir(parents=True)
     (profile_home / "config.yaml").write_text(display, encoding="utf-8")
 
     assert await runner._start_one_profile_adapters("research", profile_home, {}) == 0
@@ -119,7 +127,7 @@ async def test_secondary_profile_busy_mode_controls_live_busy_behavior(
     runner = _runner(default_mode="interrupt")
     adapter = await _load_profile_snapshot(
         runner,
-        tmp_path / "research",
+        _canonical_profile_home(tmp_path, monkeypatch),
         secondary_mode,
     )
     event = _event(profile="research")
@@ -159,7 +167,7 @@ async def test_secondary_profile_busy_mode_controls_priority_path(
     runner = _runner(default_mode="interrupt")
     adapter = await _load_profile_snapshot(
         runner,
-        tmp_path / "research",
+        _canonical_profile_home(tmp_path, monkeypatch),
         secondary_mode,
     )
     event = _event(profile="research")
@@ -184,10 +192,14 @@ async def test_secondary_profile_busy_mode_controls_priority_path(
 
 
 @pytest.mark.asyncio
-async def test_busy_status_dispatches_through_active_session_path(tmp_path):
+async def test_busy_status_dispatches_through_active_session_path(tmp_path, monkeypatch):
     """A running session still dispatches /busy through its normal handler."""
     runner = _runner(default_mode="interrupt")
-    await _load_profile_snapshot(runner, tmp_path / "research", "queue")
+    await _load_profile_snapshot(
+        runner,
+        _canonical_profile_home(tmp_path, monkeypatch),
+        "queue",
+    )
     event = _event(profile="research")
     event.text = "/busy status"
     session_key = runner._session_key_for_source(event.source)
@@ -303,7 +315,7 @@ async def test_secondary_adapter_busy_guard_stamps_profile_before_resolving_mode
     runner = _runner(default_mode="interrupt")
     adapter = await _load_profile_snapshot(
         runner,
-        tmp_path / "research",
+        _canonical_profile_home(tmp_path, monkeypatch),
         "steer",
     )
     event = _event(profile=None)
@@ -475,6 +487,7 @@ async def test_primary_adapter_busy_origin_uses_routed_privacy(
             f"privacy:\n  redact_pii: {str(privacy).lower()}\n", encoding="utf-8",
         )
     runner = _runner(default_mode=mode)
+    runner._served_profile_names = {"default", "research"}
     runner.config.profile_routes = [
         ProfileRoute(name="research-chat", platform="telegram", profile="research", chat_id="chat-1"),
     ]

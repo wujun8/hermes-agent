@@ -767,29 +767,40 @@ class _KanbanNotification:
 
         # Pings, artifact uploads (media policy) and the wake text (display.language) all read the
         # SUBSCRIBER profile's config; the notifier thread itself runs in the launch profile's scope.
-        async with self._owner_scope():
-            if not await self._send_pings():
-                return
-            # All text pings delivered (or skipped for non-push / wake-only).
-            original_events = self.d["events"]
-            from gateway.warning_notifications import warning_notifications_enabled
-            split = not warning_notifications_enabled(self.platform_str)
-            wake_groups = ([original_events] if not split else [
-                [ev for ev in original_events if diagnostic_event(ev)],
-                [ev for ev in original_events if not diagnostic_event(ev)],
-            ])
-            wake_payloads = []
-            for events in wake_groups:
-                if not events:
-                    continue
-                self.d = {**self.d, "events": events}
-                self.wake_handoff = self.wake_review_detail = ""
-                for ev in events:
-                    self.format_event(ev)
-                self.build_wake_text()
-                if self.wake_kinds:
-                    wake_payloads.append((self.synth, self.wake_diagnostic, self.wake_kinds))
-            self.d = {**self.d, "events": original_events}
+        from gateway.run import ProfileRouteRejectedError
+        try:
+            async with self._owner_scope():
+                if not await self._send_pings():
+                    return
+                # All text pings delivered (or skipped for non-push / wake-only).
+                original_events = self.d["events"]
+                from gateway.warning_notifications import warning_notifications_enabled
+                split = not warning_notifications_enabled(self.platform_str)
+                wake_groups = ([original_events] if not split else [
+                    [ev for ev in original_events if diagnostic_event(ev)],
+                    [ev for ev in original_events if not diagnostic_event(ev)],
+                ])
+                wake_payloads = []
+                for events in wake_groups:
+                    if not events:
+                        continue
+                    self.d = {**self.d, "events": events}
+                    self.wake_handoff = self.wake_review_detail = ""
+                    for ev in events:
+                        self.format_event(ev)
+                    self.build_wake_text()
+                    if self.wake_kinds:
+                        wake_payloads.append((self.synth, self.wake_diagnostic, self.wake_kinds))
+                self.d = {**self.d, "events": original_events}
+        except ProfileRouteRejectedError:
+            # The subscription's profile is gone or is no longer served (profile removed / route
+            # revoked between ticks). Never fall back to the launch profile's scope — the route
+            # authorizes exactly one transport, so rewind the claim and retry after the next
+            # reconcile publishes the served set.
+            logger.warning("kanban notifier: profile %r unavailable for %s; rewinding claim",
+                           self.sub_profile, self.task_id)
+            await self.rewind()
+            return
         is_push = self.is_push_adapter
         from gateway.wake import WakeNotAccepted
 

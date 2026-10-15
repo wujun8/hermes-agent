@@ -1,8 +1,7 @@
-"""`hermes update` lockfile-churn cleanup must respect npm workspace ownership (#112378).
+"""Local update policy preserves every user lockfile edit for autostash.
 
-The single root ``package-lock.json`` spans every workspace declared in the root ``package.json``
-``workspaces`` globs, so a dirty workspace manifest (``apps/desktop/package.json``) protects it;
-a dirty manifest outside the workspace graph does not.
+Workspace ownership cannot distinguish npm churn from an intentional lockfile-only change.
+The compatibility cleanup hook must leave all dirty bytes intact.
 """
 
 import json
@@ -37,7 +36,9 @@ def _repo(tmp_path):
 def _still_dirty_after_cleanup(repo, *dirty):
     for rel in dirty:
         (repo / rel).write_text("dirty\n", encoding="utf-8")
+    before = {rel: (repo / rel).read_bytes() for rel in dirty}
     _discard_lockfile_churn(["git"], repo)
+    assert {rel: (repo / rel).read_bytes() for rel in dirty} == before
     return set(_git(repo, "diff", "--name-only").splitlines())
 
 
@@ -48,19 +49,18 @@ def test_dirty_workspace_manifest_preserves_root_lock(tmp_path):
     }
 
 
-def test_manifest_outside_workspace_graph_does_not_protect_root_lock(tmp_path):
+def test_manifest_outside_workspace_graph_still_preserves_root_lock(tmp_path):
     repo = _repo(tmp_path)
     assert _still_dirty_after_cleanup(repo, "vendor/foo/package.json", "package-lock.json") == {
-        "vendor/foo/package.json",
+        "vendor/foo/package.json", "package-lock.json",
     }
 
 
-def test_unsupported_workspaces_glob_still_discards_root_lock_churn(tmp_path):
-    """A string ``workspaces`` (iterated char by char, '/' is a non-relative glob) must not abort
-    the cleanup: the churned root lock is still reverted, the bad entry just owns nothing."""
+def test_unsupported_workspaces_glob_still_preserves_root_lock(tmp_path):
+    """Malformed workspace metadata must not permit discarding dirty lockfile bytes."""
     repo = _repo(tmp_path)
     (repo / "package.json").write_text(json.dumps({"workspaces": "apps/*"}), encoding="utf-8")
     _git(repo, "commit", "-qam", "string workspaces")
     assert _still_dirty_after_cleanup(repo, "vendor/foo/package.json", "package-lock.json") == {
-        "vendor/foo/package.json",
+        "vendor/foo/package.json", "package-lock.json",
     }

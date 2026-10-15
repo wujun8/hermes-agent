@@ -13,11 +13,16 @@ from __future__ import annotations
 
 import asyncio
 import json
+from unittest.mock import patch
 
 import pytest
 import pytest_asyncio
 
-from gateway.relay.ws_transport import WebSocketRelayTransport, WEBSOCKETS_AVAILABLE
+from gateway.relay.ws_transport import (
+    WebSocketRelayTransport,
+    WEBSOCKETS_AVAILABLE,
+    _event_from_wire,
+)
 
 pytestmark = pytest.mark.skipif(not WEBSOCKETS_AVAILABLE, reason="websockets not installed")
 
@@ -135,6 +140,51 @@ async def test_inbound_frame_reaches_handler(server):
         assert received[0].source.scope_id == "guildA"
     finally:
         await t.disconnect()
+
+
+@pytest.mark.parametrize(
+    "profile",
+    [
+        "../escape",
+        "../../existing",
+        "/absolute/profile",
+        r"foo\bar",
+        r"C:\\profile",
+        r"\\\\server\\share",
+        ".",
+        "a\x00b",
+        "a\nb",
+        "a" * 65,
+    ],
+)
+def test_invalid_wire_profile_rejected_before_source_or_filesystem_lookup(profile):
+    raw = {
+        "text": "hello",
+        "source": {"platform": "discord", "profile": profile},
+    }
+    with patch("gateway.relay.ws_transport.SessionSource") as source_ctor, \
+            patch("hermes_cli.profiles.get_profile_dir") as get_dir, \
+            patch("hermes_cli.profiles.resolve_profile_home") as resolver:
+        with pytest.raises(ValueError, match="invalid profile"):
+            _event_from_wire(raw)
+
+    source_ctor.assert_not_called()
+    get_dir.assert_not_called()
+    resolver.assert_not_called()
+
+
+def test_mixed_case_wire_profile_is_canonicalized_before_source_publication():
+    event = _event_from_wire(
+        {
+            "text": "hello",
+            "source": {
+                "platform": "discord",
+                "profile": "  MiXeD_Profile ",
+            },
+        }
+    )
+
+    assert event.source.profile == "mixed_profile"
 
 
 # ── Phase 7 Unit 7d-B: terminal 4401 (opt-out revocation) ────────────────────

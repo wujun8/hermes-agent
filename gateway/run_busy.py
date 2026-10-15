@@ -1018,6 +1018,10 @@ class GatewayBusySessionMixin:
     async def _busy_stop_command(self, event: MessageEvent, quick_key: str, source):
         # Hard-kill: a soft interrupt can't reach a truly hung executor thread.
         from gateway.run import _INTERRUPT_REASON_STOP
+        try:
+            await self.async_session_store.clear_resume_pending(quick_key)
+        except Exception as exc:
+            logger.debug("clear_resume_pending on /stop failed for %s: %s", quick_key, exc)
         await self._interrupt_and_clear_session(
             quick_key, source, interrupt_reason=_INTERRUPT_REASON_STOP, invalidation_reason="stop_command",
         )

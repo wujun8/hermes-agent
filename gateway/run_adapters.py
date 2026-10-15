@@ -986,12 +986,39 @@ class GatewayAdapterLifecycleMixin:
             active = getattr(self, "_primary_profile_name", None) or "default"
         else:
             active = get_active_profile_name() or "default"  # launch profile, pre-identity (adapter boot)
+        profile_homes = []
+        try:
+            profile_homes = _multiplex_profile_homes(self.config)
+            from hermes_cli.profiles import normalize_profile_name, validate_profile_name
+
+            served_names = set()
+            for profile_name, _profile_home in profile_homes:
+                canonical = normalize_profile_name(profile_name)
+                validate_profile_name(canonical)
+                served_names.add(canonical)
+            # The active/default profiles remain authoritative even when a focused
+            # test or partial enumeration omits one of them.
+            served_names.add(normalize_profile_name(active))
+            served_names.add("default")
+            self._served_profile_names = served_names
+        except Exception:
+            # Fail closed to explicit process-owned profiles, never arbitrary
+            # existing directories, until a later pass can publish the full set.
+            self._served_profile_names = {"default"}
+            try:
+                from hermes_cli.profiles import normalize_profile_name
+
+                self._served_profile_names.add(normalize_profile_name(active))
+            except Exception:
+                pass
         for name, home in profiles_to_serve(True, include_parked=True):
             if name != "default" and profile_is_parked(home):
                 logger.info("profile '%s' is parked (gateway.parked); not served by this gateway", name)
         connected = 0
         claimed = self._primary_resource_claims(active)
-        profile_homes = _multiplex_profile_homes(self.config)
+        # Upstream tracks a per-profile serve signature so the reconcile loop can pick up changes
+        # made while the initial connection awaited I/O; ``profile_homes`` was already resolved
+        # (fail-closed) above, so only the signature map is initialized here.
         self._served_profile_signatures = {}
         transient_failed = set()
         for profile_name, profile_home in profile_homes:

@@ -7,7 +7,6 @@ covered by a separate live test gated on `codex --version`.
 
 from __future__ import annotations
 
-import sys
 import threading
 
 import pytest
@@ -387,4 +386,3 @@ class TestSpawnEnvSecretStripping:
         monkeypatch.setenv("OPENAI_API_KEY", "sk-codex-needs-this")
         env = self._capture_spawn_env(monkeypatch)
         assert env.get("OPENAI_API_KEY") == "sk-codex-needs-this"
-

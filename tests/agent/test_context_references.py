@@ -753,3 +753,36 @@ async def test_composer_paste_outside_workspace_is_attached_but_sibling_dir_is_n
     assert "PASTED-BODY-MARKER" in result.message
     assert "LOOKALIKE-SECRET" not in result.message
     assert "outside the allowed workspace" in "\n".join(result.warnings)
+
+
+@pytest.mark.asyncio
+async def test_staged_attachment_outside_workspace_is_attached_but_sibling_dir_is_not(tmp_path, monkeypatch):
+    """Gateway `file.attach` staging (<HERMES_HOME>/attachments/<name>, see
+    tui_gateway/prompt_attachments.py) is admitted like composer-pastes: remote-desktop
+    attachment refs always sit outside the session cwd, so the workspace guard must admit
+    exactly that anchored root (local patch 0003) — and nothing that merely neighbours it."""
+    from agent.context_references import preprocess_context_references_async
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    hermes_home = tmp_path / ".hermes"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    staged = hermes_home / "attachments" / "粘贴内容 (6.6 KB)"
+    staged.parent.mkdir(parents=True)
+    staged.write_text("STAGED-ATTACHMENT-BODY\n", encoding="utf-8")
+    lookalike = hermes_home / "attachments-backup" / "secret.txt"
+    lookalike.parent.mkdir(parents=True)
+    lookalike.write_text("LOOKALIKE-SECRET\n", encoding="utf-8")
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+
+    result = await preprocess_context_references_async(
+        f"see @file:`{staged}` and @file:`{lookalike}`",
+        cwd=workspace,
+        allowed_root=workspace,
+        context_length=100_000,
+    )
+
+    assert result.expanded
+    assert "STAGED-ATTACHMENT-BODY" in result.message
+    assert "LOOKALIKE-SECRET" not in result.message
+    assert "outside the allowed workspace" in "\n".join(result.warnings)
