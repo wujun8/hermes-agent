@@ -125,6 +125,8 @@ def normalize_model_response(
     """Normalize ``response`` into ``assistant_message`` (str content, never dict/list) and run
     the post-response hooks and continuation guards, in the original order."""
     assistant_message = normalize_response_for_agent(agent, response)
+    from agent.delegation_route_recovery import record_route_success
+    record_route_success(agent, assistant_message)
     finish_reason = assistant_message.finish_reason
 
     def _verdict(action: str, result: Optional[dict[str, Any]] = None) -> ResponseIntakeVerdict:

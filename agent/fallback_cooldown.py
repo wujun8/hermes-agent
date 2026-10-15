@@ -53,6 +53,8 @@ def _arm_rate_limit_cooldown(
     Only arm when leaving the primary: chain-switching from an active fallback means the primary
     was not the failing source. Return the armed cooldown in seconds, or None when not armed.
     """
+    from agent.delegation_route_recovery import record_route_failure
+    record_route_failure(agent, reason)
     if reason not in _RATE_LIMIT_FAILOVER_REASONS:
         return None
     current_provider = (getattr(agent, "provider", "") or "").strip().lower()

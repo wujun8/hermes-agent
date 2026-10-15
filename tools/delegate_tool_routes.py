@@ -22,6 +22,11 @@ def _validated_selection(selection):
         raise ValueError("route model must be non-empty")
     if not isinstance(selection.provider, str) or not selection.provider.strip():
         raise ValueError("route provider must be non-empty")
+    if not isinstance(selection.fallback_to_configured, bool):
+        raise ValueError("invalid configured-route recovery policy")
+    if (type(selection.failure_cooldown_seconds) is not int
+            or not 1 <= selection.failure_cooldown_seconds <= 86400):
+        raise ValueError("invalid route failure cooldown")
     mode = None
     if selection.api_mode is not None:
         if not isinstance(selection.api_mode, str):
@@ -36,6 +41,8 @@ def _validated_selection(selection):
     return DelegationRouteSelection(
         model=selection.model.strip(), provider=selection.provider.strip(),
         api_mode=mode, required_endpoint_host=host.lower() if host else None,
+        fallback_to_configured=selection.fallback_to_configured,
+        failure_cooldown_seconds=selection.failure_cooldown_seconds,
     )
 
 
@@ -111,7 +118,11 @@ def resolve_delegation_route(cfg, parent_agent, *, allow_selectors=True):
                 selection = entry["select"](settings)
                 if selection is None:
                     continue
-                return _resolve_selection(cfg, parent_agent, selection)
+                route, creds = _resolve_selection(cfg, parent_agent, selection)
+                if selection.fallback_to_configured:
+                    from agent.delegation_route_recovery import prepare_selected_route
+                    return prepare_selected_route(cfg, parent_agent, route, creds, selection, name)
+                return route, creds
             except Exception:  # health: allow BLE001 -- plugin/resolver failures must fail open without logging secret-bearing exception details
                 logger.warning("Delegation route selector %s unavailable; using the configured route", name)
                 break

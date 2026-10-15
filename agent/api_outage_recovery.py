@@ -121,15 +121,29 @@ class ApiOutageRecoveryWaiter:
 
     def _run_probe(self, argv: list[str], agent: Any) -> str:
         """Return success/failure/interrupted without exposing probe output."""
+        input_text = None
+        extra = {}
+        if "--active-route-stdin" in argv:
+            from agent.api_outage_probe import active_route_input, active_probe_environment
+            try:
+                input_text = active_route_input(agent)
+                extra = {"input": input_text, "env": active_probe_environment(agent)}
+            except (ValueError, TypeError):
+                return "failure"
+        timeout = self.config.probe_timeout_seconds
+        deadline = getattr(self, "_wait_deadline", None)
+        if deadline is not None:
+            timeout = min(timeout, max(0.01, deadline - self._clock()))
         if self._runner is not None:
             try:
                 completed = self._runner(
                     argv,
                     shell=False,
-                    timeout=self.config.probe_timeout_seconds,
+                    timeout=timeout,
                     capture_output=True,
                     text=True,
                     check=False,
+                    **extra,
                 )
                 return "success" if completed.returncode == 0 else "failure"
             except Exception:
@@ -145,12 +159,16 @@ class ApiOutageRecoveryWaiter:
             # A dedicated session lets interruption/timeout stop descendants,
             # not just the immediate probe executable.
             popen_kwargs["start_new_session"] = True
+        if input_text is not None:
+            popen_kwargs["env"] = extra["env"]
         try:
-            process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, **popen_kwargs)
+            process = subprocess.Popen(
+                argv, stdin=subprocess.PIPE if input_text is not None else subprocess.DEVNULL, **popen_kwargs
+            )
         except Exception:
             return "failure"
 
-        deadline = self._clock() + self.config.probe_timeout_seconds
+        deadline = self._clock() + timeout
         next_touch = self._clock() + 30.0
         while process.poll() is None:
             if getattr(agent, "_interrupt_requested", False):
@@ -163,6 +181,15 @@ class ApiOutageRecoveryWaiter:
             if now >= next_touch:
                 agent._touch_activity("running API outage recovery probe")
                 next_touch = now + 30.0
+            if extra:
+                try:
+                    process.communicate(input=input_text, timeout=0.2)
+                    input_text = None
+                except subprocess.TimeoutExpired:
+                    input_text = None
+                except (OSError, ValueError):
+                    self._stop_process(process)
+                    return "failure"
             self._sleep(0.2)
         return "success" if process.returncode == 0 else "failure"
 
@@ -174,6 +201,10 @@ class ApiOutageRecoveryWaiter:
         on_recovered: Callable[[str], None],
     ) -> str:
         agent._api_outage_waiting = True
+        started_at = self._clock()
+        limit = getattr(agent, "_api_outage_max_wait_seconds", 0)
+        spent = getattr(agent, "_api_outage_wait_elapsed_seconds", 0.0)
+        self._wait_deadline = started_at + max(0, limit - spent) if limit > 0 else None
         try:
             agent._touch_activity("waiting for API outage recovery probe")
             interval = self.config.probe_interval_seconds
@@ -195,6 +226,9 @@ class ApiOutageRecoveryWaiter:
                     return "interrupted"
 
                 now = self._clock()
+                if self._wait_deadline is not None and now >= self._wait_deadline:
+                    on_parked("API outage recovery wait reached its configured limit.")
+                    return "timed_out"
                 if now >= next_touch:
                     agent._touch_activity("waiting for API outage recovery probe")
                     next_touch = now + 30.0
@@ -225,6 +259,8 @@ class ApiOutageRecoveryWaiter:
 
                 self._sleep(0.2)
         finally:
+            agent._api_outage_wait_elapsed_seconds = spent + max(0.0, self._clock() - started_at)
+            self._wait_deadline = None
             agent._api_outage_waiting = False
             try:
                 agent._touch_activity("API outage recovery wait ended")
@@ -239,7 +275,7 @@ def park_for_api_outage_recovery(
     messages: list[dict[str, Any]],
     conversation_history: Any,
 ) -> dict[str, Any] | None:
-    """Park the active API boundary, returning only when explicitly interrupted.
+    """Park the API boundary until recovery, interruption, or the child's wait limit.
 
     ``None`` means the external probe recovered and the caller should retry the same
     request boundary without replaying transcript messages.
@@ -258,6 +294,13 @@ def park_for_api_outage_recovery(
     outcome = waiter.wait(agent, endpoint_key, agent._emit_status, agent._emit_status)
     if outcome == "recovered":
         return None
+    if outcome == "timed_out":
+        agent._persist_session(messages, conversation_history)
+        return {
+            "final_response": "API outage recovery timed out; the delegated route is still unavailable.",
+            "messages": messages, "api_calls": agent._api_call_count,
+            "completed": False, "failed": True, "failure_reason": "timeout",
+        }
 
     from agent.message_sanitization import close_interrupted_tool_sequence
 

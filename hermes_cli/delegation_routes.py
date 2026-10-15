@@ -15,3 +15,5 @@ class DelegationRouteSelection:
     provider: str = "inherit"
     api_mode: str | None = None
     required_endpoint_host: str | None = None
+    fallback_to_configured: bool = False
+    failure_cooldown_seconds: int = 300

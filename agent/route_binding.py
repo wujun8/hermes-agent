@@ -89,6 +89,9 @@ def bind_route_entry(agent: Any, entry: dict[str, Any], provider: str, model: st
     agent._ensure_lmstudio_runtime_loaded()  # LM Studio: preload before probing context length
     _update_fallback_context_compressor(agent)
     _reresolve_fallback_reasoning_config(agent)
+    if "request_overrides" in entry:
+        from copy import deepcopy
+        agent.request_overrides = deepcopy(entry["request_overrides"])
     _rescope_fallback_extra_body(agent, old_model, old_provider, old_base_url)
     return old_model, old_provider
 

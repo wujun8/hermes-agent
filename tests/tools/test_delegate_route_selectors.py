@@ -490,3 +490,73 @@ def test_host_isolation_explicitly_refuses_in_process_route_selectors(profiles):
             host = getattr(manager, "_plugin_host_instance", None)
             if host is not None:
                 host.shutdown()
+
+
+def _recoverable_config():
+    return {
+        "model": "normal-worker", "provider": "custom:normal",
+        "base_url": "https://normal.example/v1", "api_key": "normal-route-secret",
+        "api_mode": "codex_responses", "max_iterations": 5,
+        "request_overrides": {"extra_headers": {"X-Route": "normal"}},
+        "fallback_providers": [{"provider": "custom:normal", "model": "last-backup"}],
+        "selector_policy": {"profile": "recovery-test"},
+    }
+
+
+def test_optional_route_prepends_exact_configured_backup_without_mutating_profile(profiles, captured_dispatch):
+    profile = profiles(
+        source=_plugin('return DelegationRouteSelection("cheap-worker", api_mode="chat_completions", fallback_to_configured=True)'),
+        delegation=_recoverable_config(),
+    )
+    before = (profile.home / "config.yaml").read_bytes()
+    with _scope(profile.home):
+        kwargs = _dispatch(profile, captured_dispatch)
+    assert kwargs["model"] == "cheap-worker"
+    assert kwargs["api_mode"] == "chat_completions"
+    backup, last = kwargs["fallback_model"]
+    assert (backup["model"], backup["base_url"], backup["api_key"], backup["api_mode"]) == (
+        "normal-worker", "https://normal.example/v1", "normal-route-secret", "codex_responses",
+    )
+    assert backup["request_overrides"] == {"extra_headers": {"X-Route": "normal"}}
+    assert last["model"] == "last-backup"
+    child = captured_dispatch[0][-1]
+    assert child._selected_route_recovery is not None
+    assert child._api_outage_max_wait_seconds == 600
+    assert (profile.home / "config.yaml").read_bytes() == before
+
+
+def test_route_failure_cools_only_own_profile_and_recovery_is_single_flight(profiles, monkeypatch):
+    from agent import delegation_route_recovery as recovery
+    from agent.delegation_route_health import RouteHealthRegistry
+    from agent.error_classifier import FailoverReason
+
+    now = [0.0]
+    monkeypatch.setattr(recovery, "ROUTE_HEALTH", RouteHealthRegistry(clock=lambda: now[0]))
+    source = _plugin('return DelegationRouteSelection("cheap-worker", fallback_to_configured=True)')
+    profile = profiles(source=source, delegation=_recoverable_config())
+    other = profiles("B", source=source, delegation=_recoverable_config())
+    with _scope(profile.home):
+        cfg = load_config_readonly()["delegation"]
+        route, creds = resolve_delegation_route(cfg, profile.parent)
+        child = SimpleNamespace(**creds, _selected_route_recovery=route[recovery.POLICY_KEY])
+        recovery.record_route_failure(child, FailoverReason.server_error)
+        _assert_normal(cfg, *resolve_delegation_route(cfg, profile.parent))
+    with _scope(other.home):
+        _route, creds = resolve_delegation_route(load_config_readonly()["delegation"], other.parent)
+        assert creds["model"] == "cheap-worker"
+    now[0] = 301.0
+    with _scope(profile.home):
+        route, creds = resolve_delegation_route(cfg, profile.parent)
+        assert creds["model"] == "cheap-worker"
+        _assert_normal(cfg, *resolve_delegation_route(cfg, profile.parent))
+        recovered = SimpleNamespace(**creds, _selected_route_recovery=route[recovery.POLICY_KEY])
+        recovery.record_route_success(recovered, SimpleNamespace(content="ready", tool_calls=None))
+        assert resolve_delegation_route(cfg, profile.parent)[1]["model"] == "cheap-worker"
+
+
+@pytest.mark.parametrize("policy", ["fallback_to_configured=1", "failure_cooldown_seconds=-1"])
+def test_invalid_optional_recovery_policy_retains_configured_route(profiles, policy):
+    profile = profiles(source=_plugin(f'return DelegationRouteSelection("cheap-worker", {policy})'))
+    with _scope(profile.home):
+        cfg = load_config_readonly()["delegation"]
+        _assert_normal(cfg, *resolve_delegation_route(cfg, profile.parent))
