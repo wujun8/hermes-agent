@@ -44,13 +44,32 @@ test('detectRemoteDisplay does not treat WSLg as remote', () => {
   )
 })
 
-test('detectRemoteDisplay flags SSH sessions on any platform', () => {
+test('detectRemoteDisplay ignores SSH metadata on native macOS and preserves explicit overrides', () => {
   assert.equal(
     detectRemoteDisplay({ env: { SSH_CONNECTION: '1.2.3.4 5 6.7.8.9 22' }, platform: 'linux' }),
     'ssh-session'
   )
-  assert.equal(detectRemoteDisplay({ env: { SSH_CLIENT: '1.2.3.4 5 22' }, platform: 'darwin' }), 'ssh-session')
+  assert.equal(
+    detectRemoteDisplay({ env: { SSH_CONNECTION: '1.2.3.4 5 6.7.8.9 22' }, platform: 'darwin' }),
+    null
+  )
+  assert.equal(detectRemoteDisplay({ env: { SSH_CLIENT: '1.2.3.4 5 22' }, platform: 'darwin' }), null)
+  assert.equal(detectRemoteDisplay({ env: { SSH_TTY: '/dev/pts/0' }, platform: 'darwin' }), null)
   assert.equal(detectRemoteDisplay({ env: { SSH_TTY: '/dev/pts/0' }, platform: 'win32' }), 'ssh-session')
+  assert.equal(
+    detectRemoteDisplay({
+      env: { HERMES_DESKTOP_DISABLE_GPU: '1', SSH_CONNECTION: '1.2.3.4 5 6.7.8.9 22' },
+      platform: 'darwin'
+    }),
+    'override (HERMES_DESKTOP_DISABLE_GPU)'
+  )
+  assert.equal(
+    detectRemoteDisplay({
+      env: { HERMES_DESKTOP_DISABLE_GPU: '0', SSH_CONNECTION: '1.2.3.4 5 6.7.8.9 22' },
+      platform: 'darwin'
+    }),
+    null
+  )
 })
 
 test('detectRemoteDisplay flags forwarded X11 displays but not local ones', () => {

@@ -539,6 +539,9 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
   const paneBudget = transcriptPaneBudget(mountedPanes, paneLifecycle === 'hot-hidden')
 
   const [renderBudget, setRenderBudget] = useState(FIRST_PAINT_BUDGET)
+  // Keep a reached page floor for this transcript: hot-hidden clamps the render
+  // budget to 40, but revealing must keep its retained rows mounted during backfill.
+  const [fullPageReached, setFullPageReached] = useState(false)
 
   // Cut the budget during RENDER, not in the post-commit layout effect. An
   // effect-time cut is too late: React would first build the whole tree with
@@ -560,6 +563,7 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
     setBudgetSessionKey(sessionKey)
     setHadGroups(hasGroups)
     setRenderBudget(FIRST_PAINT_BUDGET)
+    setFullPageReached(false)
   } else if (shouldClampTranscriptBudget(paneLifecycle === 'hot-hidden', renderBudget, paneBudget)) {
     // Apply the hidden budget during render so React never first commits the
     // stale full transcript after this pane moves to the background.
@@ -569,7 +573,10 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
 
     if (hasGroups) {
       setRenderBudget(FIRST_PAINT_BUDGET)
+      setFullPageReached(false)
     }
+  } else if (renderBudget >= paneBudget && !fullPageReached) {
+    setFullPageReached(true)
   }
 
   // Where to land after a prepend, in distance-from-bottom (survives the
@@ -655,7 +662,7 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
   // growing — then completed — weight never advances the cut boundary. A
   // moving cut unmounts older rows, shrinks scrollHeight, and the browser
   // clamp looks like a user scroll-up to use-stick-to-bottom.
-  const fullPage = renderBudget >= paneBudget
+  const fullPage = fullPageReached || renderBudget >= paneBudget
 
   const hiddenCount = firstVisibleGroupIndex(weightedGroups, renderBudget, fullPage ? MIN_VISIBLE_GROUPS : 0, fullPage)
 

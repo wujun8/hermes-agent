@@ -72,9 +72,9 @@ function detectRemoteDisplay(options: { env?: NodeJS.ProcessEnv; platform?: Node
     return null
   }
 
-  // Launched from an SSH session → the display is X11-forwarded or otherwise
-  // remote. Covers the common `ssh user@box` + GUI-forwarding case.
-  if (env.SSH_CONNECTION || env.SSH_CLIENT || env.SSH_TTY) {
+  // SSH metadata identifies forwarded displays on Linux and Windows. macOS
+  // Electron windows use the local Aqua display even when launched from SSH.
+  if (platform !== 'darwin' && (env.SSH_CONNECTION || env.SSH_CLIENT || env.SSH_TTY)) {
     return 'ssh-session'
   }
 

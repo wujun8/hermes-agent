@@ -786,10 +786,12 @@ export function TreeGroup({
 
       {/* Body: the zone's pane content — the active pane and bounded hot-hidden
           cache stay mounted in absolute layers; parked panes are unmounted.
-          `visibility` (not display) keeps the hidden pane's layout box, so
-          scroll positions and measurements survive the round-trip — which also
-          makes a hidden layer's rect identical to the visible one's, hence the
-          marker document-wide lookups filter on (see pane-visibility.ts).
+          opacity: 0 on the pane root preserves its layout box and scroll
+          positions, even when descendants override visibility. The old
+          inherited-visibility override caused a full-transcript style
+          recalculation. A hidden layer's rect stays identical to the visible
+          one's, hence marker document-wide lookups filter on
+          (see pane-visibility.ts).
           The body carries the zone's right-click menu too: a pane without a
           header (no strip showing) otherwise has no Close anywhere on screen
           (#92500) — same ZoneMenu the strip and the edit veil already serve. */}
@@ -836,7 +838,7 @@ export function TreeGroup({
                   aria-hidden={!isActive || undefined}
                   className={cn(
                     'absolute inset-0 overflow-auto',
-                    !isActive && 'pointer-events-none invisible opacity-0'
+                    !isActive && 'pointer-events-none opacity-0'
                   )}
                   inert={!isActive || undefined}
                   key={paneId}
