@@ -64,7 +64,7 @@ def _(rid, params: dict) -> dict:
             return dispatched
     if plugin_handler := _plugin_command_handler(base) if base else None:
         try:
-            return _ok(rid, {"output": _run_plugin_command(plugin_handler, arg, session) or "(no output)"})
+            return _ok(rid, {"output": _run_plugin_command(plugin_handler, arg, session, sid=sid) or "(no output)"})
         except Exception as e:
             logger.debug("Slash command execution failed", exc_info=True)
             return _ok(rid, {"output": f"Plugin command error: {e}"})

@@ -346,16 +346,16 @@ def _populate_critical_tree(root: Path, *, broken_file: str | None = None) -> No
         else:
             path.write_text("# stub\n")
 
-def test_validate_post_pull_critical_files_syntax_rejects_existing_syntax_error(tmp_path):
+def test_validate_critical_files_syntax_rejects_existing_syntax_error(tmp_path):
     _populate_critical_tree(tmp_path, broken_file="hermes_cli/config.py")
 
-    ok, failing_path, error = update_cmd._validate_post_pull_critical_files_syntax(tmp_path)
+    ok, failing_path, error = update_cmd._validate_critical_files_syntax(tmp_path)
 
     assert ok is False
     assert failing_path == str(tmp_path / "hermes_cli/config.py")
     assert error and "syntax" in error.lower()
 
-def test_validate_post_pull_critical_files_syntax_rejects_existing_symlink(
+def test_validate_critical_files_syntax_rejects_existing_symlink(
     tmp_path, monkeypatch
 ):
     monkeypatch.setattr(update_cmd, "_UPDATE_CRITICAL_FILES", ("required.py",))
@@ -363,7 +363,7 @@ def test_validate_post_pull_critical_files_syntax_rejects_existing_symlink(
     outside.write_text("VALUE = 1\n")
     try:
         (tmp_path / "required.py").symlink_to(outside)
-        ok, failing_path, error = update_cmd._validate_post_pull_critical_files_syntax(tmp_path)
+        ok, failing_path, error = update_cmd._validate_critical_files_syntax(tmp_path)
     finally:
         outside.unlink(missing_ok=True)
 

@@ -1,6 +1,9 @@
 """Default configuration for delegated children."""
 
 DEFAULT_DELEGATION = {
+    # Task-routing strategy: "default" uses the keys below; backends holds per-strategy settings.
+    "backend": "default",
+    "backends": {},
     # Total recovery-wait budget per child; successful model replies reset it.
     "api_outage_max_wait_seconds": 600,
     "model": "",  # e.g. "google/gemini-3-flash-preview" (empty = inherit parent)

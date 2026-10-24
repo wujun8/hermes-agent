@@ -1456,6 +1456,8 @@ async def test_api_outage_recovery_marks_then_schedules_after_turn_release():
     runner._hm_estop_gate.return_value = None
     runner._session_key_for_source.return_value = session_key
     runner._hm_pending_reply_intercepts = AsyncMock(return_value=None)
+    runner._hm_authority_admission = AsyncMock(return_value=(False, None))
+    runner._hm_post_admission_consume = AsyncMock(return_value=(False, None))
     runner._is_session_running.return_value = False
     runner._hm_dispatch_idle_commands = AsyncMock(return_value=(False, None))
     runner._is_telegram_topic_root_lobby.return_value = False

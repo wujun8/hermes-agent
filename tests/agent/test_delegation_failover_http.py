@@ -19,7 +19,7 @@ def test_optional_route_http_503_uses_configured_responses_fallback_and_cools_ro
     from hermes_constants import reset_hermes_home_override, set_hermes_home_override
     from hermes_state import SessionDB
     from tools import delegate_tool
-    from tools.delegate_tool_routes import resolve_delegation_route
+    from tools.delegate_tool_routes import resolve_task_routes
 
     requests = []
     metadata_probes = []
@@ -95,14 +95,22 @@ def test_optional_route_http_503_uses_configured_responses_fallback_and_cools_ro
     plugin_dir.mkdir(parents=True)
     (plugin_dir / "plugin.yaml").write_text("name: route-http-probe\nversion: 1.0.0\n", encoding="utf-8")
     (plugin_dir / "__init__.py").write_text(
-        "from hermes_cli.delegation_routes import DelegationRouteSelection\n"
-        "def select(_settings):\n"
-        "    return DelegationRouteSelection(\n"
-        "        'deepseek-flash', provider='custom:deepseek-route', api_mode='chat_completions',\n"
-        "        fallback_to_configured=True, failure_cooldown_seconds=60,\n"
-        "    )\n"
+        "from agent.delegation_provider import DelegationProvider\n"
+        "class HttpProbe(DelegationProvider):\n"
+        "    @property\n"
+        "    def name(self):\n"
+        "        return 'route-http-probe'\n"
+        "    def route_task(self, _task, _config):\n"
+        "        return {\n"
+        "            'model': 'deepseek-flash', 'provider': 'custom:deepseek-route',\n"
+        "            'api_mode': 'chat_completions',\n"
+        "            'route_policy': {\n"
+        "                'fallback_to_configured': True, 'failure_cooldown_seconds': 60,\n"
+        "                'required_endpoint_host': '127.0.0.1',\n"
+        "            },\n"
+        "        }\n"
         "def register(ctx):\n"
-        "    ctx.register_delegation_route_selector('http-probe', select)\n",
+        "    ctx.register_delegation_provider(HttpProbe())\n",
         encoding="utf-8",
     )
 
@@ -110,6 +118,8 @@ def test_optional_route_http_503_uses_configured_responses_fallback_and_cools_ro
     config = {
         "plugins": {"enabled": ["route-http-probe"], "isolation": "in_process"},
         "delegation": {
+            "backend": "route-http-probe",
+            "backends": {"route-http-probe": {}},
             "provider": "custom:configured-route",
             "model": "gpt-6-luna",
             "api_mode": "codex_responses",
@@ -188,7 +198,10 @@ def test_optional_route_http_503_uses_configured_responses_fallback_and_cools_ro
         monkeypatch.setattr("model_tools.get_tool_definitions", lambda *_a, **_kw: [])
         monkeypatch.setattr("model_tools.check_toolset_requirements", dict)
         cfg = load_config_readonly()["delegation"]
-        route, creds = resolve_delegation_route(cfg, parent)
+        routes, error = resolve_task_routes([{"goal": "route via the optional HTTP route"}], cfg, parent)
+        assert error is None and len(routes) == 1
+        selected_route = routes[0]
+        route, creds = selected_route.routing_cfg, selected_route.creds
         assert creds["model"] == "deepseek-flash"
         assert creds["provider"] == "custom:deepseek-route"
         assert creds["api_mode"] == "chat_completions"
@@ -237,8 +250,15 @@ def test_optional_route_http_503_uses_configured_responses_fallback_and_cools_ro
         )
         assert requests[-1] == configured_requests[-1]
 
-        cooled_route, cooled_creds = resolve_delegation_route(cfg, parent)
-        assert cooled_route is cfg
+        cooled_routes, cooled_error = resolve_task_routes(
+            [{"goal": "route via the cooling optional HTTP route"}], cfg, parent,
+        )
+        assert cooled_error is None and len(cooled_routes) == 1
+        cooled_route = cooled_routes[0]
+        cooled_creds = cooled_route.creds
+        assert cooled_route.error is None
+        assert "route_policy" not in cooled_route.routing_cfg
+        assert cooled_route.routing_cfg["model"] == cfg["model"]
         assert cooled_creds["model"] == "gpt-6-luna"
         assert cooled_creds["provider"] == "custom:configured-route"
     finally:

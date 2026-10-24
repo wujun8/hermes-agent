@@ -63,6 +63,13 @@ def load_user_config_effective(config_path: Optional[Path] = None, *, fail_close
     Cached on the user + managed file signatures and the values of every referenced env var.
     ``persist_backup=False`` skips good-file backup creation; combine it with
     ``fail_closed=True`` for readers that must never write recovery artifacts."""
+    from agent.safe_worker_policy import worker_config_snapshot
+
+    # A frozen-policy worker is detached from the profile's files: the owner-supplied
+    # snapshot IS the user layer (same seam load_config / read_raw_config honour).
+    snapshot = worker_config_snapshot()
+    if snapshot is not None:
+        return _effective(snapshot)
     if config_path is None:
         config_path = _config.get_config_path()
     path_key = str(config_path)

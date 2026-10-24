@@ -129,6 +129,14 @@ class _Store:
         self.peek_calls.append((key, peek_only))
         return self.entries.get(key)
 
+    async def lookup_by_session_key(self, key):
+        session_id = self.entries.get(key)
+        if session_id is None:
+            return None
+        now = datetime.now(UTC)
+        return SessionEntry(session_key=key, session_id=session_id,
+                            created_at=now, updated_at=now)
+
 
 class _Cache(dict):
     def __init__(self):
@@ -196,6 +204,41 @@ def make_runner():
 
 def _override(db, session_id):
     return SessionDB.session_policy_override(db.get_session(session_id), POLICY_KEY)
+
+
+@pytest.mark.asyncio
+async def test_resolved_gateway_handler_preserves_exact_canonical_session(db, make_runner):
+    source = _source()
+    runner = make_runner(db, entries={_key(source): "other-current-session"})
+    handler = plugins.get_plugin_command_handler("session-mode")
+    now = datetime.now(UTC)
+    entry = SessionEntry(session_key=_key(source), session_id="canonical-session",
+                         created_at=now, updated_at=now, origin=source)
+
+    result = await runner._hm_run_plugin_handler(
+        handler, _event("off", source=source), source, entry, args="on")
+
+    assert "state=True; override=True; id=canonical-session" in result
+    assert _override(db, "canonical-session") is True
+    assert db.get_session("other-current-session") is None
+    assert runner.async_session_store.create_calls == []
+
+
+@pytest.mark.asyncio
+async def test_resolved_gateway_session_handler_refuses_foreign_route(db, make_runner):
+    source = _source()
+    runner = make_runner(db)
+    handler = plugins.get_plugin_command_handler("session-mode")
+    now = datetime.now(UTC)
+    entry = SessionEntry(session_key="foreign-route", session_id="foreign-session",
+                         created_at=now, updated_at=now, origin=source)
+
+    result = await runner._hm_run_plugin_handler(
+        handler, _event("on", source=source), source, entry, args="on")
+
+    assert "session route mismatch" in result
+    assert db.get_session("foreign-session") is None
+    assert runner.async_session_store.create_calls == []
 
 
 @pytest.mark.asyncio

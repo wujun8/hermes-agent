@@ -36,7 +36,7 @@ def _agent_route_identity(agent):
     return _route_identity(route)
 
 
-def prepare_selected_route(cfg, parent, route, creds, selection, selector_name):
+def prepare_selected_route(cfg, parent, route, creds, *, cooldown_seconds, backend):
     """Attach the original route as first backup, or bypass a cooling-down selection."""
     from tools.delegate_tool import _parent_live_home, _resolve_delegation_credentials
     from tools.delegate_tool_config import _resolve_child_runtime, _resolve_child_fallback_chain
@@ -61,13 +61,13 @@ def prepare_selected_route(cfg, parent, route, creds, selection, selector_name):
         from hermes_constants import get_hermes_home
         home = get_hermes_home()
     fingerprint = hashlib.sha256(str(selected_runtime.get("api_key") or "").encode()).hexdigest()
-    key = (str(home), selector_name, *_route_identity(selected_runtime), fingerprint)
+    key = (str(home), backend, *_route_identity(selected_runtime), fingerprint)
     permit = ROUTE_HEALTH.acquire(
-        key, cooldown_seconds=selection.failure_cooldown_seconds,
+        key, cooldown_seconds=cooldown_seconds,
         probe_lease_seconds=max(60.0, _child_wait_budget(cfg)),
     )
     if permit is None:
-        logger.info("Delegated route %s cooling down; retaining configured route", selection.model)
+        logger.info("Delegated route %s cooling down; retaining configured route", creds.get("model"))
         return cfg, normal
     chain = _resolve_child_fallback_chain(parent, cfg, pinned=bool(
         normal.get("provider") or normal.get("base_url") or normal.get("model"))) or []

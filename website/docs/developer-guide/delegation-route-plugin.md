@@ -3,6 +3,11 @@ sidebar_position: 21
 title: Delegation route plugins
 ---
 
+This local selector API is retained for existing plugins. New plugins should use
+[`DelegationProvider`](delegation-provider-plugin.md), including its local
+`route_policy` extension for optional routes. The schedule plugin v0.2 uses that
+interface and `delegation.backend: deepseek-off-peak`; v0.1 remains compatible.
+
 Native plugins can select a model/provider for newly dispatched children without
 handling credentials or replacing `delegate_task`. Register a synchronous selector:
 
@@ -78,6 +83,6 @@ unload and failed-load cleanup. The capability requires `plugins.isolation:
 in_process`; host-isolated plugins are explicitly refused until a synchronous
 route-selection protocol is available.
 
-The standalone `hermes-delegation-schedule` plugin consumes this API for scheduled
-model selection. Its calendar dependency and provider-specific configuration live
-in that plugin, outside the Hermes source tree.
+The standalone schedule plugin keeps its calendar dependency and provider-specific
+configuration outside the Hermes source tree. Its v0.1 registration continues to
+work through this adapter; v0.2 registers an ordinary delegation provider.

@@ -6,7 +6,6 @@ identity. Read requests never initialize a route or inspect a live agent.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from pathlib import Path
 
@@ -148,56 +147,15 @@ def _run_write_request(runner, source, handler, request, session_key,
             owned_db.close()
 
 
-async def dispatch_gateway_plugin_command(runner, event, source, command):
-    """Dispatch a plugin slash command with the host's authorization and context."""
-    # Underscores normalize to hyphens so Telegram's underscored autocomplete form
-    # matches plugin commands registered with hyphens.
-    if command:
-        session_handler = False
-        try:
-            from hermes_cli.plugins import get_plugin_command_handler
-            from hermes_cli.session_commands import is_session_command
-            from gateway.session import build_session_context
-
-            plugin_handler = get_plugin_command_handler(command.replace("_", "-"))
-            if plugin_handler:
-                session_handler = is_session_command(plugin_handler)
-                denied = runner._check_slash_access(source, command.replace("_", "-"))
-                if denied is not None:
-                    return True, denied, command
-                if session_handler:
-                    result = await dispatch_gateway_session_command(runner, event, plugin_handler)
-                    return True, str(result) if result else None, command
-                # This dispatch precedes the agent-turn path's HERMES_SESSION_* binding.
-                # No session entry exists yet, so derive its key from the source. Sync
-                # handlers run on the gateway pool with ContextVars, avoiding loop I/O
-                # that can starve the liveness watchdog (#108698, #105279).
-                plugin_context = build_session_context(source, runner.config)
-                plugin_context.session_key = runner._session_key_for_source(source)
-                user_args = event.get_command_args().strip()
-                with runner._session_env_scope(plugin_context):
-                    if asyncio.iscoroutinefunction(plugin_handler):
-                        result = await plugin_handler(user_args)
-                    else:
-                        result = await runner._run_in_executor_with_context(plugin_handler, user_args)
-                        if asyncio.iscoroutine(result):
-                            result = await result
-                return True, str(result) if result else None, command
-        except Exception as exc:
-            logger.warning("Plugin command dispatch failed: %s", exc, exc_info=True)
-            if session_handler:
-                return True, f"Session command error: {exc}", command
-    return False, None, command
-
-
-async def dispatch_gateway_session_command(runner, event, handler):
+async def dispatch_gateway_session_command(runner, event, handler, *, session_entry=None, args=None):
     """Run one recognized session command; errors are replies, never model input."""
     from hermes_cli.session_commands import prepare_session_command
     from gateway.session import build_session_context
 
     try:
         request = await runner._run_in_executor_with_context(
-            prepare_session_command, handler, event.get_command_args().strip())
+            prepare_session_command, handler,
+            event.get_command_args().strip() if args is None else args)
     except ValueError as exc:
         return str(exc)
     except Exception as exc:
@@ -207,13 +165,19 @@ async def dispatch_gateway_session_command(runner, event, handler):
     try:
         source = event.source
         session_key = runner._session_key_for_source(source)
+        if session_entry is not None and session_entry.session_key != session_key:
+            raise ValueError("session route mismatch; refusing to mutate")
         if runner._is_session_running(session_key):
             return t("gateway.busy.slash_rejected", command=handler.name)
         async with runner._async_profile_scope_for_source(source):
             profile_home = await runner._run_in_executor_with_context(_resolve_profile_home)
             # Validate configuration before a write route can create its canonical row.
             config = await runner._run_in_executor_with_context(_load_command_config)
-            if request.write:
+            if session_entry is not None:
+                session_id = str(session_entry.session_id or "")
+                if not session_id.strip():
+                    raise ValueError("a non-empty exact session ID is required")
+            elif request.write:
                 entry = await runner.async_session_store.get_or_create_session(source)
                 session_id = str(getattr(entry, "session_id", "") or "")
                 if not session_id.strip():

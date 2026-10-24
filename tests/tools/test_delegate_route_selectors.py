@@ -9,6 +9,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from copy import deepcopy
 import json
+import shutil
 from pathlib import Path
 from textwrap import dedent, indent
 from types import SimpleNamespace
@@ -22,7 +23,7 @@ from hermes_cli.config import load_config_readonly
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 from hermes_state import SessionDB
 from tools import delegate_tool
-from tools.delegate_tool_routes import resolve_delegation_route
+from hermes_cli.plugins_delegation_routes import resolve_delegation_route
 
 
 # This list comes from the public selector-input contract, not the resolver's table.
@@ -91,6 +92,10 @@ def profiles(tmp_path, monkeypatch):
     root.mkdir()
     bundled = tmp_path / "empty-bundled"
     bundled.mkdir()
+    # The default route is a bundled backend in v0.22.5; keep the real resolver
+    # while excluding unrelated bundled plugins from this profile fixture.
+    shutil.copytree(Path(__file__).resolve().parents[2] / "plugins/delegation/default",
+                    bundled / "delegation/default")
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setenv("HERMES_HOME", str(root))
     monkeypatch.setenv("HERMES_BUNDLED_PLUGINS", str(bundled))

@@ -329,7 +329,7 @@ def _run_ordinary_update(repo: Path, monkeypatch, *, dirty: bool) -> tuple[list,
 
     original_stash = update_cmd._stash_local_changes_if_needed
     original_restore = update_cmd._restore_stashed_changes
-    original_post_pull_guard = update_cmd._validate_post_pull_critical_files_syntax
+    original_post_pull_guard = update_cmd._validate_critical_files_syntax
 
     def stash(*args, **kwargs):
         events.append("stash")
@@ -347,7 +347,7 @@ def _run_ordinary_update(repo: Path, monkeypatch, *, dirty: bool) -> tuple[list,
     monkeypatch.setattr(update_cmd, "_normalize_managed_eol", eol_noop)
     monkeypatch.setattr(
         update_cmd,
-        "_validate_post_pull_critical_files_syntax",
+        "_validate_critical_files_syntax",
         post_pull_guard,
     )
     monkeypatch.setattr(hermes_main, "_stash_local_changes_if_needed", stash)
